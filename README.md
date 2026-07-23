@@ -35,9 +35,10 @@ cd tauri && pnpm tauri build
 
 ## Contributing
 
-This repo is exported from Sundial's private monorepo on every release; the
-monorepo remains the source of truth. Issues and PRs are welcome — accepted
-patches are ported inward and ship in the next export with attribution.
+Contributions are welcome — bug reports, fixes, features, ideas. Open an
+issue or send a PR. We review everything here, and merged changes ship in
+the next release with your authorship preserved. Planning something bigger?
+Open an issue first and we'll help you scope it.
 
 ## License
 
