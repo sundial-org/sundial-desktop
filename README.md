@@ -2,11 +2,6 @@
 
 [Website](https://www.sundial.md) | [Blog](https://www.sundial.md/blog) | [Docs](https://www.sundial.md/docs) | [X](https://x.com/sundialhub)
 
-- **Use the desktop app** → [Download](https://www.sundial.md/download) — free forever, latest macOS
-- **Build it from source** → [Build](#build)
-- **Want to contribute?** → [Issues](https://github.com/sundial-org/sundial-desktop/issues)
-- **Have a bug or feature request?** → [Add it here](https://github.com/sundial-org/sundial-desktop/issues/new)
-
 Sundial is a markdown editor built for your writing experience first, while staying agent-native. It balances privacy-preserving local editing with collaborative sharing of a single file or a full project. It is flexible to use with any agent — and Sundial itself is customizable with any agent :)
 
 It is free forever — only pay per-use for Sundial's agent, or use your own.
@@ -21,6 +16,13 @@ It is free forever — only pay per-use for Sundial's agent, or use your own.
 - **Real documents** — Markdown first; LaTeX with live preview and citations; notebooks that run
 - **Local-first** — plain files on disk, works offline, no account needed
 - **One workspace everywhere** — sign in to share, edit multiplayer, and reach the same workspace from web, iMessage, or Slack, with Sunny (Sundial's hosted agent) as another collaborator
+
+## Get started
+
+- **Use the desktop app** → [Download](https://www.sundial.md/download) — free forever, latest macOS
+- **Build it from source** → [Build](#build)
+- **Want to contribute?** → [Issues](https://github.com/sundial-org/sundial-desktop/issues)
+- **Have a bug or feature request?** → [Add it here](https://github.com/sundial-org/sundial-desktop/issues/new)
 
 ## Philosophy
 
