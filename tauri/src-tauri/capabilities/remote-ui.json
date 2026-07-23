@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "remote-ui",
+  "description": "The UI is a remote page (loopback sidecar proxy in packaged builds, localhost dev server in dev), so IPC from it is origin-gated. Grant only what the UI needs: start_dragging on mousedown and the double-click maximize toggle for the top-bar drag region, and webview zoom for the Cmd+/− interface zoom. Everything else stays app-origin-only.",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+  },
+  "permissions": [
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize",
+    "core:webview:allow-set-webview-zoom"
+  ]
+}

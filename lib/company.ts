@@ -1,0 +1,9 @@
+export const COMPANY_NAME = 'Long Horizon Research, Inc.';
+export const COMPANY_DBA_NAME = `${COMPANY_NAME} DBA Sundial`;
+export const COMPANY_EMAIL = 'team@longhorizonresearch.com';
+export const COMPANY_URL = 'https://longhorizonresearch.com';
+export const DISCORD_INVITE_URL = 'https://discord.gg/NTKjTzTnEd';
+export const FEEDBACK_FORM_URL = 'https://tally.so/r/5BrrOM';
+export const COMPANY_LOCATION = 'San Francisco';
+export const LEGAL_LAST_UPDATED = 'April 7, 2026';
+export const TERMS_LABEL = 'Terms of Service';

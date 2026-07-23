@@ -1,0 +1,139 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+**/.tmp-bin/**
+
+# dependencies
+node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+/tests/output/
+/test-results/
+/playwright-report/
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+# …except the value-less example/manifest files. Never un-ignore .env.onboarding.
+!.env.example
+!.env.ci.example
+
+# internal onboarding/offboarding checklist
+/ONBOARDING.md
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# clerk configuration (can include secrets)
+/.clerk/
+
+# python
+**/__pycache__/
+**/.venv/
+**/.pytest_cache/
+
+# eval runner outputs
+evals/results/
+
+# supabase
+supabase/.temp
+
+# claude code local config
+.claude/settings.json
+.claude/settings.local.json
+.claude/commit-splitter/
+.claude/worktrees/
+.claude/plans/
+.codex/
+.agent/
+.agents
+.claude/skills/supabase-postgres-best-practices
+.cline/
+.codebuddy/
+.commandcode/
+.continue/
+.crush/
+.cursor/
+.factory/
+.goose/
+.junie/
+.kilocode/
+.kiro/
+.kode/
+.mcpjam/
+.mux/
+.neovate/
+.openhands/
+.pi/
+.playwright-cli/
+.pochi/
+.qoder/
+.qwen/
+.roo/
+.trae/
+.windsurf/
+.zencoder/
+.chrome-profile
+.tmp
+tmp/
+
+# local scratch / reference clones
+knowledge-work-plugins/
+file-link-auth*.yaml
+scripts/examples/runs/
+
+package-lock.json
+.claude
+# Stray LaTeX build artifacts that compile-checks may produce inside
+# templates/<x>/files/. The registry filters these at read-time, but keep
+# them out of git too.
+templates/**/files/*.aux
+templates/**/files/*.fdb_latexmk
+templates/**/files/*.fls
+templates/**/files/*.log
+templates/**/files/*.out
+templates/**/files/*.toc
+templates/**/files/*.synctex.gz
+templates/**/files/*.bbl
+templates/**/files/*.blg
+
+# reliability harness local artifacts
+reliability/artifacts/
+
+CLAUDE.local.md
+agent-ts/eval/harness-quality-runs/
+mcp/eval/metrics.jsonl
+
+# entire.io session-capture CLI (personal tooling, config stays local)
+.entire/
+
+# desktop-ui build output (root patterns are anchored)
+desktop-ui/.next/
+desktop-ui/out/

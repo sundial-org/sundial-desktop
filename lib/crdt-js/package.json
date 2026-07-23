@@ -1,0 +1,9 @@
+{
+  "name": "sundial-crdt",
+  "type": "module",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.0",
+    "ws": "^8.16.0",
+    "yjs": "^13.6.14"
+  }
+}

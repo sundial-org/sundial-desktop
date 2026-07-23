@@ -1,0 +1,1 @@
+export const LINK_INVITE_EMAIL = '__link__';

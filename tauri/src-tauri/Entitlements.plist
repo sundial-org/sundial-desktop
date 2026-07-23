@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Applied to every signed binary in the bundle (hardened runtime). The
+     bundled Node sidecar needs the JIT exceptions: V8 cannot reserve its
+     code range under the hardened runtime without them and dies at spawn
+     with "Failed to reserve virtual memory for CodeRange". -->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+</dict>
+</plist>

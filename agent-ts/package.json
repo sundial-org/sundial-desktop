@@ -1,0 +1,41 @@
+{
+  "name": "sundial-agent-ts",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Sundial agent harness in TypeScript. Vercel AI SDK + Gateway, one code path across providers.",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:tests": "tsc -p tsconfig.tests.json --noEmit",
+    "test": "pnpm typecheck && pnpm typecheck:tests && vitest run"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.96",
+    "@ai-sdk/gateway": "^3.0.148",
+    "@ai-sdk/google": "^3.0.91",
+    "@ai-sdk/openai": "^3.0.84",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.185",
+    "@composio/core": "^0.10.0",
+    "@composio/vercel": "^0.9.2",
+    "@hono/node-server": "^2.0.4",
+    "@openai/agents": "^0.3.9",
+    "@supabase/supabase-js": "^2.93.3",
+    "ai": "^6.0.224",
+    "hono": "^4.10.0",
+    "ioredis": "^5.11.0",
+    "resumable-stream": "^2.2.12",
+    "undici": "^8.4.1",
+    "yaml": "^2.9.0",
+    "zod": "^3.25.0",
+    "zod-to-json-schema": "^3.25.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

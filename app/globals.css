@@ -1,0 +1,2259 @@
+@import "tailwindcss";
+@source "../node_modules/streamdown/dist/*.js";
+@source "../node_modules/@streamdown/code/dist/*.js";
+@source "../node_modules/@streamdown/mermaid/dist/*.js";
+
+:root {
+  --beige-v-light: #fbf6ef;
+  --beige-light: #f1e5d7;
+  --beige-med: #e7c49e;
+  --beige-dark: #c9a57a;
+  --beige-deep: #866646;
+  --beige-ink: #634a31;
+  --beige-ink-strong: #3f2e1d;
+  --beige-deepest: #2a1d10;
+  --beige-night: #18110b;
+  --beige-black: #0d0703;
+  --orange-deep: #c24d00;
+  /* Minimal shadcn-ish tokens for chrome that reads them directly. */
+  --background: #fff;
+  --border: #d4d4d8;
+}
+
+@theme inline {
+  --font-geist-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-sans: var(--font-geist-sans);
+  --color-beige-50: var(--beige-v-light);
+  --color-beige-100: var(--beige-v-light);
+  --color-beige-200: var(--beige-light);
+  --color-beige-300: var(--beige-med);
+  --color-beige-400: var(--beige-dark);
+  --color-beige-500: var(--beige-deep);
+  --color-beige-600: var(--beige-ink);
+  --color-beige-700: var(--beige-ink-strong);
+  --color-beige-800: var(--beige-deepest);
+  --color-beige-900: var(--beige-night);
+  --color-beige-950: var(--beige-black);
+  --color-orange: #ff8112;
+  --color-orange-deep: var(--orange-deep);
+}
+
+/* Bind Tailwind's `dark:` variant to the theme class — the v4 default is
+   prefers-color-scheme, which would ignore an explicit Light/Dark preference. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ── Dark mode ───────────────────────────────────────────────────────────────
+   The app's Tailwind utilities resolve through the theme's CSS variables, so
+   dark mode is a palette remap under `.dark` (stamped on <html> by the inline
+   theme script — lib/theme.ts), not per-component `dark:` classes. The stone
+   scale inverts (surfaces down, text up) on the same warm hue; `white` becomes
+   the raised-card surface sitting above the `stone-50` page. Accent scales only
+   remap the shades used as chip tints (50–200) and chip text (600–800).
+   `not print` so print/PDF export always renders the light palette. */
+@media not print {
+.dark {
+  color-scheme: dark;
+
+  --color-white: #23201d;
+  --color-stone-50: #1b1917;
+  --color-stone-100: #2a2723;
+  --color-stone-200: #38342e;
+  --color-stone-300: #474138;
+  --color-stone-400: #8a8175;
+  --color-stone-500: #a49b8d;
+  --color-stone-600: #bcb3a4;
+  --color-stone-700: #d1c9bc;
+  --color-stone-800: #e5dfd4;
+  --color-stone-900: #f1ece3;
+  --color-stone-950: #f9f6f0;
+
+  --beige-v-light: #262019;
+  --beige-light: #382d1f;
+  --beige-med: #64502f;
+  --beige-dark: #8f734b;
+  --beige-deep: #c8a878;
+  --beige-ink: #dcc5a1;
+  --beige-ink-strong: #eee1ca;
+  --beige-deepest: #f5eddd;
+  --beige-night: #faf5eb;
+  --beige-black: #fdfaf5;
+  --orange-deep: #e8752e;
+  --color-orange-deep: var(--orange-deep);
+
+  --background: #23201d;
+  --border: #3d3831;
+
+  --color-emerald-50: #12291d;
+  --color-emerald-100: #163425;
+  --color-emerald-200: #1f4c35;
+  --color-emerald-600: #34d399;
+  --color-emerald-700: #6ee7b7;
+  --color-emerald-800: #a7f3d0;
+  --color-green-50: #142916;
+  --color-green-100: #1a341d;
+  --color-green-200: #254a29;
+  --color-green-600: #4ade80;
+  --color-green-700: #86efac;
+  --color-green-800: #bbf7d0;
+  --color-red-50: #301a17;
+  --color-red-100: #3d211d;
+  --color-red-200: #57302a;
+  --color-red-600: #f87171;
+  --color-red-700: #fca5a5;
+  --color-red-800: #fecaca;
+  --color-rose-50: #2f1a1f;
+  --color-rose-100: #3d2128;
+  --color-rose-200: #572f39;
+  --color-rose-600: #fb7185;
+  --color-rose-700: #fda4af;
+  --color-rose-800: #fecdd3;
+  --color-amber-50: #2c2212;
+  --color-amber-100: #392c15;
+  --color-amber-200: #543f1d;
+  --color-amber-600: #fbbf24;
+  --color-amber-700: #fcd34d;
+  --color-amber-800: #fde68a;
+  --color-amber-900: #fef3c7;
+  --color-yellow-50: #2b2410;
+  --color-yellow-100: #382f13;
+  --color-yellow-200: #52451b;
+  --color-yellow-700: #fde047;
+  --color-yellow-800: #fef08a;
+  --color-orange-50: #2e1e12;
+  --color-orange-100: #3c2715;
+  --color-orange-200: #55371d;
+  --color-orange-600: #fb923c;
+  --color-orange-700: #fdba74;
+  --color-orange-800: #fed7aa;
+  --color-blue-50: #16202f;
+  --color-blue-100: #1b283e;
+  --color-blue-200: #253a5a;
+  --color-blue-600: #60a5fa;
+  --color-blue-700: #93c5fd;
+  --color-blue-800: #bfdbfe;
+  --color-sky-50: #13232f;
+  --color-sky-100: #182d3e;
+  --color-sky-200: #204059;
+  --color-sky-600: #38bdf8;
+  --color-sky-700: #7dd3fc;
+  --color-sky-800: #bae6fd;
+  --color-indigo-50: #1d1e33;
+  --color-indigo-100: #252744;
+  --color-indigo-200: #333861;
+  --color-indigo-300: #4a4f8f;
+  --color-indigo-600: #818cf8;
+  --color-indigo-700: #a5b4fc;
+  --color-indigo-800: #c7d2fe;
+  --color-violet-50: #231d33;
+  --color-violet-100: #2d2545;
+  --color-violet-200: #3f3360;
+  --color-violet-600: #a78bfa;
+  --color-violet-700: #c4b5fd;
+  --color-violet-800: #ddd6fe;
+  --color-purple-50: #261d33;
+  --color-purple-100: #302545;
+  --color-purple-200: #433361;
+  --color-purple-600: #c084fc;
+  --color-purple-700: #d8b4fe;
+  --color-purple-800: #e9d5ff;
+}
+
+/* Hardcoded light chrome that can't remap through a palette variable. */
+.dark .tiptap blockquote[data-callout],
+.dark .markdown-content blockquote[data-callout] {
+  background: #282420;
+  border-color: #3d3831;
+  box-shadow: none;
+}
+.dark .tiptap blockquote[data-callout='note'],
+.dark .tiptap blockquote[data-callout='info'],
+.dark .tiptap blockquote[data-callout='abstract'],
+.dark .markdown-content blockquote[data-callout='note'],
+.dark .markdown-content blockquote[data-callout='info'],
+.dark .markdown-content blockquote[data-callout='abstract'] {
+  background: #1c2430;
+  border-color: #33507a;
+}
+.dark .tiptap blockquote[data-callout='tip'],
+.dark .tiptap blockquote[data-callout='success'],
+.dark .tiptap blockquote[data-callout='question'],
+.dark .markdown-content blockquote[data-callout='tip'],
+.dark .markdown-content blockquote[data-callout='success'],
+.dark .markdown-content blockquote[data-callout='question'] {
+  background: #1e2617;
+  border-color: #4c661f;
+}
+.dark .tiptap blockquote[data-callout='warning'],
+.dark .tiptap blockquote[data-callout='caution'],
+.dark .tiptap blockquote[data-callout='example'],
+.dark .markdown-content blockquote[data-callout='warning'],
+.dark .markdown-content blockquote[data-callout='caution'],
+.dark .markdown-content blockquote[data-callout='example'] {
+  background: #2b2211;
+  border-color: #8a6116;
+}
+.dark .tiptap blockquote[data-callout='danger'],
+.dark .tiptap blockquote[data-callout='failure'],
+.dark .tiptap blockquote[data-callout='bug'],
+.dark .markdown-content blockquote[data-callout='danger'],
+.dark .markdown-content blockquote[data-callout='failure'],
+.dark .markdown-content blockquote[data-callout='bug'] {
+  background: #2d191d;
+  border-color: #8a3a48;
+}
+.dark .tiptap blockquote[data-callout='quote'],
+.dark .markdown-content blockquote[data-callout='quote'] {
+  background: #262320;
+  border-color: #474138;
+}
+/* Highlights keep readable light-on-dark text: drop to translucent tints. */
+.dark .tiptap mark,
+.dark .markdown-content mark {
+  background: rgba(250, 204, 21, 0.28);
+  color: inherit;
+}
+.dark .tiptap .fr-match {
+  background-color: rgba(255, 129, 18, 0.3);
+}
+.dark .tiptap .fr-match-active {
+  background-color: rgba(255, 129, 18, 0.55);
+  outline-color: var(--color-orange);
+}
+.dark .tiptap .doc-comment-range-active,
+.dark .tiptap .Tiptap-mathematics-render:has(+ .Tiptap-mathematics-editor--hidden.doc-comment-range-active),
+.dark .monaco-editor .monaco-comment-range-active {
+  background: rgba(255, 140, 0, 0.45);
+  animation: none;
+}
+.dark .tiptap .doc-comment-range-resolved,
+.dark .tiptap .Tiptap-mathematics-render:has(+ .Tiptap-mathematics-editor--hidden.doc-comment-range-resolved),
+.dark .monaco-editor .monaco-comment-range-resolved {
+  background: rgba(120, 113, 108, 0.35);
+}
+.dark .tiptap hr {
+  border-top-color: rgba(255, 255, 255, 0.12);
+}
+.dark .Tiptap-mathematics-editor {
+  background: rgba(59, 130, 246, 0.16);
+  color: #93c5fd;
+}
+} /* end @media not print */
+
+/* Hide SSR-only fallback content for JS-enabled browsers.
+   The `js` class is added synchronously via an inline <script> in <head>
+   BEFORE the first paint, so the fallback never flickers. */
+html.js .ssr-only {
+  display: none !important;
+}
+
+.tiptap {
+  color: var(--color-stone-900, #1c1917);
+  font-size: 0.95rem;
+  /* The markdown editor frame sets --line-height (Spacing toolbar control);
+     surfaces that don't (chat, previews) fall back to the base 1.55. */
+  line-height: var(--line-height, 1.55);
+}
+
+.tiptap > * + * {
+  margin-top: 0.9em;
+}
+
+
+/* Blurred-selection highlight (Selection extension): keeps the selected text
+   visibly marked while DOM focus is elsewhere — e.g. the chat input right
+   after "Ask Sunny" — so the user still sees what they handed to the chat. */
+.tiptap .sd-blur-selection {
+  background: rgba(180, 213, 254, 0.55);
+}
+/* The Selection extension injects a PAGE-GLOBAL rule that makes native
+   ::selection transparent on every unfocused .ProseMirror — but it never
+   paints its replacement decoration in non-editable views, which would leave
+   read-only docs with invisible selections. Restore one (the attribute
+   selector outweighs the injected rule). */
+.ProseMirror[contenteditable='false']:not(.ProseMirror-focused) *::selection {
+  background: rgba(180, 213, 254, 0.55);
+}
+
+/* Doc links whose href is a `?modal=` deep-link open on a PLAIN click (the
+   collab editor routes them into the page's query params) — show a hand,
+   unlike normal editor links which need Cmd-click. */
+.ProseMirror a[href^='?'][href*='modal='] {
+  cursor: pointer;
+}
+
+/* Skip layout + paint for off-screen blocks of the main document editor so
+   scrolling a long page doesn't repaint every KaTeX/table/code block at once
+   (the "scrolling lags on a large page" report). Scoped to [data-print-root]
+   (the markdown editor card) so chat-rendered markdown is untouched.
+   `contain-intrinsic-size: auto` lets the browser remember each block's real
+   height after it renders once, keeping the scrollbar stable. The @media print
+   block below forces full rendering so export/print never drops off-screen
+   content.
+
+   content-visibility implies `contain: paint`, which (a) clips anything a block
+   paints OUTSIDE its box and (b) makes the block the containing block for its
+   absolutely-positioned descendants. The diff/suggestion chrome relies on both:
+   the pending-diff rail paints into the left margin gutter (::before at
+   left:-13px) and the review controls are absolutely positioned in the reserved
+   right gutter. So exclude pending-diff blocks, and turn the optimization off
+   while the doc has live suggestions (.has-suggestions) — both are transient
+   review states where correctness beats the scroll win. The :has() also
+   excludes lists/blockquotes whose pending-diff class sits on a descendant
+   (the <li>), whose rail reaches further into the gutter, and blocks holding a
+   remote/agent cursor — whose name flag (.sundial-cursor__label) sits above the
+   line and would be clipped during normal multiplayer editing.
+
+   Blink-only (`:root:not([data-engine="webkit"])`, stamped by the root
+   layout's inline script — lib/engine.ts): the cursor carve-out means a block
+   flips in and out of content-visibility as a collaborator's caret enters and
+   leaves it, and WKWebView/Safari mishandle that toggle — the on-screen block
+   stops PAINTING (typed text "disappears" until selected forces a repaint),
+   and ProseMirror can then misread the skipped subtree and commit REAL CRDT
+   deletions of the just-typed text (the desktop-shell sentence-loss bug,
+   July 2026). Correctness beats the scroll win on WebKit.
+
+   `.sd-caret-block` (LocalCaretBlock decoration, lib/tiptap/local-caret-block)
+   is the LOCAL caret's block: Blink can leave the DOM caret behind a character
+   typed into a freshly created c-v:auto block (still in the skipped state
+   until the next frame), and ProseMirror then re-anchors the caret BEFORE the
+   typed char — the "/ai" slash rotation bug, July 2026. The native caret has
+   no DOM node for :has() to see, hence the decoration class. */
+:root:not([data-engine='webkit'])
+  [data-print-root]
+  .tiptap:not(.has-suggestions)
+  > *:not(.sd-caret-block):not(.diff-pending-addition):not(.diff-pending-deletion):not(.diff-block-add):not(.diff-block-del):not(:has(.diff-pending-addition, .diff-pending-deletion, .diff-block-add, .diff-block-del, .sundial-cursor, .sundial-agent-ghost-cursor)) {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 3rem;
+}
+
+/* Inline links: regular-markdown styling so users can spot a link and click
+   through to other workspace files / external URLs. Hover underlines; bare
+   state shows just the color so reading flow stays calm. Inside the tiptap
+   editor the cursor stays as the text I-beam (click places the caret and
+   surfaces the hover-card; ⌘/Ctrl-click navigates). In chat surfaces wiki
+   links behave like buttons, so they show the pointer cursor. */
+.tiptap a,
+.wiki-file-link {
+  color: #2563eb;
+  text-decoration: none;
+}
+
+.tiptap a {
+  cursor: text;
+}
+
+.wiki-file-link {
+  cursor: pointer;
+}
+
+.tiptap a:hover,
+.wiki-file-link:hover {
+  text-decoration: underline;
+}
+
+/* User chat bubbles use a dark surface — keep link affordance readable. */
+.group-\[\.is-user\] .wiki-file-link {
+  color: #93c5fd;
+}
+
+.group-\[\.is-user\] .wiki-file-link:hover {
+  color: #bfdbfe;
+}
+
+.tiptap h1 {
+  font-size: 1.875rem;
+  line-height: 1.2;
+  font-weight: 700;
+  margin-top: 0.4em;
+}
+
+.tiptap h2 {
+  font-size: 1.5rem;
+  line-height: 1.3;
+  font-weight: 600;
+  margin-top: 0.35em;
+}
+
+.tiptap h3 {
+  font-size: 1.25rem;
+  line-height: 1.3;
+  font-weight: 600;
+  margin-top: 0.3em;
+}
+
+.tiptap h4 {
+  font-size: 1.1rem;
+  line-height: 1.3;
+  font-weight: 600;
+  margin-top: 0.25em;
+}
+
+.tiptap h5 {
+  font-size: 1rem;
+  line-height: 1.3;
+  font-weight: 600;
+  margin-top: 0.2em;
+}
+
+.tiptap h6 {
+  font-size: 0.95rem;
+  line-height: 1.3;
+  font-weight: 600;
+  margin-top: 0.2em;
+}
+
+.tiptap ul,
+.tiptap ol {
+  padding-left: 1.5rem;
+  list-style-position: outside;
+}
+
+.tiptap ul,
+.tiptap ul[data-type="bulletList"] {
+  list-style: disc;
+}
+
+.tiptap ol,
+.tiptap ol[data-type="orderedList"] {
+  list-style: decimal;
+}
+
+.tiptap ul > li {
+  list-style-type: disc;
+}
+
+.tiptap ol > li {
+  list-style-type: decimal;
+}
+
+/* Checkbox list items hide the disc and hang the checkbox in the marker
+   gutter. The box is positioned ABSOLUTELY (out of flow) and the <li> keeps
+   its normal indent, so two things line up at every nesting depth:
+   - the label flows from the list's content edge → aligns with bullet labels;
+   - the box sits in the gutter → aligns with the disc bullet.
+   The previous `margin-left` shift on the <li> dragged the whole nested
+   subtree left, so lists nested under a checkbox were under-indented. */
+.tiptap li:has(> p > .md-checkbox) {
+  list-style: none;
+  position: relative;
+}
+
+/* Decoration-based markdown checkboxes – hides [ ]/[x] text,
+   shows a visual checkbox via ::before. `left` must be px/rem, not em:
+   font-size is 0 here so an em value would collapse to 0. */
+.md-checkbox {
+  color: transparent;
+  font-size: 0;
+  position: absolute;
+  left: -1.42rem;
+  top: 0.2rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  user-select: none;
+}
+.md-checkbox::before {
+  content: '';
+  display: block;
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+}
+.md-checkbox-unchecked::before {
+  border: 1.5px solid var(--color-stone-300, #d6d3d1);
+  background: var(--color-white, #fff);
+}
+.md-checkbox-checked::before {
+  content: '✓';
+  border: 1.5px solid var(--color-stone-500, #78716c);
+  background: var(--color-stone-500, #78716c);
+  color: white;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 14px;
+  text-align: center;
+}
+/* Dim checked item text */
+.tiptap li:has(> p > .md-checkbox-checked) > p {
+  color: var(--color-stone-400, #a8a29e);
+  text-decoration: line-through;
+}
+
+/* Images are @tiptap Image nodes (Google-Docs style). The WorkspaceImage
+   NodeView wraps the <img> in `.sundial-image` and adds a corner resize handle;
+   ProseMirror adds `ProseMirror-selectednode` to the wrapper when selected. */
+.tiptap img {
+  display: inline-block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 6px;
+  vertical-align: bottom;
+}
+.tiptap .sundial-image {
+  position: relative;
+  display: inline-block;
+  line-height: 0;
+}
+.tiptap .sundial-image.is-selected {
+  outline: 2px solid #3b82f6;
+  outline-offset: 1px;
+  border-radius: 6px;
+}
+.tiptap .sundial-image-handle {
+  display: none;
+  position: absolute;
+  right: -6px;
+  bottom: -6px;
+  width: 12px;
+  height: 12px;
+  border: 2px solid #3b82f6;
+  background: var(--color-white, #fff);
+  border-radius: 50%;
+  cursor: nwse-resize;
+}
+.tiptap .sundial-image.is-selected .sundial-image-handle {
+  display: block;
+}
+/* Image alignment (center/right); left/default stays inline. */
+.tiptap .sundial-image[data-align='center'] {
+  display: block;
+  width: fit-content;
+  margin-inline: auto;
+}
+.tiptap .sundial-image[data-align='right'] {
+  display: block;
+  width: fit-content;
+  margin-inline: auto 0;
+}
+/* Same alignment on read-only markdown surfaces (chat, previews, diffs). */
+.md-image-align {
+  display: block;
+  width: fit-content;
+}
+.md-image-align[data-align='center'] {
+  margin-inline: auto;
+}
+.md-image-align[data-align='right'] {
+  margin-inline: auto 0;
+}
+/* No resize affordance in read-only / View mode. Must out-specify the
+   `.is-selected` show rule above, since a clicked image can still select. */
+.tiptap[contenteditable='false'] .sundial-image.is-selected .sundial-image-handle {
+  display: none;
+}
+
+/* Find & Replace match highlights */
+.tiptap .fr-match {
+  background-color: #ffedd5;
+  border-radius: 2px;
+}
+.tiptap .fr-match-active {
+  background-color: #fdba74;
+  outline: 1px solid #ea580c;
+}
+
+.tiptap .doc-comment-range {
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  border-radius: 0;
+  cursor: text;
+  text-decoration: none !important;
+  transition: background-color 120ms ease;
+}
+
+.tiptap .doc-comment-range-open {
+  background: rgba(255, 121, 0, 0.4);
+}
+
+/* The focused comment's text gets a distinctly stronger highlight plus a brief
+ * yellow flash on select, so with many comments you can tell at a glance which
+ * span the open thread belongs to (the "active looks identical to the rest" bug). */
+@keyframes doc-comment-flash {
+  0%,
+  35% {
+    background: rgba(255, 209, 56, 0.95);
+  }
+  100% {
+    background: rgba(255, 140, 0, 0.85);
+  }
+}
+
+.tiptap .doc-comment-range-active {
+  background: rgba(255, 140, 0, 0.85);
+  animation: doc-comment-flash 0.9s ease-out;
+}
+
+.tiptap .doc-comment-range-resolved {
+  background: rgba(232, 234, 237, 0.95);
+}
+
+/* A reply that lands while a comment thread is open (an agent answering, a
+ * teammate replying) eases in instead of popping blankly into the card. */
+@keyframes comment-message-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.comment-message-enter {
+  animation: comment-message-enter 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .comment-message-enter {
+    animation: none;
+  }
+}
+
+.tiptap .doc-comment-draft-range {
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  border-radius: 0;
+  background: rgba(255, 121, 0, 0.44);
+  text-decoration: none !important;
+}
+
+/* Comment highlights must also cover KaTeX-rendered math. The Mathematics
+ * extension collapses the raw `$…$` source to a 0×0 box (so the inline comment
+ * background lands on something invisible) and paints KaTeX as a separate
+ * sibling widget that sits right *before* that collapsed source. When the
+ * source span carries a comment class, re-apply the matching background to the
+ * preceding render widget so the highlight visually spans the math too.
+ * `:has` keeps this scoped to genuinely-commented math. */
+.tiptap .Tiptap-mathematics-render:has(+ .Tiptap-mathematics-editor--hidden.doc-comment-range-open) {
+  background: rgba(255, 121, 0, 0.4);
+}
+.tiptap .Tiptap-mathematics-render:has(+ .Tiptap-mathematics-editor--hidden.doc-comment-range-active) {
+  background: rgba(255, 140, 0, 0.85);
+  animation: doc-comment-flash 0.9s ease-out;
+}
+.tiptap .Tiptap-mathematics-render:has(+ .Tiptap-mathematics-editor--hidden.doc-comment-range-resolved) {
+  background: rgba(232, 234, 237, 0.95);
+}
+.tiptap .Tiptap-mathematics-render:has(+ .Tiptap-mathematics-editor--hidden.doc-comment-draft-range) {
+  background: rgba(255, 121, 0, 0.44);
+}
+
+.tiptap .doc-attribution-paint {
+  border-left: 3px solid transparent;
+  margin-left: -11px;
+  padding-left: 8px;
+}
+
+.tiptap .doc-attribution-paint-0 { background: rgba(59, 130, 246, 0.12); border-left-color: rgba(37, 99, 235, 0.55); }
+.tiptap .doc-attribution-paint-1 { background: rgba(16, 185, 129, 0.12); border-left-color: rgba(5, 150, 105, 0.55); }
+.tiptap .doc-attribution-paint-2 { background: rgba(245, 158, 11, 0.14); border-left-color: rgba(217, 119, 6, 0.55); }
+.tiptap .doc-attribution-paint-3 { background: rgba(236, 72, 153, 0.12); border-left-color: rgba(219, 39, 119, 0.55); }
+.tiptap .doc-attribution-paint-4 { background: rgba(139, 92, 246, 0.12); border-left-color: rgba(124, 58, 237, 0.55); }
+.tiptap .doc-attribution-paint-5 { background: rgba(20, 184, 166, 0.12); border-left-color: rgba(13, 148, 136, 0.55); }
+
+.tiptap li {
+  display: list-item;
+  margin: 0.1rem 0;
+}
+
+.tiptap hr {
+  border: 0;
+  border-top: 1px solid rgba(231, 229, 228, 0.7);
+  margin: 1rem 0;
+}
+
+.tiptap blockquote {
+  border-left: 2px solid var(--color-stone-300, #d6d3d1);
+  color: var(--color-stone-600, #57534e);
+  font-style: italic;
+  margin: 1rem 0;
+  padding-left: 1rem;
+}
+
+.tiptap blockquote > *:first-child {
+  margin-top: 0;
+}
+
+.tiptap blockquote > *:last-child {
+  margin-bottom: 0;
+}
+
+.tiptap blockquote[data-callout],
+.markdown-content blockquote[data-callout] {
+  background: linear-gradient(180deg, rgba(250, 250, 249, 0.98), rgba(245, 245, 244, 0.92));
+  border: 1px solid var(--color-stone-200, #e7e5e4);
+  border-left-width: 3px;
+  border-radius: 1rem;
+  box-shadow: 0 20px 40px -34px rgba(28, 25, 23, 0.35);
+  color: var(--color-stone-600, #57534e);
+  font-style: normal;
+  margin: 1.1rem 0;
+  padding: 0.95rem 1rem;
+}
+
+.tiptap blockquote[data-callout] > p:first-child,
+.markdown-content blockquote[data-callout] > p:first-child {
+  color: var(--color-stone-900, #1c1917);
+  font-weight: 600;
+  margin-bottom: 0.45rem;
+}
+
+.tiptap blockquote[data-callout='note'],
+.tiptap blockquote[data-callout='info'],
+.tiptap blockquote[data-callout='abstract'],
+.markdown-content blockquote[data-callout='note'],
+.markdown-content blockquote[data-callout='info'],
+.markdown-content blockquote[data-callout='abstract'] {
+  background: linear-gradient(180deg, #f8fafc, #eff6ff);
+  border-color: #bfdbfe;
+}
+
+.tiptap blockquote[data-callout='tip'],
+.tiptap blockquote[data-callout='success'],
+.tiptap blockquote[data-callout='question'],
+.markdown-content blockquote[data-callout='tip'],
+.markdown-content blockquote[data-callout='success'],
+.markdown-content blockquote[data-callout='question'] {
+  background: linear-gradient(180deg, #f7fee7, #ecfccb);
+  border-color: #bef264;
+}
+
+.tiptap blockquote[data-callout='warning'],
+.tiptap blockquote[data-callout='caution'],
+.tiptap blockquote[data-callout='example'],
+.markdown-content blockquote[data-callout='warning'],
+.markdown-content blockquote[data-callout='caution'],
+.markdown-content blockquote[data-callout='example'] {
+  background: linear-gradient(180deg, #fffbeb, #fef3c7);
+  border-color: #fbbf24;
+}
+
+.tiptap blockquote[data-callout='danger'],
+.tiptap blockquote[data-callout='failure'],
+.tiptap blockquote[data-callout='bug'],
+.markdown-content blockquote[data-callout='danger'],
+.markdown-content blockquote[data-callout='failure'],
+.markdown-content blockquote[data-callout='bug'] {
+  background: linear-gradient(180deg, #fff1f2, #ffe4e6);
+  border-color: #fda4af;
+}
+
+.tiptap blockquote[data-callout='quote'],
+.markdown-content blockquote[data-callout='quote'] {
+  background: linear-gradient(180deg, var(--color-stone-50, #fafaf9), var(--color-stone-100, #f5f5f4));
+  border-color: var(--color-stone-300, #d6d3d1);
+}
+
+.tiptap .tableWrapper {
+  overflow-x: auto;
+  margin: 1rem 0;
+}
+
+.tiptap table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.tiptap th,
+.tiptap td {
+  /* `position: relative` is required by prosemirror-tables: the cell-selection
+     highlight is a `.selectedCell::after` overlay with `position: absolute;
+     inset: 0`. Without a positioned cell ancestor it anchors to the editor and
+     visually paints the whole file as "selected" when you drag across cells. */
+  position: relative;
+  border: 1px solid var(--color-stone-200, #e7e5e4);
+  padding: 0.55rem 0.7rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.tiptap th {
+  background: var(--color-stone-50, #fafaf9);
+  font-weight: 600;
+}
+
+.tiptap th p,
+.tiptap td p {
+  margin: 0;
+}
+
+.tiptap .selectedCell::after {
+  background: rgba(231, 196, 158, 0.2);
+  content: "";
+  inset: 0;
+  pointer-events: none;
+  position: absolute;
+}
+
+/* Column resizing (prosemirror-tables). The plugin adds `resize-cursor` to the
+   editor root when the pointer is over a column border, and renders a
+   `.column-resize-handle` at the active border — without this CSS the columns
+   are resizable but give no cursor/handle affordance, so users can't tell. */
+.tiptap.resize-cursor {
+  cursor: ew-resize;
+  cursor: col-resize;
+}
+.tiptap .column-resize-handle {
+  position: absolute;
+  right: -1px;
+  top: 0;
+  bottom: -1px;
+  width: 3px;
+  background-color: #6366f1;
+  pointer-events: none;
+}
+
+.tiptap code {
+  background: var(--color-stone-100, #f5f5f4);
+  padding: 0.1rem 0.3rem;
+  border-radius: 0.35rem;
+  font-size: 0.85em;
+}
+
+/* Doc code blocks — a light slab matching chat's code chrome (`:not(.tiptap-code)`
+   keeps the raw-markdown code editor's dark theme untouched). Token colors come
+   from the CodeBlockShiki decorations as CSS vars so theme flips are free. */
+.tiptap:not(.tiptap-code) pre {
+  background: var(--color-stone-50, #fafaf9);
+  border: 1px solid var(--color-stone-200, #e7e5e4);
+  border-radius: 0.6rem;
+  padding: 0.75rem 0.9rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  overflow-x: auto;
+}
+.tiptap:not(.tiptap-code) pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+}
+.dark .tiptap:not(.tiptap-code) pre {
+  background: #1c1917;
+  border-color: #292524;
+}
+/* A code block inside a pending suggestion drops the slab so the green/red
+   review band (diff-pending rules further down) composites over the page
+   background exactly like every other block type. */
+.tiptap:not(.tiptap-code) pre.diff-pending-addition,
+.tiptap:not(.tiptap-code) pre.diff-pending-deletion {
+  background: transparent;
+  border-color: transparent;
+}
+.tiptap .sd-code-tok {
+  color: var(--sd-tok-light);
+}
+.dark .tiptap .sd-code-tok {
+  color: var(--sd-tok-dark, var(--sd-tok-light));
+}
+
+/* Mermaid live preview — the source `pre` hides behind the rendered SVG when
+   the selection is outside the block (MermaidPreview extension). */
+.tiptap pre.sd-mermaid-source-hidden {
+  display: none;
+}
+.tiptap .sd-mermaid-preview {
+  display: flex;
+  justify-content: center;
+  position: relative;
+  padding: 0.25rem 0;
+  cursor: pointer;
+}
+.tiptap .sd-mermaid-preview svg {
+  max-width: 100%;
+  height: auto;
+}
+/* Badge on a visible source block whose settled text doesn't parse. */
+.tiptap pre.sd-mermaid-invalid::after {
+  content: '⚠ mermaid syntax';
+  position: absolute;
+  top: 0.35rem;
+  right: 0.5rem;
+  font-size: 0.7rem;
+  font-family: var(--font-sans, ui-sans-serif);
+  color: #b45309;
+  background: rgba(254, 243, 199, 0.9);
+  border-radius: 0.35rem;
+  padding: 0.05rem 0.4rem;
+  pointer-events: none;
+}
+.tiptap pre.sd-mermaid-invalid {
+  position: relative;
+}
+
+.tiptap mark,
+.markdown-content mark {
+  background: rgba(253, 230, 138, 0.72);
+  border-radius: 0.25rem;
+  color: var(--color-stone-900, #1c1917);
+  padding: 0 0.18rem;
+}
+
+/* All wiki links — embed (`![[…]]`) or plain (`[[…]]`) — render as ordinary
+   blue links via `.tiptap a`. No chip / pill / background. */
+
+.tiptap-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+.tiptap-code > * + * {
+  margin-top: 0;
+}
+
+.tiptap-code p {
+  margin: 0;
+}
+
+.tiptap-code pre {
+  background: #0c0a09;
+  color: #f8fafc;
+  padding: 0.75rem 0.9rem;
+  border-radius: 0.6rem;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  overflow-x: auto;
+}
+
+.sundial-cursor {
+  position: relative;
+  display: inline-block;
+  width: 0;
+  /* Keep at/under the tightest line-height (headings are 1.2) so the caret
+     never inflates its line and shoves the rest of the doc down on every move. */
+  height: 1.2em;
+  border-left: 2px solid;
+  margin-left: -1px;
+  margin-right: -1px;
+  vertical-align: text-bottom;
+  pointer-events: none;
+}
+
+.sundial-cursor--sunny {
+  animation: sunny-cursor-idle-fade 12s ease-out forwards;
+}
+
+@keyframes sunny-cursor-idle-fade {
+  0%, 65% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.28;
+  }
+}
+
+.sundial-cursor__label {
+  position: absolute;
+  top: 0.15em;
+  left: -1px;
+  transform: translateY(-100%);
+  color: #ffffff;
+  font-size: 0.65rem;
+  line-height: 1;
+  padding: 0.18rem 0.4rem;
+  border-radius: 999px;
+  white-space: nowrap;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+  pointer-events: none;
+  z-index: 20;
+  /* Google-Docs-like: the name flag shows when the caret moves/types
+     (y-prosemirror rebuilds the cursor DOM, restarting this animation),
+     then fades out while the collaborator is idle so it stops covering
+     the line above. The caret bar itself stays visible. */
+  animation: sundial-cursor-label-idle-fade 3s ease forwards;
+}
+
+@keyframes sundial-cursor-label-idle-fade {
+  0%, 75% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+/* Hover-to-reveal the name tag. Once the flag has faded while the collaborator
+   is idle, hovering their caret brings the name back. The caret is 0-width with
+   pointer-events:none, so it can't be hovered on its own — lay a slightly wider
+   invisible hit zone over it (pointer-events:auto re-enables just this pseudo,
+   even though the parent opts out) so the hover target is reachable without
+   blocking text selection along the rest of the line. */
+.sundial-cursor::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -4px;
+  width: 8px;
+  pointer-events: auto;
+}
+
+.sundial-cursor:hover .sundial-cursor__label {
+  animation: none;
+  opacity: 1;
+}
+
+/* In-doc caret for a local agent. State is presence-driven from the
+   local_agent_presence ledger — the caret persists as long as the agent's
+   presence row is fresh AND last_edited_path matches the current file. */
+.sundial-agent-ghost-cursors {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  vertical-align: baseline;
+  pointer-events: none;
+}
+
+.sundial-agent-ghost-cursor {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  pointer-events: none;
+}
+
+.sundial-agent-ghost-cursor__caret {
+  display: inline-block;
+  width: 2px;
+  height: 1.2em;
+  vertical-align: text-bottom;
+  background: var(--sundial-agent-color, #4f46e5);
+  border-radius: 1px;
+  animation: sundial-agent-ghost-cursor-blink 1.1s steps(2, end) infinite;
+}
+
+.sundial-agent-ghost-cursor__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  background: var(--sundial-agent-color, #4f46e5);
+  color: #ffffff;
+  font-size: 0.65rem;
+  line-height: 1;
+  padding: 0.2rem 0.45rem;
+  border-radius: 999px;
+  white-space: nowrap;
+  flex: 0 0 auto;
+  max-width: none;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+  pointer-events: none;
+}
+
+.sundial-agent-ghost-cursor__logo {
+  width: 0.85rem;
+  height: 0.85rem;
+  background: #ffffff;
+  border-radius: 999px;
+  padding: 1px;
+  object-fit: contain;
+  flex: 0 0 auto;
+}
+
+@keyframes sundial-agent-ghost-cursor-blink {
+  to { opacity: 0.35; }
+}
+
+.yRemoteSelection {
+  background: rgba(245, 158, 11, 0.14);
+}
+
+.yRemoteSelectionHead {
+  border-left: 2px solid #f59e0b;
+  margin-left: -1px;
+}
+
+/* Workspace icon consistency — size + stroke-width in one place.
+   fill/stroke stay as SVG attributes to avoid specificity issues. */
+.ws-icon {
+  width: 1.25rem;
+  height: 1.25rem;
+  stroke-width: 2;
+}
+
+button,
+select,
+a,
+[role="button"],
+summary {
+  cursor: pointer;
+}
+
+button:disabled,
+select:disabled,
+a[aria-disabled="true"],
+[role="button"][aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+/* Floating labels in hero */
+@keyframes float {
+  0%, 100% { transform: translateY(0) translateX(0); }
+  25% { transform: translateY(-12px) translateX(6px); }
+  50% { transform: translateY(-4px) translateX(-4px); }
+  75% { transform: translateY(-16px) translateX(2px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [style*="animation: float"] {
+    animation: none !important;
+  }
+}
+
+/* Blog prose — editorial serif */
+.blog-prose {
+  color: var(--color-stone-700, #44403c);
+  font-size: 1.0625rem;
+  line-height: 1.7;
+}
+.blog-prose > * + * { margin-top: 0.9em; }
+.blog-prose h2 { font-size: 1.6rem; font-weight: 600; letter-spacing: -0.011em; color: var(--color-stone-900, #1c1917); margin-top: 2em; margin-bottom: 0.5em; line-height: 1.25; }
+.blog-prose h3 { font-size: 1.25rem; font-weight: 600; letter-spacing: -0.006em; color: var(--color-stone-900, #1c1917); margin-top: 1.5em; margin-bottom: 0.35em; line-height: 1.35; }
+.blog-prose p { margin-top: 0.9em; }
+.blog-prose > :first-child { margin-top: 0; }
+.blog-prose a { color: #C2744C; text-decoration: underline; text-underline-offset: 3px; text-decoration-color: rgba(194,116,76,0.3); }
+.blog-prose a:hover { text-decoration-color: #C2744C; }
+.blog-prose ul, .blog-prose ol { padding-left: 1.5rem; margin-top: 0.8em; margin-bottom: 0.8em; }
+.blog-prose ul { list-style: disc; }
+.blog-prose ol { list-style: decimal; }
+.blog-prose li { margin: 0.3em 0; line-height: 1.5; }
+.blog-prose li p { margin-top: 0.3em; }
+.blog-prose code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; background: var(--color-stone-100, #f5f5f4); padding: 0.15rem 0.35rem; border-radius: 0.25rem; font-size: 0.8em; }
+.blog-prose pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; background: #1c1917; color: #f8fafc; padding: 1rem 1.2rem; border-radius: 0.5rem; font-size: 0.85rem; line-height: 1.5; overflow-x: auto; margin-top: 1.4em; }
+.blog-prose pre code { background: transparent; padding: 0; font-size: inherit; }
+.blog-prose blockquote { border-left: 2px solid #C2744C; padding-left: 1.2rem; color: var(--color-stone-500, #78716c); font-style: italic; margin-top: 1.4em; }
+.blog-prose hr { border: 0; height: 1px; background: var(--color-stone-200, #e7e5e4); margin: 2.5em auto; max-width: 4rem; }
+.blog-prose img { max-width: 100%; border-radius: 0.25rem; margin-top: 1.4em; }
+.blog-prose table { width: 100%; border-collapse: collapse; margin-top: 1.4em; font-size: 0.95rem; }
+.blog-prose th, .blog-prose td { border-bottom: 1px solid var(--color-stone-200, #e7e5e4); padding: 0.6rem 0.75rem; text-align: left; }
+.blog-prose th { font-weight: 600; color: var(--color-stone-900, #1c1917); }
+.blog-prose strong { color: var(--color-stone-900, #1c1917); font-weight: 600; }
+/* Anchor targets (headings + reference ids) clear the sticky site nav on jump. */
+.blog-prose [id] { scroll-margin-top: 6rem; }
+/* Numeric citations like [12] render as compact superscripts. */
+.blog-prose a[href^="#ref-"] {
+  font-size: 0.72em;
+  vertical-align: super;
+  line-height: 0;
+  padding: 0 0.05em;
+  text-decoration: none;
+  font-variant-numeric: tabular-nums;
+}
+.blog-prose a[href^="#ref-"]:hover { text-decoration: underline; }
+
+/* Paradigm prose — position-paper chapter styling */
+.paradigm-prose {
+  color: #3a332d;
+  font-size: 1.08rem;
+  line-height: 1.72;
+}
+.paradigm-prose > * + * { margin-top: 1.1em; }
+.paradigm-prose p { margin: 0; }
+.paradigm-prose p + p { margin-top: 1.1em; }
+.paradigm-prose h2 {
+  font-size: 1.55rem;
+  font-weight: normal;
+  color: var(--color-stone-900, #1c1917);
+  margin-top: 2.4em;
+  margin-bottom: 0.3em;
+  line-height: 1.25;
+  letter-spacing: -0.005em;
+  scroll-margin-top: 2rem;
+}
+.paradigm-prose h2::before {
+  content: "";
+  display: block;
+  width: 2.5rem;
+  height: 1px;
+  background: #c2744c;
+  margin-bottom: 1.2rem;
+  opacity: 0.7;
+}
+.paradigm-prose h3 {
+  font-size: 1.2rem;
+  font-weight: 600;
+  color: var(--color-stone-900, #1c1917);
+  margin-top: 1.8em;
+  margin-bottom: 0.3em;
+  line-height: 1.3;
+  scroll-margin-top: 2rem;
+}
+.paradigm-prose a {
+  color: #c2744c;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: rgba(194,116,76,0.35);
+  text-decoration-thickness: 1px;
+}
+.paradigm-prose a:hover { text-decoration-color: #c2744c; color: #a35c36; }
+/* Compact numeric citations like [12] */
+.paradigm-prose a[href*="/paradigm/references#ref-"] {
+  font-size: 0.75em;
+  vertical-align: super;
+  line-height: 0;
+  padding: 0 0.1em;
+  text-decoration: none;
+  font-variant-numeric: tabular-nums;
+}
+.paradigm-prose a[href*="/paradigm/references#ref-"]:hover {
+  text-decoration: underline;
+}
+.paradigm-prose ul, .paradigm-prose ol { padding-left: 1.5rem; margin: 1em 0; }
+.paradigm-prose ul { list-style: disc; }
+.paradigm-prose ol { list-style: decimal; }
+.paradigm-prose li { margin: 0.4em 0; line-height: 1.65; }
+.paradigm-prose li > p { margin: 0; }
+.paradigm-prose code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  background: #f0eee6;
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.2rem;
+  font-size: 0.85em;
+  color: #a35c36;
+}
+.paradigm-prose blockquote {
+  border-left: 2px solid #c2744c;
+  padding-left: 1.2rem;
+  color: #6f675f;
+  font-style: italic;
+  margin: 1.6em 0;
+}
+.paradigm-prose hr {
+  border: 0;
+  height: 1px;
+  background: var(--color-stone-200, #e7e5e4);
+  margin: 2.5em auto;
+  max-width: 4rem;
+}
+.paradigm-prose strong { color: var(--color-stone-900, #1c1917); font-weight: 600; }
+.paradigm-prose em { font-style: italic; }
+.paradigm-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.6em 0;
+  font-size: 0.95rem;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+.paradigm-prose th, .paradigm-prose td {
+  border-bottom: 1px solid var(--color-stone-200, #e7e5e4);
+  padding: 0.7rem 0.9rem;
+  text-align: left;
+  vertical-align: top;
+}
+.paradigm-prose th {
+  font-weight: 600;
+  color: var(--color-stone-900, #1c1917);
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: #faf7f2;
+  border-bottom: 1px solid #c2744c;
+}
+.paradigm-prose th:first-child, .paradigm-prose td:first-child {
+  color: var(--color-stone-900, #1c1917);
+  font-weight: 500;
+}
+/* References list — dense, tabular */
+.paradigm-prose > p:has(> a[id^="ref-"]) {
+  font-size: 0.92rem;
+  line-height: 1.55;
+  color: #4f4740;
+  padding-left: 2.5rem;
+  text-indent: -2.5rem;
+  margin-top: 0.8em;
+}
+
+/* Diff deep-link pulse — highlights ?diff=<id> target */
+@keyframes diffDeepLinkPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(120, 113, 108, 0); }
+  20%, 60% { box-shadow: 0 0 0 4px rgba(120, 113, 108, 0.30); }
+}
+.diff-deep-link-pulse {
+  animation: diffDeepLinkPulse 1.4s ease-out;
+  border-radius: 1rem;
+}
+@media (prefers-reduced-motion: reduce) {
+  .diff-deep-link-pulse {
+    animation: none;
+    box-shadow: 0 0 0 3px rgba(120, 113, 108, 0.40);
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Shared diff styling tokens — used by both the live TipTap editor
+ *  decorations and the chat-side InlineDocDiff cards so the visual
+ *  language is identical across surfaces.
+ * ───────────────────────────────────────────────────────────────── */
+:root {
+  --diff-add-bg: rgba(16, 185, 129, 0.14);
+  --diff-add-bg-hover: rgba(16, 185, 129, 0.20);
+  --diff-add-bg-strong: rgba(16, 185, 129, 0.32);
+  --diff-add-border: rgb(16, 185, 129);
+  --diff-add-text: rgb(4, 120, 87);
+  --diff-del-bg: rgba(244, 63, 94, 0.10);
+  --diff-del-bg-hover: rgba(244, 63, 94, 0.16);
+  --diff-del-bg-strong: rgba(244, 63, 94, 0.30);
+  --diff-del-border: rgb(244, 63, 94);
+  --diff-del-text: rgb(159, 18, 57);
+}
+/* Must sit AFTER the :root block above — same specificity, so source order
+   decides, and these lose the cascade from the main .dark palette block. */
+@media not print {
+  .dark {
+    --diff-add-text: rgb(52, 211, 153);
+    --diff-del-text: rgb(251, 113, 133);
+  }
+}
+
+/* Shared diff-block chrome — one color/border language across chat-side,
+ * file-side, static chunks, and unified inline renderers. Padding is the
+ * only thing each surface may customize. */
+.diff-block-add { background-color: var(--diff-add-bg); border-left: 3px solid var(--diff-add-border); }
+.diff-block-del { background-color: var(--diff-del-bg); border-left: 3px solid var(--diff-del-border); }
+.diff-tone-add, .diff-tone-add * { color: var(--diff-add-text); }
+.diff-tone-del, .diff-tone-del * { color: var(--diff-del-text); }
+
+@keyframes diffPendingFadeIn {
+  from { background-color: rgba(16, 185, 129, 0); }
+  to { background-color: var(--diff-add-bg); }
+}
+
+/* Used by .monaco-diff-pending-actions (Keep/Undo widget) fade-in. */
+@keyframes workspaceFileContentFadeIn {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Suggestions-as-marks (suggest mode). <ins>/<del> marks live IN the doc, so
+ * these paint the instant you type — no server round-trip, no text-matching.
+ * Same palette as every other diff surface. */
+.tiptap ins[data-suggestion='insertion'],
+ins[data-suggestion='insertion'] {
+  background-color: var(--diff-add-bg);
+  color: var(--diff-add-text);
+  text-decoration: none;
+  border-radius: 2px;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  /* No fade-in animation here: ProseMirror re-creates the <ins> span on every
+   * keystroke, which would replay the fade and make the whole green run flicker
+   * as you type. The background is applied statically so it still paints the
+   * instant you type — which is the intent. */
+}
+.tiptap del[data-suggestion='deletion'],
+del[data-suggestion='deletion'] {
+  background-color: var(--diff-del-bg);
+  color: var(--diff-del-text);
+  text-decoration: none;
+  border-radius: 2px;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  /* Struck text is the accepted projection's "absent" content: the browser skips
+   * it when selecting and excludes it from copy, so a selection across a deletion
+   * reads as the kept + suggested text only (truly optimistic). */
+  -webkit-user-select: none;
+  user-select: none;
+}
+.tiptap .suggestion-node-insertion {
+  box-shadow: inset 0 0 0 2px var(--diff-add-border);
+  background-color: var(--diff-add-bg);
+}
+.tiptap .suggestion-node-deletion {
+  box-shadow: inset 0 0 0 2px var(--diff-del-border);
+  background-color: var(--diff-del-bg);
+}
+
+/* The suggest-changes plugin renders a ¶ widget at every paragraph boundary
+ * inside a suggestion. The mark coloring already conveys the change, so hide
+ * the pilcrows (keep them out of both the green and red surfaces). Exclude the
+ * KaTeX render — it's also a .ProseMirror-widget, so an unscoped rule would hide
+ * math inside a suggested line (raw `$B$` shown instead of rendered math). */
+.tiptap ins[data-suggestion] .ProseMirror-widget:not(.Tiptap-mathematics-render),
+.tiptap del[data-suggestion] .ProseMirror-widget:not(.Tiptap-mathematics-render),
+ins[data-suggestion] .ProseMirror-widget:not(.Tiptap-mathematics-render),
+del[data-suggestion] .ProseMirror-widget:not(.Tiptap-mathematics-render) {
+  display: none;
+}
+
+/* Granular accept (✓) / reject (✕) review controls. Shared 17px square button;
+ * the inline (per change-group) and gutter (per block) wrappers position them. */
+.suggestion-inline-review,
+.suggestion-gutter {
+  display: inline-flex;
+  gap: 2px;
+  user-select: none;
+}
+.suggestion-inline-review button,
+.suggestion-gutter button {
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  border-radius: 4px;
+  border: 1px solid var(--border, #d4d4d8);
+  background: var(--background, #fff);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.85;
+  transition: opacity 80ms ease-out;
+}
+.suggestion-inline-review button:hover,
+.suggestion-gutter button:hover { opacity: 1; }
+.suggestion-review-accept { color: var(--diff-add-text); border-color: var(--diff-add-border); }
+.suggestion-review-reject { color: var(--diff-del-text); border-color: var(--diff-del-border); }
+
+/* Inline group control: an OVERLAY anchored at the hovered run's end. Absolute
+ * so it never shifts the line (the words after the run stay put), dropped just
+ * below the baseline so it doesn't cover the text being read, and given a small
+ * floating chip so the buttons stay legible over whatever it overlaps. */
+.suggestion-inline-review {
+  position: absolute;
+  z-index: 12;
+  /* Drop ~one line below the run (rem, so it doesn't depend on the button's tiny
+   * font) into the inter-line gap, so the words after it on the same line stay
+   * readable; sit at the run's end horizontally. */
+  transform: translate(1px, 1.3rem);
+  padding: 2px;
+  border-radius: 6px;
+  background: var(--background, #fff);
+  box-shadow: 0 1px 4px rgba(28, 25, 23, 0.2);
+  pointer-events: auto;
+}
+
+/* Right-gutter block control: pin one ✓/✕ pair to the right edge at each block's
+ * top, so they line up. position:relative makes the editor the containing block
+ * for the absolutely-positioned controls. Two selectors:
+ *  - the live editor reserves the gutter PERMANENTLY (not toggled with
+ *    `.has-suggestions`): toggling padding-right re-wrapped the whole document
+ *    the instant a suggestion appeared — a jarring shift mid-typing.
+ *  - read-only editors (contenteditable=false) still render controls for
+ *    existing suggestion marks, so reserve the gutter on demand there too,
+ *    otherwise the controls anchor to the viewport instead of the block.
+ * An editable editor matches both with identical values, so no reflow. */
+.tiptap[contenteditable='true']:not(.tiptap-code),
+.tiptap.has-suggestions {
+  position: relative;
+  padding-right: 2.75rem;
+}
+.suggestion-gutter {
+  position: absolute;
+  right: 0.25rem;
+  margin-top: -0.1rem;
+}
+
+/* Image-upload placeholder — instant local preview + spinner shown while a
+ * dropped/pasted image uploads (collab-editor ImageUploadPlaceholder). */
+.sd-img-upload {
+  position: relative;
+  display: inline-block;
+  vertical-align: top;
+  max-width: 100%;
+  margin: 0.25rem 0;
+}
+.sd-img-upload img {
+  display: block;
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: 0.5rem;
+  opacity: 0.5;
+}
+.sd-img-upload__spinner {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 28px;
+  height: 28px;
+  margin: -14px 0 0 -14px;
+  border-radius: 9999px;
+  border: 3px solid rgba(255, 255, 255, 0.6);
+  border-top-color: var(--color-stone-700, #44403c); /* stone-700 */
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+  animation: sdImgUploadSpin 0.7s linear infinite;
+}
+@keyframes sdImgUploadSpin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sd-img-upload__spinner { animation: none; }
+}
+
+/* Inline editor decorations — applied to ProseMirror block nodes.
+ * Tint is painted on ::before (square left, rounded right) and the 3px rail
+ * lives on ::after so it can extend into the block margin gap and bridge
+ * adjacent same-change blocks into one continuous vertical line. Both pseudos
+ * sit behind text, so margins, padding, list markers, and nested <p> display
+ * stay identical to unhighlighted markdown. */
+.tiptap .diff-pending-addition {
+  position: relative;
+  isolation: isolate;
+}
+.tiptap .diff-pending-addition::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  pointer-events: none;
+  top: 0;
+  bottom: 0;
+  left: -13px;
+  right: -8px;
+  background-color: var(--diff-add-bg);
+  border-radius: 0 6px 6px 0;
+  transition: background-color 0.18s ease-out;
+  animation: diffPendingFadeIn 0.18s ease-out;
+}
+.tiptap .diff-pending-addition::after {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  pointer-events: none;
+  top: 0;
+  bottom: 0;
+  left: -13px;
+  width: 3px;
+  background-color: var(--diff-add-border);
+}
+.tiptap .diff-pending-addition:hover::before {
+  background-color: var(--diff-add-bg-hover);
+}
+/* Square the band's internal edges where adjacent same-change blocks bleed,
+   so the multi-block tint reads as one continuous ribbon. */
+.tiptap .diff-pending-addition:not(.diff-pending-first)::before {
+  border-top-right-radius: 0;
+}
+.tiptap .diff-pending-addition:not(.diff-pending-last)::before {
+  border-bottom-right-radius: 0;
+}
+/* Continuous rail — extend the ::after slab 0.6em into the 0.9em margin gap on
+   each side so adjacent same-change rails overlap and the eye sees one line.
+   Standalone blocks (first AND last) skip both extensions. */
+.tiptap .diff-pending-addition:not(.diff-pending-first)::after {
+  top: -0.6em;
+}
+.tiptap .diff-pending-addition:not(.diff-pending-last)::after {
+  bottom: -0.6em;
+}
+/* Extend the tint + rail into list marker columns (markers stay outside). */
+.tiptap li.diff-pending-addition::before,
+.tiptap li.diff-pending-addition::after {
+  left: calc(-1.5rem - 13px);
+}
+.tiptap li:has(> p > .md-checkbox).diff-pending-addition::before,
+.tiptap li:has(> p > .md-checkbox).diff-pending-addition::after {
+  left: calc(-1.25em - 13px);
+}
+/* Thin horizontal rules need a little vertical band to read as highlighted. */
+.tiptap hr.diff-pending-addition::before,
+.tiptap hr.diff-pending-addition::after {
+  top: -4px;
+  bottom: -4px;
+}
+.tiptap blockquote[data-callout].diff-pending-addition::before {
+  border-radius: 0 1rem 1rem 0;
+}
+.tiptap pre.diff-pending-addition::before {
+  border-radius: 0 0.6rem 0.6rem 0;
+}
+
+/* Stronger word-level highlight on top of the block-level addition band. */
+.tiptap .diff-inline-added {
+  background-color: var(--diff-add-bg-strong);
+  border-radius: 2px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+/* Word-level add/remove highlights for surfaces outside the `.tiptap` editor
+   (chat code chunks, Monaco deletion view zones) — same palette, symmetric
+   red for removed words / green for added words. */
+.diff-inline-added,
+.diff-inline-removed,
+.monaco-diff-inline-removed {
+  border-radius: 2px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+.diff-inline-added { background-color: var(--diff-add-bg-strong); }
+.diff-inline-removed,
+.monaco-diff-inline-removed { background-color: var(--diff-del-bg-strong); }
+
+/* Deletion ghost — mirrors the addition chrome with the deletion palette so
+   list markers, padding, and typography stay pixel-identical. */
+.tiptap .diff-pending-deletion {
+  position: relative;
+  isolation: isolate;
+}
+.tiptap .diff-pending-deletion::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  pointer-events: none;
+  top: 0;
+  bottom: 0;
+  left: -13px;
+  right: -8px;
+  background-color: var(--diff-del-bg);
+  border-radius: 0 6px 6px 0;
+  transition: background-color 0.18s ease-out;
+  animation: diffPendingDeletionFadeIn 0.18s ease-out;
+}
+.tiptap .diff-pending-deletion::after {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  pointer-events: none;
+  top: 0;
+  bottom: 0;
+  left: -13px;
+  width: 3px;
+  background-color: var(--diff-del-border);
+}
+.tiptap .diff-pending-deletion:hover::before {
+  background-color: var(--diff-del-bg-hover);
+}
+.tiptap .diff-pending-deletion:not(.diff-pending-first)::before {
+  border-top-right-radius: 0;
+}
+.tiptap .diff-pending-deletion:not(.diff-pending-last)::before {
+  border-bottom-right-radius: 0;
+}
+.tiptap .diff-pending-deletion:not(.diff-pending-first)::after {
+  top: -0.6em;
+}
+.tiptap .diff-pending-deletion:not(.diff-pending-last)::after {
+  bottom: -0.6em;
+}
+.tiptap li.diff-pending-deletion::before,
+.tiptap li.diff-pending-deletion::after {
+  left: calc(-1.5rem - 13px);
+}
+.tiptap li:has(> p > .md-checkbox).diff-pending-deletion::before,
+.tiptap li:has(> p > .md-checkbox).diff-pending-deletion::after {
+  left: calc(-1.25em - 13px);
+}
+.tiptap hr.diff-pending-deletion::before,
+.tiptap hr.diff-pending-deletion::after {
+  top: -4px;
+  bottom: -4px;
+}
+.tiptap blockquote[data-callout].diff-pending-deletion::before {
+  border-radius: 0 1rem 1rem 0;
+}
+.tiptap pre.diff-pending-deletion::before {
+  border-radius: 0 0.6rem 0.6rem 0;
+}
+/* Editor widget shell — the ghost blocks inside carry the highlight and keep
+   their own natural markdown margins; the wrapper adds nothing of its own. */
+.tiptap .diff-pending-deletion-widget {
+  margin: 0;
+  padding: 0;
+}
+/* ProseMirror widgets default to inline — block-level for deletion ghosts so
+   the ghost flows like a normal block with the same spacing as the doc. */
+.tiptap .ProseMirror-widget:has(.diff-pending-deletion-widget) {
+  display: block;
+}
+/* When a deletion widget sits directly above its paired live blocks, drop the
+   default 0.9em sibling margin so the red and green rails meet seamlessly. */
+.tiptap .ProseMirror-widget:has(.diff-pending-deletion-widget) + *,
+.tiptap .diff-pending-deletion-widget + * {
+  margin-top: 0;
+}
+
+/* Chat / file-pane inline diff chunks — same TipTap typography as the editor,
+   with just enough inset so ::before highlights are not clipped by card edges.
+   Block spacing falls back to native markdown rhythm (`.tiptap h1/h2/...`
+   margins + browser defaults) so chat reads identically to the editor. */
+.tiptap.diff-inline-doc-chunk {
+  padding-left: 13px;
+  padding-right: 8px;
+}
+.tiptap.diff-inline-doc-chunk--fade-additions .diff-pending-addition {
+  opacity: 0.5;
+}
+/* Stand-in for blank-line-only hunks — meta text, not document content. */
+.tiptap .diff-blank-note {
+  font-size: 12px;
+  font-style: italic;
+  color: var(--color-stone-500, #78716c);
+}
+
+/* Per-chunk review actions — shared across the TipTap editor widget, chat
+   markdown/code chunks, and the Monaco code widget so every surface reads as
+   one system. Icon buttons keep the verbs in aria-label/title. */
+.diff-pending-keep,
+.diff-pending-undo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  font-size: 11px;
+  border-radius: 5px;
+  border: 1px solid var(--border, #d4d4d8);
+  background: var(--color-white, #fff);
+  cursor: pointer;
+  opacity: 0.85;
+  transition: background-color 0.12s, border-color 0.12s, opacity 0.12s;
+  line-height: 1;
+}
+.diff-pending-keep {
+  color: var(--diff-add-text);
+  border-color: var(--diff-add-border);
+}
+.diff-pending-keep:hover {
+  opacity: 1;
+  background-color: var(--diff-add-bg);
+}
+.diff-pending-undo {
+  color: var(--diff-del-text);
+  border-color: var(--diff-del-border);
+}
+.diff-pending-undo:hover {
+  opacity: 1;
+  background-color: var(--diff-del-bg);
+}
+.diff-pending-author {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 4px;
+  font-size: 10px;
+  font-weight: 500;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--color-stone-500, rgb(120, 113, 108));
+  background: transparent;
+  border: 0;
+  cursor: default;
+  text-decoration: none;
+  line-height: 1;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.diff-pending-author:hover {
+  color: var(--color-stone-800, rgb(41, 37, 36));
+  text-decoration-color: currentColor;
+}
+button.diff-pending-author {
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: rgba(120, 113, 108, 0.3);
+  text-underline-offset: 2px;
+}
+button.diff-pending-author:hover {
+  text-decoration-color: currentColor;
+}
+
+/* Base container — compact, right-aligned row. */
+.diff-pending-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  user-select: none;
+}
+
+/* In-flow fallback (right-aligned, minimal reserved space) — used only for
+   pure-deletion chunks in the editor, which have no addition block to anchor a
+   floating pill inside of. */
+.tiptap .diff-pending-actions {
+  margin: 2px 0 6px;
+  cursor: pointer;
+}
+
+/* Floating overlay variant — sits the controls on the diff block's top-right
+   corner without reserving any layout height. Used by chat diff chunks and by
+   the editor (anchored inside the relatively-positioned addition block).
+   Stacked vertically so the pill stays narrow and reads as a compact menu — a
+   horizontal row spans most of a narrow gutter and gets clipped on chat. */
+.diff-pending-actions--float {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 6;
+  margin: 0;
+  gap: 3px;
+  cursor: pointer;
+}
+/* Beat the in-flow `.tiptap .diff-pending-actions` margin (equal specificity,
+   later in source) so the float never reserves a line in either surface.
+   Pill is always visible — no hover gate — so reviewers can act without
+   chasing the chunk first. */
+.tiptap .diff-pending-actions--float {
+  margin: 0;
+}
+/* Editor anchor: park the pill in the page card's right margin so it never
+   sits over text. `left: 100%` is relative to the addition block (which is
+   `position: relative`), so the pill lands just past the block's right edge,
+   inside the page card's gutter. */
+.tiptap .diff-pending-addition > .diff-pending-actions--float {
+  top: 0;
+  left: 100%;
+  right: auto;
+  margin-left: 8px;
+}
+/* Narrow viewports have no real page gutter — fall back to the in-block
+   top-right overlay (same behavior as chat chunks). */
+@media (max-width: 720px) {
+  .tiptap .diff-pending-addition > .diff-pending-actions--float {
+    top: 4px;
+    left: auto;
+    right: 4px;
+    margin-left: 0;
+  }
+}
+.chat-message-pulse {
+  animation: chat-message-pulse 1.4s ease-out;
+}
+@keyframes diffPendingDeletionFadeIn {
+  from { background-color: rgba(239, 68, 68, 0); }
+  to { background-color: var(--diff-del-bg); }
+}
+@keyframes chat-message-pulse {
+  0% { background-color: rgba(245, 158, 11, 0.18); }
+  100% { background-color: transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tiptap .diff-pending-addition::before {
+    animation: none;
+    transition: none;
+  }
+  .tiptap .diff-pending-deletion::before {
+    animation: none;
+    transition: none;
+  }
+}
+
+/* Monaco (code) editor inline decorations — same visual language */
+.monaco-editor .monaco-diff-pending-addition {
+  background-color: var(--diff-add-bg) !important;
+  animation: diffPendingFadeIn 0.18s ease-out;
+}
+.monaco-editor .monaco-diff-inline-added {
+  background-color: var(--diff-add-bg-strong) !important;
+  border-radius: 2px;
+  animation: diffInlinePendingFadeIn 0.18s ease-out;
+}
+/* Pointer cursor when hovering an addition line; toggled via `data-diff-hover`
+   from the JS side because Monaco paints `monaco-diff-pending-addition` on a
+   background overlay layer, not the text layer the cursor actually hits. */
+.monaco-editor[data-diff-hover='1'] .view-lines {
+  cursor: pointer;
+}
+.monaco-diff-pending-actions {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  background: var(--color-white, #fff);
+  border: 1px solid var(--diff-add-border);
+  border-radius: 6px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+  user-select: none;
+  pointer-events: auto;
+  width: max-content;
+  max-width: none;
+  white-space: nowrap;
+  animation: workspaceFileContentFadeIn 0.16s ease-out;
+}
+/* Empty 1-row view zone below each chunk. Reserves vertical space so the
+   Keep/Undo content widget renders into empty editor space instead of over
+   the next code line. */
+.monaco-diff-pending-actions-spacer {
+  background: transparent;
+}
+
+/* Deletion ghost rows in the code editor — red band, no strikethrough. */
+.monaco-diff-pending-deletion {
+  background-color: var(--diff-del-bg);
+  color: inherit;
+  padding-right: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: visible;
+  animation: diffPendingDeletionFadeIn 0.18s ease-out;
+}
+@keyframes diffInlinePendingFadeIn {
+  from { background-color: rgba(16, 185, 129, 0); }
+  to { background-color: var(--diff-add-bg-strong); }
+}
+.monaco-diff-pending-deletion-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* Inline comment highlights in the code editor — same visual language as the
+   markdown `.doc-comment-range*` classes, applied via Monaco inlineClassName. */
+.monaco-editor .monaco-comment-range {
+  background: rgba(255, 214, 102, 0.4);
+}
+.monaco-editor .monaco-comment-range-active {
+  background: rgba(255, 140, 0, 0.85);
+  animation: doc-comment-flash 0.9s ease-out;
+}
+.monaco-editor .monaco-comment-range-resolved {
+  background: rgba(232, 234, 237, 0.95);
+}
+.monaco-editor .monaco-comment-draft-range {
+  background: rgba(255, 121, 0, 0.44);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .monaco-editor .monaco-diff-pending-addition,
+  .monaco-editor .monaco-diff-inline-added,
+  .monaco-diff-pending-actions,
+  .monaco-diff-pending-deletion,
+  .monaco-editor .monaco-comment-range-active {
+    animation: none;
+  }
+}
+
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  [data-print-root],
+  [data-print-root] * {
+    visibility: visible;
+  }
+  /* Override the on-screen content-visibility optimization: every block must
+     render so the printout/PDF includes off-screen content. */
+  [data-print-root] .tiptap > * {
+    content-visibility: visible;
+    contain-intrinsic-size: auto none;
+  }
+  [data-print-root] {
+    position: absolute;
+    left: 0;
+    top: 0;
+    margin: 0;
+    /* The printed margin is this element's own padding (driven by the toolbar's
+       Narrow/Normal/Wide control). @page margin is 0 below so the browser prints
+       no date/title/URL/page-number chrome in the page margins. */
+    padding: var(--print-margin, 0.75in);
+    /* Honor the editor's zoom as the printed text size. `zoom` (unlike the
+       on-screen scale transform, which is reset here) reflows and paginates;
+       dividing the width back out keeps the zoomed page exactly one sheet wide
+       instead of overflowing it. */
+    zoom: var(--print-zoom, 1);
+    width: calc(100% / var(--print-zoom, 1)) !important;
+    background: white !important;
+    border: none !important;
+    box-shadow: none !important;
+    transform: none !important;
+    color: black;
+  }
+  [data-print-root] h1,
+  [data-print-root] h2,
+  [data-print-root] h3,
+  [data-print-root] h4,
+  [data-print-root] h5,
+  [data-print-root] h6 {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  [data-print-root] img,
+  [data-print-root] table {
+    break-inside: avoid;
+    page-break-inside: avoid;
+    max-width: 100%;
+  }
+  @page {
+    /* 0 so the browser prints no header/footer chrome; the page margin comes
+       from [data-print-root] padding instead (var --print-margin). */
+    margin: 0;
+  }
+}
+
+/* KaTeX in-editor overlay (Tiptap Mathematics extension).
+ * The raw `$...$` text remains in the doc; KaTeX is rendered as a widget on top.
+ * Click into the math range and the raw source becomes visible for editing. */
+.Tiptap-mathematics-editor {
+  background: rgba(234, 246, 255, 0.6);
+  border-radius: 3px;
+  padding: 0 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.95em;
+  color: #1e40af;
+}
+.Tiptap-mathematics-editor--hidden {
+  /* the inline decoration's inline style already collapses the raw source */
+}
+.Tiptap-mathematics-render {
+  display: inline-block;
+  vertical-align: middle;
+  cursor: text;
+}
+.Tiptap-mathematics-render--editable:hover {
+  outline: 1px dashed rgba(59, 130, 246, 0.5);
+  border-radius: 2px;
+}
+.tiptap .katex-display {
+  margin: 0.6em 0;
+}
+
+/* Shimmer for the transient "Compiling LaTeX" chat indicator — a soft
+   highlight band sweeping left→right across the text, Claude-Code style. */
+@keyframes latex-compile-shimmer {
+  0% { background-position: 150% 0; }
+  100% { background-position: -50% 0; }
+}
+.latex-compile-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    var(--color-stone-400, #a8a29e) 0%,
+    var(--color-stone-400, #a8a29e) 35%,
+    var(--color-stone-800, #292524) 50%,
+    var(--color-stone-400, #a8a29e) 65%,
+    var(--color-stone-400, #a8a29e) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: latex-compile-shimmer 1.5s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .latex-compile-shimmer {
+    animation: none;
+    color: var(--color-stone-500, #78716c);
+  }
+}
+
+/* SyncTeX inverse / search jump: briefly flash the target editor line so the
+   jump is visible even when the line is already on screen (no yellow). */
+.stx-line-flash {
+  animation: stx-line-flash-fade 1.5s ease-out forwards;
+}
+@keyframes stx-line-flash-fade {
+  from { background-color: rgba(129, 140, 248, 0.34); }
+  to { background-color: rgba(129, 140, 248, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .stx-line-flash { animation: none; }
+}
+
+/* Onboarding flow: gentle entrance for each step + revealed controls. */
+@keyframes onboarding-fade-in-up {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes onboarding-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.animate-fade-in-up {
+  /* `both` (not `forwards`) so staggered children (animation-delay) stay
+     hidden until their turn instead of flashing in early. */
+  animation: onboarding-fade-in-up 0.45s ease-out both;
+}
+.animate-fade-in {
+  animation: onboarding-fade-in 0.4s ease-out forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-in-up,
+  .animate-fade-in { animation: none; }
+}
+
+/* ── Onboarding welcome demo (AgentEditDemo): an agent edit lands as a green
+   tracked change, then gets accepted. All parts share one 7s linear loop. ── */
+/* The inserted line "types" in (clip-path reveal — compositor-friendly, no
+   per-frame layout), holds its green highlight until the accept, then settles
+   to plain text before the loop resets. */
+.sd-onb-demo-line {
+  display: inline-block;
+  white-space: nowrap;
+  animation: sdOnbLine 7s linear infinite;
+}
+@keyframes sdOnbLine {
+  0%, 11% { clip-path: inset(0 100% 0 0); background-color: rgb(209 250 229); opacity: 1; }
+  36% { clip-path: inset(0 0 0 0); background-color: rgb(209 250 229); }
+  55% { background-color: rgb(209 250 229); }
+  62%, 93% { clip-path: inset(0 0 0 0); background-color: transparent; opacity: 1; }
+  97%, 100% { clip-path: inset(0 0 0 0); background-color: transparent; opacity: 0; }
+}
+.sd-onb-demo-pill { animation: sdOnbPill 7s linear infinite; }
+@keyframes sdOnbPill {
+  0%, 39% { opacity: 0; transform: translateY(3px) scale(1); }
+  44%, 51% { opacity: 1; transform: translateY(0) scale(1); }
+  54% { opacity: 1; transform: translateY(0) scale(0.9); } /* the "click" */
+  58%, 100% { opacity: 0; transform: translateY(0) scale(1); }
+}
+.sd-onb-demo-done { animation: sdOnbDone 7s linear infinite; }
+@keyframes sdOnbDone {
+  0%, 56% { opacity: 0; }
+  61%, 90% { opacity: 1; }
+  96%, 100% { opacity: 0; }
+}
+/* Reduced motion: freeze on the settled, accepted state. */
+@media (prefers-reduced-motion: reduce) {
+  .sd-onb-demo-line, .sd-onb-demo-pill, .sd-onb-demo-done {
+    animation: none;
+  }
+  .sd-onb-demo-line { background-color: transparent; }
+  .sd-onb-demo-pill { display: none; }
+}
+
+/* ── LaTeX landing fonts (Google Sans / Google Sans Code) ── */
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 400; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4x5hg2a2c.woff2") format('woff2'); unicode-range: U+02C7, U+02D8-02D9, U+02DB, U+0307, U+1400-167F, U+18B0-18F5, U+25CC, U+11AB0-11ABF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 400; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4x2hg2a2c.woff2") format('woff2'); unicode-range: U+0300-0302, U+0304, U+030B-030C, U+0323-0324, U+0330-0331, U+13A0-13FF, U+AB70-ABBF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 400; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xtRg2a2c.woff2") format('woff2'); unicode-range: U+0302-0303, U+0305, U+0307-0308, U+0310, U+0312, U+0315, U+031A, U+0326-0327, U+032C, U+032F-0330, U+0332-0333, U+0338, U+033A, U+0346, U+034D, U+0391-03A1, U+03A3-03A9, U+03B1-03C9, U+03D1, U+03D5-03D6, U+03F0-03F1, U+03F4-03F5, U+2016-2017, U+2034-2038, U+203C, U+2040, U+2043, U+2047, U+2050, U+2057, U+205F, U+2070-2071, U+2074-208E, U+2090-209C, U+20D0-20DC, U+20E1, U+20E5-20EF, U+2100-2112, U+2114-2115, U+2117-2121, U+2123-214F, U+2190, U+2192, U+2194-21AE, U+21B0-21E5, U+21F1-21F2, U+21F4-2211, U+2213-2214, U+2216-22FF, U+2308-230B, U+2310, U+2319, U+231C-2321, U+2336-237A, U+237C, U+2395, U+239B-23B7, U+23D0, U+23DC-23E1, U+2474-2475, U+25AF, U+25B3, U+25B7, U+25BD, U+25C1, U+25CA, U+25CC, U+25FB, U+266D-266F, U+27C0-27FF, U+2900-2AFF, U+2B0E-2B11, U+2B30-2B4C, U+2BFE, U+3030, U+FF5B, U+FF5D, U+1D400-1D7FF, U+1EE00-1EEFF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 400; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xthg2a2c.woff2") format('woff2'); unicode-range: U+2003, U+3000, U+3002, U+4E00, U+FE12, U+16FE1, U+1B170-1B2FB; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 400; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xpxg2a2c.woff2") format('woff2'); unicode-range: U+0001-000C, U+000E-001F, U+007F-009F, U+20DD-20E0, U+20E2-20E4, U+2150-218F, U+2190, U+2192, U+2194-2199, U+21AF, U+21E6-21F0, U+21F3, U+2218-2219, U+2299, U+22C4-22C6, U+2300-243F, U+2440-244A, U+2460-24FF, U+25A0-27BF, U+2800-28FF, U+2921-2922, U+2981, U+29BF, U+29EB, U+2B00-2BFF, U+4DC0-4DFF, U+FFF9-FFFB, U+10140-1018E, U+10190-1019C, U+101A0, U+101D0-101FD, U+102E0-102FB, U+10E60-10E7E, U+1D2C0-1D2D3, U+1D2E0-1D37F, U+1F000-1F0FF, U+1F100-1F1AD, U+1F1E6-1F1FF, U+1F30D-1F30F, U+1F315, U+1F31C, U+1F31E, U+1F320-1F32C, U+1F336, U+1F378, U+1F37D, U+1F382, U+1F393-1F39F, U+1F3A7-1F3A8, U+1F3AC-1F3AF, U+1F3C2, U+1F3C4-1F3C6, U+1F3CA-1F3CE, U+1F3D4-1F3E0, U+1F3ED, U+1F3F1-1F3F3, U+1F3F5-1F3F7, U+1F408, U+1F415, U+1F41F, U+1F426, U+1F43F, U+1F441-1F442, U+1F444, U+1F446-1F449, U+1F44C-1F44E, U+1F453, U+1F46A, U+1F47D, U+1F4A3, U+1F4B0, U+1F4B3, U+1F4B9, U+1F4BB, U+1F4BF, U+1F4C8-1F4CB, U+1F4D6, U+1F4DA, U+1F4DF, U+1F4E3-1F4E6, U+1F4EA-1F4ED, U+1F4F7, U+1F4F9-1F4FB, U+1F4FD-1F4FE, U+1F503, U+1F507-1F50B, U+1F50D, U+1F512-1F513, U+1F53E-1F54A, U+1F54F-1F5FA, U+1F610, U+1F650-1F67F, U+1F687, U+1F68D, U+1F691, U+1F694, U+1F698, U+1F6AD, U+1F6B2, U+1F6B9-1F6BA, U+1F6BC, U+1F6C6-1F6CF, U+1F6D3-1F6D7, U+1F6E0-1F6EA, U+1F6F0-1F6F3, U+1F6F7-1F6FC, U+1F700-1F7FF, U+1F800-1F80B, U+1F810-1F847, U+1F850-1F859, U+1F860-1F887, U+1F890-1F8AD, U+1F8B0-1F8BB, U+1F8C0-1F8C1, U+1F900-1F90B, U+1F93B, U+1F946, U+1F984, U+1F996, U+1F9E9, U+1FA00-1FA6F, U+1FA70-1FA7C, U+1FA80-1FA89, U+1FA8F-1FAC6, U+1FACE-1FADC, U+1FADF-1FAE9, U+1FAF0-1FAF8, U+1FB00-1FBFF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 400; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xuhg2a2c.woff2") format('woff2'); unicode-range: U+0303-0304, U+0307-0308, U+030A, U+0320, U+0323-0325, U+032D-032E, U+0330-0331, U+060C, U+061B-061C, U+061F, U+0621, U+0640, U+064B-0655, U+0660-066C, U+0670, U+0700-074F, U+0860-086A, U+1DF8, U+1DFA, U+200C-200F, U+25CC, U+2670-2671; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 400; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4x6Rg2a2c.woff2") format('woff2'); unicode-range: U+02C7, U+0301-0302, U+0304, U+0306-0307, U+0309, U+0323, U+0331, U+200C-200D, U+202E, U+25CC, U+2D30-2D7F; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 400; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xxhg2a2c.woff2") format('woff2'); unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 400; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xxxg2a2c.woff2") format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 400; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xyRg2.woff2") format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 500; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4x5hg2a2c.woff2") format('woff2'); unicode-range: U+02C7, U+02D8-02D9, U+02DB, U+0307, U+1400-167F, U+18B0-18F5, U+25CC, U+11AB0-11ABF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 500; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4x2hg2a2c.woff2") format('woff2'); unicode-range: U+0300-0302, U+0304, U+030B-030C, U+0323-0324, U+0330-0331, U+13A0-13FF, U+AB70-ABBF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 500; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xtRg2a2c.woff2") format('woff2'); unicode-range: U+0302-0303, U+0305, U+0307-0308, U+0310, U+0312, U+0315, U+031A, U+0326-0327, U+032C, U+032F-0330, U+0332-0333, U+0338, U+033A, U+0346, U+034D, U+0391-03A1, U+03A3-03A9, U+03B1-03C9, U+03D1, U+03D5-03D6, U+03F0-03F1, U+03F4-03F5, U+2016-2017, U+2034-2038, U+203C, U+2040, U+2043, U+2047, U+2050, U+2057, U+205F, U+2070-2071, U+2074-208E, U+2090-209C, U+20D0-20DC, U+20E1, U+20E5-20EF, U+2100-2112, U+2114-2115, U+2117-2121, U+2123-214F, U+2190, U+2192, U+2194-21AE, U+21B0-21E5, U+21F1-21F2, U+21F4-2211, U+2213-2214, U+2216-22FF, U+2308-230B, U+2310, U+2319, U+231C-2321, U+2336-237A, U+237C, U+2395, U+239B-23B7, U+23D0, U+23DC-23E1, U+2474-2475, U+25AF, U+25B3, U+25B7, U+25BD, U+25C1, U+25CA, U+25CC, U+25FB, U+266D-266F, U+27C0-27FF, U+2900-2AFF, U+2B0E-2B11, U+2B30-2B4C, U+2BFE, U+3030, U+FF5B, U+FF5D, U+1D400-1D7FF, U+1EE00-1EEFF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 500; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xthg2a2c.woff2") format('woff2'); unicode-range: U+2003, U+3000, U+3002, U+4E00, U+FE12, U+16FE1, U+1B170-1B2FB; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 500; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xpxg2a2c.woff2") format('woff2'); unicode-range: U+0001-000C, U+000E-001F, U+007F-009F, U+20DD-20E0, U+20E2-20E4, U+2150-218F, U+2190, U+2192, U+2194-2199, U+21AF, U+21E6-21F0, U+21F3, U+2218-2219, U+2299, U+22C4-22C6, U+2300-243F, U+2440-244A, U+2460-24FF, U+25A0-27BF, U+2800-28FF, U+2921-2922, U+2981, U+29BF, U+29EB, U+2B00-2BFF, U+4DC0-4DFF, U+FFF9-FFFB, U+10140-1018E, U+10190-1019C, U+101A0, U+101D0-101FD, U+102E0-102FB, U+10E60-10E7E, U+1D2C0-1D2D3, U+1D2E0-1D37F, U+1F000-1F0FF, U+1F100-1F1AD, U+1F1E6-1F1FF, U+1F30D-1F30F, U+1F315, U+1F31C, U+1F31E, U+1F320-1F32C, U+1F336, U+1F378, U+1F37D, U+1F382, U+1F393-1F39F, U+1F3A7-1F3A8, U+1F3AC-1F3AF, U+1F3C2, U+1F3C4-1F3C6, U+1F3CA-1F3CE, U+1F3D4-1F3E0, U+1F3ED, U+1F3F1-1F3F3, U+1F3F5-1F3F7, U+1F408, U+1F415, U+1F41F, U+1F426, U+1F43F, U+1F441-1F442, U+1F444, U+1F446-1F449, U+1F44C-1F44E, U+1F453, U+1F46A, U+1F47D, U+1F4A3, U+1F4B0, U+1F4B3, U+1F4B9, U+1F4BB, U+1F4BF, U+1F4C8-1F4CB, U+1F4D6, U+1F4DA, U+1F4DF, U+1F4E3-1F4E6, U+1F4EA-1F4ED, U+1F4F7, U+1F4F9-1F4FB, U+1F4FD-1F4FE, U+1F503, U+1F507-1F50B, U+1F50D, U+1F512-1F513, U+1F53E-1F54A, U+1F54F-1F5FA, U+1F610, U+1F650-1F67F, U+1F687, U+1F68D, U+1F691, U+1F694, U+1F698, U+1F6AD, U+1F6B2, U+1F6B9-1F6BA, U+1F6BC, U+1F6C6-1F6CF, U+1F6D3-1F6D7, U+1F6E0-1F6EA, U+1F6F0-1F6F3, U+1F6F7-1F6FC, U+1F700-1F7FF, U+1F800-1F80B, U+1F810-1F847, U+1F850-1F859, U+1F860-1F887, U+1F890-1F8AD, U+1F8B0-1F8BB, U+1F8C0-1F8C1, U+1F900-1F90B, U+1F93B, U+1F946, U+1F984, U+1F996, U+1F9E9, U+1FA00-1FA6F, U+1FA70-1FA7C, U+1FA80-1FA89, U+1FA8F-1FAC6, U+1FACE-1FADC, U+1FADF-1FAE9, U+1FAF0-1FAF8, U+1FB00-1FBFF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 500; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xuhg2a2c.woff2") format('woff2'); unicode-range: U+0303-0304, U+0307-0308, U+030A, U+0320, U+0323-0325, U+032D-032E, U+0330-0331, U+060C, U+061B-061C, U+061F, U+0621, U+0640, U+064B-0655, U+0660-066C, U+0670, U+0700-074F, U+0860-086A, U+1DF8, U+1DFA, U+200C-200F, U+25CC, U+2670-2671; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 500; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4x6Rg2a2c.woff2") format('woff2'); unicode-range: U+02C7, U+0301-0302, U+0304, U+0306-0307, U+0309, U+0323, U+0331, U+200C-200D, U+202E, U+25CC, U+2D30-2D7F; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 500; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xxhg2a2c.woff2") format('woff2'); unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 500; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xxxg2a2c.woff2") format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 500; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xyRg2.woff2") format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 700; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4x5hg2a2c.woff2") format('woff2'); unicode-range: U+02C7, U+02D8-02D9, U+02DB, U+0307, U+1400-167F, U+18B0-18F5, U+25CC, U+11AB0-11ABF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 700; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4x2hg2a2c.woff2") format('woff2'); unicode-range: U+0300-0302, U+0304, U+030B-030C, U+0323-0324, U+0330-0331, U+13A0-13FF, U+AB70-ABBF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 700; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xtRg2a2c.woff2") format('woff2'); unicode-range: U+0302-0303, U+0305, U+0307-0308, U+0310, U+0312, U+0315, U+031A, U+0326-0327, U+032C, U+032F-0330, U+0332-0333, U+0338, U+033A, U+0346, U+034D, U+0391-03A1, U+03A3-03A9, U+03B1-03C9, U+03D1, U+03D5-03D6, U+03F0-03F1, U+03F4-03F5, U+2016-2017, U+2034-2038, U+203C, U+2040, U+2043, U+2047, U+2050, U+2057, U+205F, U+2070-2071, U+2074-208E, U+2090-209C, U+20D0-20DC, U+20E1, U+20E5-20EF, U+2100-2112, U+2114-2115, U+2117-2121, U+2123-214F, U+2190, U+2192, U+2194-21AE, U+21B0-21E5, U+21F1-21F2, U+21F4-2211, U+2213-2214, U+2216-22FF, U+2308-230B, U+2310, U+2319, U+231C-2321, U+2336-237A, U+237C, U+2395, U+239B-23B7, U+23D0, U+23DC-23E1, U+2474-2475, U+25AF, U+25B3, U+25B7, U+25BD, U+25C1, U+25CA, U+25CC, U+25FB, U+266D-266F, U+27C0-27FF, U+2900-2AFF, U+2B0E-2B11, U+2B30-2B4C, U+2BFE, U+3030, U+FF5B, U+FF5D, U+1D400-1D7FF, U+1EE00-1EEFF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 700; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xthg2a2c.woff2") format('woff2'); unicode-range: U+2003, U+3000, U+3002, U+4E00, U+FE12, U+16FE1, U+1B170-1B2FB; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 700; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xpxg2a2c.woff2") format('woff2'); unicode-range: U+0001-000C, U+000E-001F, U+007F-009F, U+20DD-20E0, U+20E2-20E4, U+2150-218F, U+2190, U+2192, U+2194-2199, U+21AF, U+21E6-21F0, U+21F3, U+2218-2219, U+2299, U+22C4-22C6, U+2300-243F, U+2440-244A, U+2460-24FF, U+25A0-27BF, U+2800-28FF, U+2921-2922, U+2981, U+29BF, U+29EB, U+2B00-2BFF, U+4DC0-4DFF, U+FFF9-FFFB, U+10140-1018E, U+10190-1019C, U+101A0, U+101D0-101FD, U+102E0-102FB, U+10E60-10E7E, U+1D2C0-1D2D3, U+1D2E0-1D37F, U+1F000-1F0FF, U+1F100-1F1AD, U+1F1E6-1F1FF, U+1F30D-1F30F, U+1F315, U+1F31C, U+1F31E, U+1F320-1F32C, U+1F336, U+1F378, U+1F37D, U+1F382, U+1F393-1F39F, U+1F3A7-1F3A8, U+1F3AC-1F3AF, U+1F3C2, U+1F3C4-1F3C6, U+1F3CA-1F3CE, U+1F3D4-1F3E0, U+1F3ED, U+1F3F1-1F3F3, U+1F3F5-1F3F7, U+1F408, U+1F415, U+1F41F, U+1F426, U+1F43F, U+1F441-1F442, U+1F444, U+1F446-1F449, U+1F44C-1F44E, U+1F453, U+1F46A, U+1F47D, U+1F4A3, U+1F4B0, U+1F4B3, U+1F4B9, U+1F4BB, U+1F4BF, U+1F4C8-1F4CB, U+1F4D6, U+1F4DA, U+1F4DF, U+1F4E3-1F4E6, U+1F4EA-1F4ED, U+1F4F7, U+1F4F9-1F4FB, U+1F4FD-1F4FE, U+1F503, U+1F507-1F50B, U+1F50D, U+1F512-1F513, U+1F53E-1F54A, U+1F54F-1F5FA, U+1F610, U+1F650-1F67F, U+1F687, U+1F68D, U+1F691, U+1F694, U+1F698, U+1F6AD, U+1F6B2, U+1F6B9-1F6BA, U+1F6BC, U+1F6C6-1F6CF, U+1F6D3-1F6D7, U+1F6E0-1F6EA, U+1F6F0-1F6F3, U+1F6F7-1F6FC, U+1F700-1F7FF, U+1F800-1F80B, U+1F810-1F847, U+1F850-1F859, U+1F860-1F887, U+1F890-1F8AD, U+1F8B0-1F8BB, U+1F8C0-1F8C1, U+1F900-1F90B, U+1F93B, U+1F946, U+1F984, U+1F996, U+1F9E9, U+1FA00-1FA6F, U+1FA70-1FA7C, U+1FA80-1FA89, U+1FA8F-1FAC6, U+1FACE-1FADC, U+1FADF-1FAE9, U+1FAF0-1FAF8, U+1FB00-1FBFF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 700; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xuhg2a2c.woff2") format('woff2'); unicode-range: U+0303-0304, U+0307-0308, U+030A, U+0320, U+0323-0325, U+032D-032E, U+0330-0331, U+060C, U+061B-061C, U+061F, U+0621, U+0640, U+064B-0655, U+0660-066C, U+0670, U+0700-074F, U+0860-086A, U+1DF8, U+1DFA, U+200C-200F, U+25CC, U+2670-2671; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 700; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4x6Rg2a2c.woff2") format('woff2'); unicode-range: U+02C7, U+0301-0302, U+0304, U+0306-0307, U+0309, U+0323, U+0331, U+200C-200D, U+202E, U+25CC, U+2D30-2D7F; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 700; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xxhg2a2c.woff2") format('woff2'); unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 700; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xxxg2a2c.woff2") format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+@font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 700; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xyRg2.woff2") format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: 'Google Sans Code'; font-style: normal; font-weight: 400; src: url("/fonts/pxihyogzv91QhV44Z_GQBHsGf5PuckJMZfIVTPZaiXEp_ht12EVEHsN1sCQNcmTl1gki5uc.woff2") format('woff2'); unicode-range: U+061F, U+0640, U+2015, U+201B, U+2020-2021, U+2030, U+204F, U+25CC, U+2E28-2E29, U+2E41, U+1E900-1E95F; }
+@font-face { font-family: 'Google Sans Code'; font-style: normal; font-weight: 400; src: url("/fonts/pxihyogzv91QhV44Z_GQBHsGf5PuckJMZfIVTPZaiXEp_ht12EVEHsN1sCQNcmTlmwki5uc.woff2") format('woff2'); unicode-range: U+02C7, U+02D8-02D9, U+02DB, U+0307, U+1400-167F, U+18B0-18F5, U+25CC, U+11AB0-11ABF; }
+@font-face { font-family: 'Google Sans Code'; font-style: normal; font-weight: 400; src: url("/fonts/pxihyogzv91QhV44Z_GQBHsGf5PuckJMZfIVTPZaiXEp_ht12EVEHsN1sCQNcmTlpwki5uc.woff2") format('woff2'); unicode-range: U+0300-0302, U+0304, U+030B-030C, U+0323-0324, U+0330-0331, U+13A0-13FF, U+AB70-ABBF; }
+@font-face { font-family: 'Google Sans Code'; font-style: normal; font-weight: 400; src: url("/fonts/pxihyogzv91QhV44Z_GQBHsGf5PuckJMZfIVTPZaiXEp_ht12EVEHsN1sCQNcmTlyAki5uc.woff2") format('woff2'); unicode-range: U+0302-0303, U+0305, U+0307-0308, U+0310, U+0312, U+0315, U+031A, U+0326-0327, U+032C, U+032F-0330, U+0332-0333, U+0338, U+033A, U+0346, U+034D, U+0391-03A1, U+03A3-03A9, U+03B1-03C9, U+03D1, U+03D5-03D6, U+03F0-03F1, U+03F4-03F5, U+2016-2017, U+2034-2038, U+203C, U+2040, U+2043, U+2047, U+2050, U+2057, U+205F, U+2070-2071, U+2074-208E, U+2090-209C, U+20D0-20DC, U+20E1, U+20E5-20EF, U+2100-2112, U+2114-2115, U+2117-2121, U+2123-214F, U+2190, U+2192, U+2194-21AE, U+21B0-21E5, U+21F1-21F2, U+21F4-2211, U+2213-2214, U+2216-22FF, U+2308-230B, U+2310, U+2319, U+231C-2321, U+2336-237A, U+237C, U+2395, U+239B-23B7, U+23D0, U+23DC-23E1, U+2474-2475, U+25AF, U+25B3, U+25B7, U+25BD, U+25C1, U+25CA, U+25CC, U+25FB, U+266D-266F, U+27C0-27FF, U+2900-2AFF, U+2B0E-2B11, U+2B30-2B4C, U+2BFE, U+3030, U+FF5B, U+FF5D, U+1D400-1D7FF, U+1EE00-1EEFF; }
+@font-face { font-family: 'Google Sans Code'; font-style: normal; font-weight: 400; src: url("/fonts/pxihyogzv91QhV44Z_GQBHsGf5PuckJMZfIVTPZaiXEp_ht12EVEHsN1sCQNcmTl2Aki5uc.woff2") format('woff2'); unicode-range: U+0300, U+0306-0308, U+0313, U+0483, U+20DB, U+25CC, U+10350-1037A; }
+@font-face { font-family: 'Google Sans Code'; font-style: normal; font-weight: 400; src: url("/fonts/pxihyogzv91QhV44Z_GQBHsGf5PuckJMZfIVTPZaiXEp_ht12EVEHsN1sCQNcmTl2gki5uc.woff2") format('woff2'); unicode-range: U+0001-000C, U+000E-001F, U+007F-009F, U+20DD-20E0, U+20E2-20E4, U+2150-218F, U+2190, U+2192, U+2194-2199, U+21AF, U+21E6-21F0, U+21F3, U+2218-2219, U+2299, U+22C4-22C6, U+2300-243F, U+2440-244A, U+2460-24FF, U+25A0-27BF, U+2800-28FF, U+2921-2922, U+2981, U+29BF, U+29EB, U+2B00-2BFF, U+4DC0-4DFF, U+FFF9-FFFB, U+10140-1018E, U+10190-1019C, U+101A0, U+101D0-101FD, U+102E0-102FB, U+10E60-10E7E, U+1D2C0-1D2D3, U+1D2E0-1D37F, U+1F000-1F0FF, U+1F100-1F1AD, U+1F1E6-1F1FF, U+1F30D-1F30F, U+1F315, U+1F31C, U+1F31E, U+1F320-1F32C, U+1F336, U+1F378, U+1F37D, U+1F382, U+1F393-1F39F, U+1F3A7-1F3A8, U+1F3AC-1F3AF, U+1F3C2, U+1F3C4-1F3C6, U+1F3CA-1F3CE, U+1F3D4-1F3E0, U+1F3ED, U+1F3F1-1F3F3, U+1F3F5-1F3F7, U+1F408, U+1F415, U+1F41F, U+1F426, U+1F43F, U+1F441-1F442, U+1F444, U+1F446-1F449, U+1F44C-1F44E, U+1F453, U+1F46A, U+1F47D, U+1F4A3, U+1F4B0, U+1F4B3, U+1F4B9, U+1F4BB, U+1F4BF, U+1F4C8-1F4CB, U+1F4D6, U+1F4DA, U+1F4DF, U+1F4E3-1F4E6, U+1F4EA-1F4ED, U+1F4F7, U+1F4F9-1F4FB, U+1F4FD-1F4FE, U+1F503, U+1F507-1F50B, U+1F50D, U+1F512-1F513, U+1F53E-1F54A, U+1F54F-1F5FA, U+1F610, U+1F650-1F67F, U+1F687, U+1F68D, U+1F691, U+1F694, U+1F698, U+1F6AD, U+1F6B2, U+1F6B9-1F6BA, U+1F6BC, U+1F6C6-1F6CF, U+1F6D3-1F6D7, U+1F6E0-1F6EA, U+1F6F0-1F6F3, U+1F6F7-1F6FC, U+1F700-1F7FF, U+1F800-1F80B, U+1F810-1F847, U+1F850-1F859, U+1F860-1F887, U+1F890-1F8AD, U+1F8B0-1F8BB, U+1F8C0-1F8C1, U+1F900-1F90B, U+1F93B, U+1F946, U+1F984, U+1F996, U+1F9E9, U+1FA00-1FA6F, U+1FA70-1FA7C, U+1FA80-1FA89, U+1FA8F-1FAC6, U+1FACE-1FADC, U+1FADF-1FAE9, U+1FAF0-1FAF8, U+1FB00-1FBFF; }
+@font-face { font-family: 'Google Sans Code'; font-style: normal; font-weight: 400; src: url("/fonts/pxihyogzv91QhV44Z_GQBHsGf5PuckJMZfIVTPZaiXEp_ht12EVEHsN1sCQNcmTlDigH297Y.woff2") format('woff2'); unicode-range: U+2000-2001, U+2004-2008, U+200A, U+23B8-23BD, U+2500-259F; }
+@font-face { font-family: 'Google Sans Code'; font-style: normal; font-weight: 400; src: url("/fonts/pxihyogzv91QhV44Z_GQBHsGf5PuckJMZfIVTPZaiXEp_ht12EVEHsN1sCQNcmTlxwki5uc.woff2") format('woff2'); unicode-range: U+0303-0304, U+0307-0308, U+030A, U+0320, U+0323-0325, U+032D-032E, U+0330-0331, U+060C, U+061B-061C, U+061F, U+0621, U+0640, U+064B-0655, U+0660-066C, U+0670, U+0700-074F, U+0860-086A, U+1DF8, U+1DFA, U+200C-200F, U+25CC, U+2670-2671; }
+@font-face { font-family: 'Google Sans Code'; font-style: normal; font-weight: 400; src: url("/fonts/pxihyogzv91QhV44Z_GQBHsGf5PuckJMZfIVTPZaiXEp_ht12EVEHsN1sCQNcmTluwki5uc.woff2") format('woff2'); unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB; }
+@font-face { font-family: 'Google Sans Code'; font-style: normal; font-weight: 400; src: url("/fonts/pxihyogzv91QhV44Z_GQBHsGf5PuckJMZfIVTPZaiXEp_ht12EVEHsN1sCQNcmTlugki5uc.woff2") format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+@font-face { font-family: 'Google Sans Code'; font-style: normal; font-weight: 400; src: url("/fonts/pxihyogzv91QhV44Z_GQBHsGf5PuckJMZfIVTPZaiXEp_ht12EVEHsN1sCQNcmTltAki.woff2") format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: "Google Sans"; src: url("/fonts/4Ua_rENHsxJlGDuGo1OIlJfC6l_24rlCK1Yo_Iqcsih3SAyH6cAwhX9RFD48TE63OOYKtrw2IKlnrSjiEjo5.woff2"); font-display: swap; font-style: normal; font-weight: 500 }
+
+/* ── LaTeX landing (/latex) — design tokens + animations ported from the
+   marketing site (PR #448). Colors + `font-display` are additive (no collision
+   with the app theme); the landing's base font + mono are scoped to
+   `.latex-landing` so the rest of the app is untouched. ──────────────────── */
+@theme {
+  --color-paper: #fffdfb;
+  --color-section: #eceae3;
+  --color-cream: #f5efe5;
+  --color-ink: #151009;
+  --color-ink-2: #1a1000;
+  --color-ink-soft: #211c15;
+  --color-gray-warm: #635d54;
+  --color-gray-mid: #8c857a;
+  --color-tan: #b5afa5;
+  --color-sand: #e8d5c0;
+  --color-orange: #ff8112;
+  --color-orange-deep: #c24d00;
+  --color-amber: #ffc56a;
+  --color-peach: #ffedd0;
+
+  --font-display: "Google Sans", "Google Sans Flex", sans-serif;
+}
+
+/* Scope the landing's base typography + surface so it never leaks onto the app.
+   `--font-mono` is overridden only here (the app uses font-mono elsewhere). */
+.latex-landing {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: "Google Sans Flex", "Google Sans", sans-serif;
+  --font-mono: "Google Sans Code", "Fragment Mono", monospace;
+  -webkit-font-smoothing: antialiased;
+}
+
+@keyframes blink {
+  0%, 45% { opacity: 1; }
+  50%, 95% { opacity: 0; }
+}
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+@keyframes wiggle {
+  from { transform: rotate(-7deg); }
+  to { transform: rotate(7deg); }
+}
+@keyframes peek {
+  0%, 12% { transform: translateX(-115%) rotate(-30deg); }
+  22%, 70% { transform: translateX(0) rotate(0deg); }
+  80%, 100% { transform: translateX(-115%) rotate(-30deg); }
+}
+@keyframes latex-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-7px); }
+}
+@utility animate-blink {
+  animation: blink 1s step-end infinite;
+}
+@utility animate-marquee {
+  animation: marquee 35s linear infinite;
+}
+@utility animate-wiggle {
+  animation: wiggle 1.6s ease-in-out infinite alternate;
+}
+@utility animate-peek {
+  animation: peek 9s ease-in-out infinite;
+}
+@utility animate-float {
+  animation: latex-float 4.5s ease-in-out infinite;
+}
+
+/* scroll-triggered entrances (driven by Reveal in latex-landing/client.tsx) */
+.latex-landing [data-reveal] {
+  opacity: 0;
+  transition: opacity 0.55s ease-out, transform 0.65s cubic-bezier(0.34, 1.56, 0.64, 1);
+  transition-delay: var(--reveal-delay, 0s);
+}
+.latex-landing [data-reveal="rise"] { transform: translateY(28px); }
+.latex-landing [data-reveal="pop"] { transform: scale(0); }
+.latex-landing [data-reveal].revealed {
+  opacity: 1;
+  transform: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .latex-landing [data-reveal] { opacity: 1; transform: none; transition: none; }
+  .animate-wiggle, .animate-peek, .animate-marquee, .animate-float { animation: none; }
+}
+
+/* ── Streamdown table chrome: opaque surfaces ───────────────────────────────
+   Streamdown paints the table copy-format dropdown and the fullscreen overlay
+   with `bg-background`/`shadow-lg` — shadcn tokens this app never wired, so they
+   compute transparent: the open dropdown lets the table bleed through, and the
+   fullscreen overlay lets the whole page bleed through (unreadable). The chrome
+   (esp. fullscreen) portals to <body>, outside the chat renderer's className
+   scope, so repaint it here. The overlay match is pinned to `.bg-background`
+   (the token Streamdown gives its overlay) so it can't hit the app's own
+   `fixed inset-0 z-50 bg-black/40` modal scrims, which also contain tables. */
+.fixed.inset-0.z-50.bg-background:has([data-streamdown="table"]) {
+  background-color: var(--color-white, #fff);
+}
+:is([data-streamdown="table-wrapper"], .fixed.inset-0.z-50.bg-background:has([data-streamdown="table"]))
+  .absolute.z-20 {
+  background-color: var(--color-white, #fff);
+  border-color: var(--color-stone-200, #e7e5e4); /* stone-200 */
+  box-shadow: 0 4px 12px -2px rgb(28 25 23 / 0.12);
+}
+:is([data-streamdown="table-wrapper"], .fixed.inset-0.z-50.bg-background:has([data-streamdown="table"]))
+  .absolute.z-20 button:hover {
+  background-color: var(--color-stone-100, #f5f5f4); /* stone-100 */
+}

@@ -1,0 +1,7 @@
+@import '../../app/globals.css';
+
+/* Tailwind v4 auto-detects sources relative to the build root (desktop-ui/),
+   which holds only re-exports — point the scanner at the shared surface. */
+@source '../../app';
+@source '../../components';
+@source '../../lib';
