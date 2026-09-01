@@ -9,28 +9,28 @@ scripts/oss/README.md in the monorepo so future exports keep it.
 
 **Self-improving multiplayer AI workspace.**
 
-A doc where your team and your agents work together, and that gets smarter as you use it. Claude Code and Codex join your documents as live collaborators, on the subscriptions you already pay for. Every edit by anyone, human or agent, is attributed and reviewable. And every night, each agent distills the day's sessions into memory and skills it uses tomorrow.
+A doc where your team and your agents work together, and that gets smarter as you use it. Claude Code and Codex join your documents as live collaborators, on the subscriptions you already pay for. Every edit by anyone, human or agent, is attributed and reviewable. Every night, each agent distills the day's sessions into memory and skills it uses tomorrow. And it is local by default: files, agents, and memory live on your machine, and nothing syncs until you share.
 
 [Download for macOS](https://www.sundial.md/download) · [Web app](https://www.sundial.md) · [Docs](https://www.sundial.md/docs) · [Blog](https://www.sundial.md/blog) · [X](https://x.com/sundialhub)
 
-![A local Claude Code turn proposing reviewable edits in a shared Sundial doc](screenshot.png)
+<!-- HERO SHOT (todo): replace screenshot.png with one frame that shows the
+comment-delegation flow: text selected, a comment thread "@Agent tighten this
+section", the agent's reply in the thread, its edit pending inline as a
+suggestion, and at least two live cursors (one human, one agent). -->
+![Delegating an edit to the agent from a comment thread in a shared Sundial doc](screenshot.png)
 
-*Your own Claude Code, running locally, proposing edits you accept or reject line by line.*
+*Select text, comment, tag the agent. The fix comes back as a suggestion you accept or reject.*
 
 ## What you get
 
 - **Multiplayer for agents.** Live cursors for people and agents in the same doc. You see "Ana's Claude Code" typing the way you see Ana typing.
 - **Your subscription works here.** Claude Code and Codex run on your machine, inside the editor. No API key, no per-token markup, no account until you share.
+- **Comment to delegate.** Select a paragraph, comment `@Agent shorten this`, and the agent answers in the thread; its fix lands as a suggestion on exactly that selection. Comments work between people too.
 - **It learns every night.** Once a day your agent reads the day's sessions and distills them into `memory/` notes and reusable `skills/`. No review queue, no vendor database: plain markdown in your project, and it works in bare Claude Code too.
-- **Mention a teammate's agent.** `@ana's agent` in a shared doc asks her agent, running on her machine under her rules with her context, to draft or review. It replies in the thread; its edits land as suggestions.
 - **Track changes, built for agents.** Every edit by anyone, human or agent, is attributed, with inline accept/reject and history at edit granularity, not commit granularity.
 - **Writing that compiles.** Markdown first; LaTeX with live PDF preview and notebooks that run are first-class too.
 - **Any model.** Local engines run on your subscriptions; signed in, swap between frontier and open models mid-conversation.
-- **Local-first.** Plain files on disk. Works offline. Delete the app and your work is still just files.
-
-## Does it actually self-improve?
-
-We treat that as an empirical question, not a tagline. We replayed the exact shipped reflection mechanism over months of real workspace history, then ran a pre-registered ablation: the same agent answering the same held-out requests with distilled memory, with an equal-size budget of raw transcript, and with nothing, scored by blinded cross-model judges in both presentation orders, with cluster-bootstrap confidence intervals. The design, harness, and full report are published alongside this repo, and we publish the numbers either way. [Read the study.](https://www.sundial.md/blog/reflection-ablation)
+- **Local by default.** Plain files on your disk, agents on your machine, memory in your project. Nothing syncs until you share a doc; share and it syncs live through our cloud; stop sharing and you are fully local again. Works offline.
 
 ## How it works
 
@@ -47,11 +47,19 @@ Documents are CRDTs (Yjs), so agents and people edit the same doc concurrently w
 | Agent memory and skills as plain files | ✓       | manual               | ✗                    | ✗        |
 | Local-first, open source               | ✓       | ✗                    | ✗                    | files only |
 
+## Does it actually self-improve?
+
+<!-- CHART (todo): docs/reflection-ablation.png — blind pairwise win rates
+with 95% CIs (memory vs none, memory vs equal-size raw transcript) from the
+replay ablation. Land it with the report; keep this section chart-first. -->
+![Blind pairwise win rate of the agent with distilled memory vs without, on held-out requests from real workspaces](docs/reflection-ablation.png)
+
+We replayed the shipped nightly reflection over months of real workspace history, then had the same agent answer held-out requests with and without the distilled memory, scored by blinded cross-model judges. Pre-registered design, harness, and full report: [the study](https://www.sundial.md/blog/reflection-ablation).
+
 ## Security model
 
 - Agents propose; you decide. Agent writes land as suggestions with inline review, and full edit history means anything is revertable.
 - Memory stays home. What your agent learns about you lives in plain files on your disk, written by your own local engine, never in a vendor database. Read it, edit it, delete it.
-- A mention from a teammate never pushes execution into your machine. Your own app sees the mention and decides locally whether to run. It is opt-in per workspace, off by default, and such runs are clamped: shared folder only, no shell access, suggest-mode edits, and no access to your personal memory outside the share.
 - Your files are plain markdown on your disk. Nothing leaves your machine until you share a file or folder, and sharing is scoped to exactly what you picked.
 
 ## Get started
