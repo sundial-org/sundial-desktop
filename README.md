@@ -8,13 +8,13 @@ scripts/oss/README.md in the monorepo so future exports keep it.
 # Sundial Desktop
 
 <!-- The release badge renders once the repo is public and has a GitHub release. -->
-[![Release](https://img.shields.io/github/v/release/sundial-org/sundial-desktop)](https://github.com/sundial-org/sundial-desktop/releases) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE) [![X](https://img.shields.io/badge/X-@sundialhub-black)](https://x.com/sundialhub)
+[![Release](https://img.shields.io/github/v/release/sundial-org/sundial-desktop)](https://github.com/sundial-org/sundial-desktop/releases) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE) [![X](https://img.shields.io/badge/X-@sundialmd-black)](https://x.com/sundialmd)
 
 **Self-improving multiplayer AI workspace.**
 
-A doc where your team and your agents work together, and that gets smarter as you use it. Claude Code and Codex join your documents as live collaborators, on the subscriptions you already pay for. Every edit by anyone, human or agent, is attributed and reviewable. Every night, each agent distills the day's sessions into memory and skills it uses tomorrow. And it is local by default: files, agents, and memory live on your machine, and nothing syncs until you share.
+A Markdown editor where your team and your agents work together, and that gets smarter as you use it. Claude Code and Codex join your documents as live collaborators, on the subscriptions you already pay for. Every edit by anyone, human or agent, is attributed and reviewable. Every night, your agents distill the day's sessions into memory and skills they use tomorrow. And it is local by default: files, agents, and memory live on your machine, and nothing syncs until you share.
 
-[Download for macOS](https://www.sundial.md/download) · [Web app](https://www.sundial.md) · [Docs](https://www.sundial.md/docs) · [Blog](https://www.sundial.md/blog) · [X](https://x.com/sundialhub)
+[Download for macOS](https://www.sundial.md/download) · [Web app](https://www.sundial.md) · [Docs](https://www.sundial.md/docs) · [Blog](https://www.sundial.md/blog) · [X](https://x.com/sundialmd)
 
 <!-- HERO (todo): replace screenshot.png with demo.gif (~15s) of the
 comment-delegation flow: select text, comment "@Agent tighten this section",
@@ -122,7 +122,7 @@ If Sundial is useful to you, a star helps other people find it.
 
 ## Community
 
-[X @sundialhub](https://x.com/sundialhub) for what we're building · [Issues](https://github.com/sundial-org/sundial-desktop/issues) for bugs and ideas.
+[X @sundialmd](https://x.com/sundialmd) for what we're building · [Issues](https://github.com/sundial-org/sundial-desktop/issues) for bugs and ideas.
 <!-- TODO: add the Discord invite here once a public server exists. -->
 
 ## License
