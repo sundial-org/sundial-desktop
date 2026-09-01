@@ -7,16 +7,19 @@ scripts/oss/README.md in the monorepo so future exports keep it.
 
 # Sundial Desktop
 
+<!-- The release badge renders once the repo is public and has a GitHub release. -->
+[![Release](https://img.shields.io/github/v/release/sundial-org/sundial-desktop)](https://github.com/sundial-org/sundial-desktop/releases) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE) [![X](https://img.shields.io/badge/X-@sundialhub-black)](https://x.com/sundialhub)
+
 **Self-improving multiplayer AI workspace.**
 
 A doc where your team and your agents work together, and that gets smarter as you use it. Claude Code and Codex join your documents as live collaborators, on the subscriptions you already pay for. Every edit by anyone, human or agent, is attributed and reviewable. Every night, each agent distills the day's sessions into memory and skills it uses tomorrow. And it is local by default: files, agents, and memory live on your machine, and nothing syncs until you share.
 
 [Download for macOS](https://www.sundial.md/download) · [Web app](https://www.sundial.md) · [Docs](https://www.sundial.md/docs) · [Blog](https://www.sundial.md/blog) · [X](https://x.com/sundialhub)
 
-<!-- HERO SHOT (todo): replace screenshot.png with one frame that shows the
-comment-delegation flow: text selected, a comment thread "@Agent tighten this
-section", the agent's reply in the thread, its edit pending inline as a
-suggestion, and at least two live cursors (one human, one agent). -->
+<!-- HERO (todo): replace screenshot.png with demo.gif (~15s) of the
+comment-delegation flow: select text, comment "@Agent tighten this section",
+agent replies in the thread, its edit appears inline as a pending suggestion,
+user accepts it; at least two live cursors visible (one human, one agent). -->
 ![Delegating an edit to the agent from a comment thread in a shared Sundial doc](screenshot.png)
 
 *Select text, comment, tag the agent. The fix comes back as a suggestion you accept or reject.*
@@ -62,11 +65,30 @@ We replayed the shipped nightly reflection over months of real workspace history
 - Memory stays home. What your agent learns about you lives in plain files on your disk, written by your own local engine, never in a vendor database. Read it, edit it, delete it.
 - Your files are plain markdown on your disk. Nothing leaves your machine until you share a file or folder, and sharing is scoped to exactly what you picked.
 
-## Get started
+## FAQ
 
-- **Download the desktop app** → [sundial.md/download](https://www.sundial.md/download) (free, latest macOS; Windows and Linux tracked in issues)
-- **Build from source** → [Build](#build)
-- **Bugs and ideas** → [Issues](https://github.com/sundial-org/sundial-desktop/issues)
+**Does my data leave my machine?** Not until you share. In a local project, files, agent runs, and memory all stay on disk. Sharing a doc syncs that doc through our cloud; everything else stays local.
+
+**Do I need an API key?** No. Sundial drives the Claude Code and Codex you already have, on your existing plan. Signed in, you can also use hosted models with no key.
+
+**Can I use my Claude Max or ChatGPT plan?** Yes, that is the default: local engines run on your own login and subscription.
+
+**What works offline?** Editing, review, and history, fully. Agent turns need your model provider reachable; sharing and hosted models need Sundial's cloud.
+
+## Install
+
+**macOS** — [download the app](https://www.sundial.md/download), drag it to Applications, open it. Free, no account needed.
+
+**Windows / Linux** — not built yet, tracked in [issues](https://github.com/sundial-org/sundial-desktop/issues); a star helps us prioritize.
+
+**From source** — see [Build](#build).
+
+## Try it in 60 seconds
+
+1. Open Sundial and point it at any folder of markdown, or start empty.
+2. Select a sentence and comment `@Agent make this tighter`.
+3. The agent replies in the thread and its edit shows up inline as a suggestion. Accept or reject it.
+4. Come back tomorrow: the nightly reflection has written what it learned to `memory/`.
 
 ## Build
 
@@ -97,6 +119,11 @@ Sundial stands on [Yjs](https://github.com/yjs/yjs), [Tiptap](https://github.com
 Contributions are welcome: bug reports, fixes, features, ideas. Open an issue or send a PR. We review everything here, and merged changes ship in the next release with your authorship preserved. Planning something bigger? Open an issue first and we will help you scope it.
 
 If Sundial is useful to you, a star helps other people find it.
+
+## Community
+
+[X @sundialhub](https://x.com/sundialhub) for what we're building · [Issues](https://github.com/sundial-org/sundial-desktop/issues) for bugs and ideas.
+<!-- TODO: add the Discord invite here once a public server exists. -->
 
 ## License
 
