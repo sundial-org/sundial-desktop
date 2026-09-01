@@ -69,6 +69,8 @@ export function messageRenderSignature(message: UIMessage): string {
     `s${typeof meta.run_status === 'string' ? meta.run_status : ''}`,
     `r${typeof meta.run_error === 'string' ? meta.run_error : ''}`,
     `a${cheapHash(safeStringify(Array.isArray(meta.attachments) ? meta.attachments : []))}`,
+    // Scheduled-run presentation (source tag / skipped note) renders from meta.
+    `m${typeof meta.source === 'string' ? meta.source : ''}${meta.skipped === true ? '!' : ''}${typeof meta.skip_reason === 'string' ? cheapHash(meta.skip_reason) : ''}`,
   );
   return segs.join('|');
 }

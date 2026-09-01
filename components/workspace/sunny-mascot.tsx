@@ -1,11 +1,15 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
-import lottie, { type AnimationItem } from 'lottie-web';
-import sunnyWave from './sunny/sunny-wave.json';
-import sunnyLaptop from './sunny/sunny-laptop.json';
+import type { AnimationItem } from 'lottie-web';
 
-const ANIMATIONS = { wave: sunnyWave, laptop: sunnyLaptop } as const;
+// Player + rig load on demand: the full lottie build is ~360 KB minified and
+// this mascot only shows inside the secrets manager, so it must not ride in
+// the workspace's first-paint bundle.
+const ANIMATIONS = {
+  wave: () => import('./sunny/sunny-wave.json'),
+  laptop: () => import('./sunny/sunny-laptop.json'),
+} as const;
 
 export type SunnyVariant = keyof typeof ANIMATIONS;
 
@@ -27,16 +31,26 @@ export function SunnyMascot({
       typeof window !== 'undefined' &&
       window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 
-    const anim: AnimationItem = lottie.loadAnimation({
-      container: node,
-      renderer: 'svg',
-      loop: !reduceMotion,
-      autoplay: !reduceMotion,
-      animationData: ANIMATIONS[variant],
-    });
-    if (reduceMotion) anim.goToAndStop(anim.totalFrames - 1, true);
+    let anim: AnimationItem | null = null;
+    let cancelled = false;
+    Promise.all([import('lottie-web/build/player/lottie_light'), ANIMATIONS[variant]()])
+      .then(([mod, rig]) => {
+        if (cancelled) return;
+        anim = mod.default.loadAnimation({
+          container: node,
+          renderer: 'svg',
+          loop: !reduceMotion,
+          autoplay: !reduceMotion,
+          animationData: rig.default,
+        });
+        if (reduceMotion) anim.goToAndStop(anim.totalFrames - 1, true);
+      })
+      .catch(() => {});
 
-    return () => anim.destroy();
+    return () => {
+      cancelled = true;
+      anim?.destroy();
+    };
   }, [variant]);
 
   return <div ref={containerRef} className={className} aria-hidden />;

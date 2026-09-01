@@ -10,10 +10,15 @@ export const SESSION_GAP_MS = 5 * 60 * 1000;
 // Chat id joins the session key: one author's edits from two chats are two
 // review units (the panel's current-chat filter matches on entry.chatId).
 // Edit mode joins it too: a suggest session must not absorb the same turn's
-// direct-applied rows (e.g. an unmarkable-fallback write) — the panel's Undo
-// resolves only suggestion ids, so a mixed unit would revert partially while
-// displaying the whole span's diff.
-const authorKey = (row) => `${row.actor ?? ''}:${row.author_id ?? ''}:${row.chat_id ?? ''}:${row.edit_mode ?? 'edit'}`;
+// direct-applied rows (an edit-mode write) — the panel's Undo resolves only
+// suggestion ids, so a mixed unit would revert partially while displaying the
+// whole span's diff.
+// Message id joins it too, so a review unit never spans two assistant TURNS —
+// the cloud's unit is the turn, and a merged unit would Keep/Undo both at once
+// and point every author chip at whichever turn happened to be last. Human and
+// external rows carry no message id, so their grouping is unchanged.
+const authorKey = (row) =>
+  `${row.actor ?? ''}:${row.author_id ?? ''}:${row.chat_id ?? ''}:${row.edit_mode ?? 'edit'}:${row.message_id ?? ''}`;
 const tsOf = (row) => (row.created_at ? Date.parse(row.created_at) || 0 : 0);
 
 /** Group one path's rows (ascending) into sessions. */
@@ -30,6 +35,12 @@ export function collectLocalSessions(rows) {
       actor: last.actor ?? null,
       authorId: last.author_id ?? null,
       chatId: last.chat_id ?? null,
+      // The transcript's assistant message id (the local analog of
+      // `doc_edits.assistant_message_id`) — NOT the review id, which is the
+      // synthetic `applied-<rowId>` session key. Only a jump target: it's what
+      // the chat renders as `data-message-id`. Null for human/external rows.
+      // Uniform across the span — it's part of `authorKey`.
+      messageId: last.message_id ?? null,
       createdAt: last.created_at ?? null,
       firstRowId: first.id,
       lastRowId: last.id,
@@ -65,8 +76,22 @@ export function collectLocalSessions(rows) {
  *  filter SESSIONS before the cap (an author's older sessions must not vanish
  *  behind a page of someone else's) but never the row stream — grouping needs
  *  interposed other-author rows as session separators; per-actor counts are
- *  reported pre-actor-filter over the scanned window. */
-export function buildLocalChangeEntries(rows, { limit = 100, scanFloor = null, actors = null, chatId = null } = {}) {
+ *  reported pre-actor-filter over the scanned window.
+ *
+ *  `isPending` narrows to still-unresolved suggest sessions, and for the same
+ *  reason it runs BEFORE the cap: the editor's per-file review feed asks only
+ *  for pending units, and one left open under a page of newer applied history
+ *  would silently lose its author chip. Only suggest sessions can be pending,
+ *  so the (doc-probing) predicate is never called for plain edit history.
+ *
+ *  @param {any[]} rows
+ *  @param {{ limit?: number, scanFloor?: number | null, actors?: string[] | null,
+ *            chatId?: string | null, isPending?: ((session: any) => boolean) | null }} [options]
+ */
+export function buildLocalChangeEntries(
+  rows,
+  { limit = 100, scanFloor = null, actors = null, chatId = null, isPending = null } = {},
+) {
   const byPath = new Map();
   for (const row of rows) {
     const bucket = byPath.get(row.path);
@@ -88,6 +113,7 @@ export function buildLocalChangeEntries(rows, { limit = 100, scanFloor = null, a
     actorCounts[key] = (actorCounts[key] ?? 0) + 1;
   }
   if (actors) sessions = sessions.filter((session) => actors.includes(session.actor ?? ''));
+  if (isPending) sessions = sessions.filter((s) => s.editMode === 'suggest' && isPending(s));
   const entries = sessions.slice(0, limit);
   const firstDropped = sessions[limit];
   const cursorCandidates = [];

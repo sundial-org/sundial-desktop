@@ -59,13 +59,22 @@ export type TurnEditFile = {
   mime?: string | null;
   lineCount?: number;
   byteSize?: number;
+  /** How THIS file's edits landed — 'suggest' files are pending action items
+   *  (accept/discard); 'edit' files are already applied (revertable). Decided
+   *  per file, not per turn (a suggest turn can hold forced-direct rows). */
+  editMode?: 'edit' | 'suggest';
   chunks: TurnEditChunk[];
 };
 
 /** When an applied-edit session merely accepted a pending suggestion, who
  *  originally proposed it — lets the Review panel label the accepted diff
  *  ("Accepted Sunny's suggestion") instead of showing an empty edit. */
-export type AcceptedSuggestion = { kind: 'sunny' | 'local_agent' | 'human'; name: string };
+export type AcceptedSuggestion = {
+  kind: 'sunny' | 'local_agent' | 'human';
+  name: string;
+  /** How the review landed. Omitted on older payloads — treat as 'accepted'. */
+  decision?: 'accepted' | 'rejected';
+};
 
 export type TurnEditsResponse = {
   assistantMessageId: string;
@@ -375,6 +384,28 @@ export function buildTurnEditFile(params: {
  * placeholder carrying its size — the chat renders a "diff too large" notice
  * rather than dropping the file and claiming the turn produced no edit.
  */
+/**
+ * A delete with nothing to diff — the file was already empty. `buildTurnEditFile`
+ * returns null for two identical sides, which is right for a no-op edit and
+ * wrong for a delete: the turn DID remove a file. Without this the chip counts
+ * a file the card then can't show. Chunkless, like the oversized/blob entries.
+ */
+export function buildEmptyDeletedTurnEditFile(params: {
+  fileId: string | null;
+  filePath: string;
+}): TurnEditFile {
+  return {
+    id: params.filePath,
+    fileId: params.fileId,
+    filePath: params.filePath,
+    isNew: false,
+    isDeleted: true,
+    addedLineCount: 0,
+    deletedLineCount: 0,
+    chunks: [],
+  };
+}
+
 export function buildOversizedTurnEditFile(params: {
   fileId: string | null;
   filePath: string;

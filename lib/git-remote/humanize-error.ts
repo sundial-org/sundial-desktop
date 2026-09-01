@@ -9,7 +9,7 @@ export function humanizeGitError(provider: LinkedRepoProvider, raw: string): str
 
   if (provider === 'overleaf') {
     if (/\b403\b/.test(text)) {
-      return 'Overleaf returned 403. Git integration is a premium-only feature — the Overleaf account whose token you connected needs a paid subscription (or Overleaf Commons via .edu). Check Menu → Sync → Git inside the project on overleaf.com to confirm git-bridge is enabled for that account.';
+      return 'Overleaf returned 403. Git integration is a premium-only feature: the Overleaf account whose token you connected needs a paid subscription (or Overleaf Commons via .edu). Check Menu → Sync → Git inside the project on overleaf.com to confirm git-bridge is enabled for that account.';
     }
     if (/not found|\b404\b/i.test(text)) {
       return "Overleaf couldn't find that project. Double-check the project URL and make sure the connected Overleaf account has access to it.";

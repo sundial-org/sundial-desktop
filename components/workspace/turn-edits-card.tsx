@@ -5,7 +5,7 @@ import { BlobFileNotice } from '@/components/workspace/diff-review/blob-file-not
 import { CopyLinkButton } from '@/components/workspace/copy-link-button';
 import { DiffSummaryBar } from '@/components/workspace/diff-review/diff-summary-bar';
 import { InlineDocDiff } from '@/components/workspace/diff-review/inline-doc-diff';
-import { InlineTurnReview } from '@/components/workspace/diff-review/inline-turn-review';
+import { ChatEditCards } from '@/components/workspace/diff-review/chat-edit-cards';
 import { Spinner } from '@/components/ui/spinner';
 import {
   OversizedFileNotice,
@@ -16,9 +16,12 @@ import { readJsonResponse } from '@/lib/http/read-json-response';
 import { useApiFetch } from '@/lib/workspace/api-fetch-context';
 import type { TurnEditFile, TurnEditsResponse } from '@/lib/workspace/turn-edits';
 import {
+  fetchTurnEdits,
   getCachedTurnEdits,
   setCachedTurnEdits,
+  setCachedTurnEditsForScope,
   subscribeTurnEdits,
+  turnEditsCacheScope,
 } from '@/lib/workspace/turn-edits-cache';
 
 export { StaticChunk, formatTurnFileSummary };
@@ -93,18 +96,14 @@ export function TurnEditsCard({
     setLoading(true);
     setError(null);
     try {
-      const response = await apiFetch(
-        `/api/workspace/turn-edits?assistantMessageId=${encodeURIComponent(assistantMessageId)}`,
-        { cache: 'no-store' },
-      );
-      const nextPayload = await readJsonResponse<TurnEditsResponse & { error?: string }>(response);
-      if (!response.ok) {
-        throw new Error(nextPayload?.error || `Failed to load turn edits (${response.status})`);
-      }
+      // Through the shared loader, never a private fetch: it dedupes in-flight
+      // requests and refuses to cache OR deliver an answer authorized under a
+      // share scope that has since changed — a private load skipped the cache
+      // but still rendered the wider-grant payload (Codex, PR #1104 round 32).
+      const nextPayload = await fetchTurnEdits(apiFetch, assistantMessageId);
       if (!nextPayload) {
         throw new Error('Failed to load turn edits');
       }
-      setCachedTurnEdits(assistantMessageId, nextPayload);
       setPayload(nextPayload);
       onPayloadChange?.(nextPayload);
     } catch (nextError) {
@@ -145,6 +144,7 @@ export function TurnEditsCard({
 
   const persistKeep = useCallback(
     async (filePath: string, chunkIds: string[] | '*') => {
+      const scope = turnEditsCacheScope();
       const response = await apiFetch('/api/workspace/turn-edits/keep-chunk', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -155,7 +155,10 @@ export function TurnEditsCard({
         throw new Error(next?.error || `Failed to keep change (${response.status})`);
       }
       if (!next) throw new Error('Failed to keep change');
-      setCachedTurnEdits(assistantMessageId, next);
+      setCachedTurnEditsForScope(scope, assistantMessageId, next);
+      // Same rule for LOCAL state: an answer from a superseded share scope is
+      // not delivered either (Codex, PR #1104 round 32).
+      if (turnEditsCacheScope() !== scope) throw new Error('The share link changed. Reload to continue');
       onPayloadChange?.(next);
     },
     [assistantMessageId, workspaceId, onPayloadChange, apiFetch],
@@ -195,6 +198,7 @@ export function TurnEditsCard({
 
   const requestUndo = useCallback(
     async (filePath: string, chunkId: string) => {
+      const scope = turnEditsCacheScope();
       const response = await apiFetch('/api/workspace/turn-edits/undo-chunk', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -207,8 +211,8 @@ export function TurnEditsCard({
 
       if (!response.ok) {
         if (nextPayload && 'payload' in nextPayload && nextPayload.payload) {
-          setCachedTurnEdits(assistantMessageId, nextPayload.payload);
-          onPayloadChange?.(nextPayload.payload);
+          setCachedTurnEditsForScope(scope, assistantMessageId, nextPayload.payload);
+          if (turnEditsCacheScope() === scope) onPayloadChange?.(nextPayload.payload);
         }
         throw new Error(nextPayload?.error || `Failed to undo change (${response.status})`);
       }
@@ -217,7 +221,8 @@ export function TurnEditsCard({
       }
 
       const payload = nextPayload as TurnEditsResponse;
-      setCachedTurnEdits(assistantMessageId, payload);
+      setCachedTurnEditsForScope(scope, assistantMessageId, payload);
+      if (turnEditsCacheScope() !== scope) throw new Error('The share link changed. Reload to continue');
       onPayloadChange?.(payload);
       return payload;
     },
@@ -297,9 +302,11 @@ export function TurnEditsCard({
     });
   }, [assistantMessageId, payload, persistKeep, inScope]);
 
-  const undoAll = useCallback(async () => {
+  // Undo every in-scope pending chunk — or, with `onlyFilePath`, just that
+  // file's (the chat card's whole-file ✗).
+  const undoAll = useCallback(async (onlyFilePath?: string) => {
     if (activeUndoKey) return;
-    setActiveUndoKey('__all__');
+    setActiveUndoKey(onlyFilePath ? `__file__:${onlyFilePath}` : '__all__');
     setError(null);
     try {
       let nextPayload = payload;
@@ -311,12 +318,25 @@ export function TurnEditsCard({
         // Stale turns are undoable via the route's text-based revert path, and
         // deleted files via the restore path — undo every file in scope.
         const nextUndoTarget = nextPayload.files
-          .filter((file) => inScope(file.filePath))
-          .flatMap((file) =>
-            file.chunks
-              .filter((chunk) => chunk.status === 'pending')
-              .map((chunk) => ({ filePath: file.filePath, chunkId: chunk.id })),
-          )[0];
+          .filter((file) => inScope(file.filePath) && (!onlyFilePath || file.filePath === onlyFilePath))
+          .flatMap((file) => {
+            // The scoped call serves two card actions with different reach:
+            // DISCARD (pending chunks exist) touches pending only — a
+            // partially reviewed suggest file keeps its already-accepted
+            // chunks (Codex P1 on #1039). REVERT (nothing pending) unwinds
+            // the KEPT chunks (applied edits are born kept; the undo route
+            // re-derives chunks from live text, so a kept chunk whose text
+            // still matches reverts cleanly and no-ops safely otherwise).
+            // "Undo all" (unscoped) stays pending-only.
+            const hasPending = file.chunks.some((chunk) => chunk.status === 'pending');
+            return file.chunks
+              .filter(
+                (chunk) =>
+                  chunk.status === 'pending' ||
+                  (onlyFilePath && !hasPending && chunk.status === 'kept'),
+              )
+              .map((chunk) => ({ filePath: file.filePath, chunkId: chunk.id }));
+          })[0];
         if (!nextUndoTarget) break;
         const triedKey = `${nextUndoTarget.filePath}:${nextUndoTarget.chunkId}`;
         if (tried.has(triedKey)) break;
@@ -492,34 +512,32 @@ export function TurnEditsCard({
   if (isInlineVariant) {
     if (loading && !payload) {
       return (
-        <div className="mt-2 w-fit max-w-full rounded-lg border border-stone-200 bg-stone-50/60 px-2.5 py-1 text-[12px]">
+        <div className="mt-1 flex h-6 w-fit max-w-full items-center text-[12px]">
           <Spinner label="Loading changes…" size={12} />
         </div>
       );
     }
     if (error) {
+      // Quiet grey, no red banner (chat design rules).
       return (
-        <div className="mt-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-[12px] text-red-700">
-          {error}
-        </div>
+        <div className="mt-1 flex h-6 items-center text-[14px] text-stone-500">{error}</div>
       );
     }
     if (!payload || visibleFiles.length === 0) {
       return null;
     }
+    // Per-file edit cards (2026-08-01 design) — keep/undo is whole-file, same
+    // semantics as the old InlineTurnReview (one mark group per file).
     return (
-      <InlineTurnReview
+      <ChatEditCards
         files={visibleFiles}
-        activeUndoKey={activeUndoKey}
-        isLatestTurn={isLatestTurn}
         assistantMessageId={assistantMessageId}
         projectId={payload?.projectId ?? workspaceId}
-        onKeepChunk={keepChunk}
-        onUndoChunk={(filePath, chunkId) => void undoChunk(filePath, chunkId)}
-        onKeepAll={keepAll}
-        onUndoAll={() => void undoAll()}
-        onReExpand={() => void load()}
-        defaultDiffExpanded={defaultExpanded}
+        activeUndoKey={activeUndoKey}
+        defaultExpanded={defaultExpanded}
+        onKeepFile={(filePath) => keepChunk(filePath, '')}
+        onUndoFile={(filePath) => void undoAll(filePath)}
+        onOpenFile={onOpenFile}
       />
     );
   }

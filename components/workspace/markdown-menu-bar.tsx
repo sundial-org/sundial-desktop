@@ -1,11 +1,22 @@
 'use client';
 
+// The Google Docs-style File/Edit/View/Insert/Format menu bar. Removed from
+// the everyday chrome in the wireframe redesign (#907) and restored here for
+// the 'docs' document style only (lib/doc-style.ts) — the IDE style keeps the
+// single ⋯ menu. Revived from the pre-redesign implementation (7485a7fbb~1)
+// with downloads routed through the workspace data plane like
+// document-actions-menu (apiFetch + path-share tokens, export hidden on local
+// workspaces). Keyboard shortcuts stay owned by DocumentActionsMenu — this bar
+// only lists them.
 import type { Editor } from '@tiptap/react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { FindReplacePanel } from './find-replace';
-import { ImageInsertField, openEditorLinkMenu } from './markdown-toolbar';
+import { canAlignSelection, ImageInsertField, openEditorLinkMenu } from './markdown-toolbar';
 import { insertDefaultTable } from '@/lib/tiptap/slash-items';
+import { setDocStylePreference } from '@/lib/doc-style';
 import { isMarkdownFile } from '@/lib/sync/policy';
+import { appendPathShareTokenToUrl } from '@/lib/workspace/path-share-token-client';
+import { useApiFetch } from '@/lib/workspace/api-fetch-context';
 
 type MenuBarFile = {
   id: string;
@@ -18,13 +29,19 @@ interface MenuBarProps {
   readOnly?: boolean;
   file?: MenuBarFile | null;
   projectId?: string | null;
+  /** Local (sidecar) workspace: export is a cloud-only route — hide it. */
+  localWorkspace?: boolean;
+  /** Horizontal padding override (default px-3) so the bar can align flush
+   *  under the Docs-style header title. */
+  className?: string;
   sidebarOpen?: boolean;
   onNewFile?: () => void;
   onRename?: () => void;
   onDuplicate?: () => void;
   onDelete?: () => void;
   onToggleSidebar?: () => void;
-  onToggleMode?: () => void;
+  /** Split panes are print:hidden — printing from them would print the primary. */
+  hidePrint?: boolean;
 }
 
 type MenuItem =
@@ -34,7 +51,6 @@ type MenuItem =
       shortcut?: string;
       onClick: () => void;
       disabled?: boolean;
-      trailing?: string;
     }
   | { type: 'separator' };
 
@@ -102,15 +118,23 @@ export function MarkdownMenuBar({
   readOnly = false,
   file = null,
   projectId = null,
+  localWorkspace = false,
+  className = 'px-3',
   sidebarOpen,
   onNewFile,
   onRename,
   onDuplicate,
   onDelete,
   onToggleSidebar,
-  onToggleMode,
+  hidePrint = false,
 }: MenuBarProps) {
+  const apiFetch = useApiFetch();
   const [openMenu, setOpenMenu] = useState<string | null>(null);
+  // Set when the open menu was reached by HOVERING from another open menu.
+  // The mousedown that follows such a hover is "choose this menu", not
+  // "toggle it closed" — it consumes the flag and keeps the menu open
+  // (Codex r7: File → hover Edit → click closed the bar).
+  const hoverSwitchedRef = useRef(false);
   const [findOpen, setFindOpen] = useState(false);
   const [imageOpen, setImageOpen] = useState(false);
   const [imageUrl, setImageUrl] = useState('');
@@ -122,7 +146,10 @@ export function MarkdownMenuBar({
     Format: useRef<HTMLButtonElement | null>(null),
   } as const;
 
-  const close = useCallback(() => setOpenMenu(null), []);
+  const close = useCallback(() => {
+    hoverSwitchedRef.current = false;
+    setOpenMenu(null);
+  }, []);
 
   const run = useCallback(
     (fn: () => void) => {
@@ -131,19 +158,6 @@ export function MarkdownMenuBar({
     },
     [close],
   );
-
-  // ⌘⇧H opens Find & Replace
-  useEffect(() => {
-    if (!editor) return;
-    const handler = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'h') {
-        event.preventDefault();
-        setFindOpen(true);
-      }
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [editor]);
 
   // A destroyed editor counts as absent: the menu bar renders against the last
   // (frozen) editor during file switches, and v3 throws when any command runs on
@@ -158,11 +172,15 @@ export function MarkdownMenuBar({
     | undefined;
   const canUndo = typeof canChain?.undo === 'function' ? canChain.undo() : false;
   const canRedo = typeof canChain?.redo === 'function' ? canChain.redo() : false;
+  const canAlign = !readOnly && !noEditor && canAlignSelection(editor!);
   const canDownload = Boolean(file && projectId && file.type !== 'folder');
   const canRename = Boolean(file && onRename && !readOnly);
   const canDuplicate = Boolean(file && onDuplicate && !readOnly && file.type !== 'folder');
   const canDelete = Boolean(file && onDelete && !readOnly);
-  const canCreate = Boolean(onNewFile && !readOnly);
+  // New is gated by its CREATE TARGET, not the open file: the page only wires
+  // onNewFile when canUploadToFolder(create parent) holds, and a read-only
+  // active file says nothing about creating elsewhere (Codex round 4).
+  const canCreate = Boolean(onNewFile);
 
   const submitImage = () => {
     const url = imageUrl.trim();
@@ -178,8 +196,21 @@ export function MarkdownMenuBar({
 
   const insertTaskListItem = () => {
     // Decoration-based checkboxes (see MarkdownCheckbox in collab-editor.tsx):
-    // just seed a bullet-list item that begins with `[ ] `.
-    editor!.chain().focus().toggleBulletList().insertContent('[ ] ').run();
+    // seed a bullet-list item that begins with `[ ] `. Mirrors the toolbar's
+    // checklist command — only toggle INTO a bulleted list (a blind toggle
+    // would dissolve an existing one), and never double-mark a line.
+    if (!editor!.isActive('bulletList')) {
+      editor!.chain().focus().toggleBulletList().run();
+    }
+    const { $from } = editor!.state.selection;
+    const paragraph = $from.parent;
+    if (
+      paragraph.type.name === 'paragraph' &&
+      !paragraph.textContent.startsWith('[ ]') &&
+      !paragraph.textContent.startsWith('[x]')
+    ) {
+      editor!.chain().focus().insertContentAt($from.start(), '[ ] ').run();
+    }
   };
 
   const execCopy = () => {
@@ -216,31 +247,46 @@ export function MarkdownMenuBar({
     anchor.remove();
   };
 
+  const downloadBlobAs = async (url: string, name: string, label: string) => {
+    try {
+      // apiFetch, not a plain anchor: in a LOCAL workspace the data plane is
+      // the sidecar shim, and an anchor navigation would go straight to the
+      // cloud app, which has never heard of this project.
+      const res = await apiFetch(url);
+      if (!res.ok) throw new Error(`${label} failed (${res.status})`);
+      const objectUrl = URL.createObjectURL(await res.blob());
+      clickDownloadAnchor(objectUrl, name);
+      // Deferred: WKWebView and Firefox start the anchor's navigation
+      // asynchronously — revoking synchronously hands them a dead URL.
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    } catch (error) {
+      console.error(`[${label}]`, error);
+      window.alert(`Could not ${label} this document. Please try again.`);
+    }
+  };
+
   const downloadCurrentFile = () => {
     if (!file || !projectId) return;
     const params = new URLSearchParams({ projectId, fileId: file.id });
-    clickDownloadAnchor(
-      `/api/workspace/files/download?${params.toString()}`,
-      file.path.split('/').pop() ?? 'download',
-    );
+    const url = appendPathShareTokenToUrl(`/api/workspace/files/download?${params.toString()}`);
+    const name = file.path.split('/').pop() ?? 'download';
+    // Cloud keeps the ANCHOR: the browser streams it to disk. The local shim
+    // can't be reached by an anchor at all (see downloadBlobAs).
+    if (!localWorkspace) {
+      clickDownloadAnchor(url, name);
+      return;
+    }
+    void downloadBlobAs(url, name, 'download');
   };
 
-  // Export goes through fetch (not a plain anchor) so a conversion failure
-  // surfaces as a message instead of downloading a broken .pdf/.docx.
-  const exportCurrentFile = async (format: 'pdf' | 'docx') => {
+  const exportCurrentFile = (format: 'pdf' | 'docx') => {
     if (!file || !projectId) return;
     const params = new URLSearchParams({ projectId, fileId: file.id, format });
-    try {
-      const res = await fetch(`/api/workspace/files/export?${params.toString()}`);
-      if (!res.ok) throw new Error(`export failed (${res.status})`);
-      const url = URL.createObjectURL(await res.blob());
-      const name = `${(file.path.split('/').pop() ?? 'document').replace(/\.[^.]+$/, '')}.${format}`;
-      clickDownloadAnchor(url, name);
-      URL.revokeObjectURL(url);
-    } catch (error) {
-      console.error('[export]', error);
-      window.alert(`Could not export as ${format.toUpperCase()}. Please try again.`);
-    }
+    void downloadBlobAs(
+      appendPathShareTokenToUrl(`/api/workspace/files/export?${params.toString()}`),
+      `${(file.path.split('/').pop() ?? 'document').replace(/\.[^.]+$/, '')}.${format}`,
+      `export as ${format.toUpperCase()}`,
+    );
   };
 
   const fileItems: MenuItem[] = [];
@@ -253,7 +299,8 @@ export function MarkdownMenuBar({
   if (canDownload) {
     fileItems.push({ type: 'action', label: 'Download', onClick: () => run(downloadCurrentFile) });
   }
-  if (canDownload && isMarkdownFile(file?.path)) {
+  // Export is a cloud route: the local shim answers 501 — don't offer it there.
+  if (canDownload && !localWorkspace && isMarkdownFile(file?.path)) {
     fileItems.push({
       type: 'action',
       label: 'Download as PDF',
@@ -272,35 +319,41 @@ export function MarkdownMenuBar({
     fileItems.push({ type: 'separator' });
     fileItems.push({ type: 'action', label: 'Move to trash', onClick: () => run(onDelete!) });
   }
-  if (fileItems.length > 0) fileItems.push({ type: 'separator' });
-  fileItems.push({
-    type: 'action',
-    label: 'Print',
-    shortcut: '⌘P',
-    onClick: () => run(() => typeof window !== 'undefined' && window.print()),
-  });
-
-  const viewItems: MenuItem[] = [];
-  if (onToggleMode && !readOnly) {
-    viewItems.push({
+  if (!hidePrint) {
+    if (fileItems.length > 0) fileItems.push({ type: 'separator' });
+    fileItems.push({
       type: 'action',
-      label: 'Mode',
-      trailing: readOnly ? 'Viewing' : 'Editing',
-      onClick: () => run(onToggleMode),
+      label: 'Print',
+      shortcut: '⌘P',
+      onClick: () => run(() => typeof window !== 'undefined' && window.print()),
     });
   }
+
+  // No toolbar toggle here: the Docs toolbar can never close (founder) —
+  // it's where the doc controls live.
+  const viewItems: MenuItem[] = [];
   if (onToggleSidebar) {
     viewItems.push({
       type: 'action',
       label: sidebarOpen ? 'Hide sidebar' : 'Show sidebar',
       onClick: () => run(onToggleSidebar),
     });
+    viewItems.push({ type: 'separator' });
   }
-  if (viewItems.length > 0) viewItems.push({ type: 'separator' });
   viewItems.push({
     type: 'action',
     label: 'Full screen',
     onClick: () => run(() => document.documentElement.requestFullscreen?.()),
+  });
+  // The way OUT of the Docs style. The top-left icon switch is gone (founder:
+  // floating icons read as chrome the page shouldn't have), so the style
+  // change lives in menus: here, the ⋮ menu, and Settings → Appearance. This
+  // bar only renders in the Docs style, so the item is unconditional.
+  viewItems.push({ type: 'separator' });
+  viewItems.push({
+    type: 'action',
+    label: 'IDE view',
+    onClick: () => run(() => setDocStylePreference('obsidian')),
   });
 
   const menus: Menu[] = [
@@ -474,53 +527,30 @@ export function MarkdownMenuBar({
         },
         {
           type: 'action',
-          label: 'Heading 4',
-          disabled: noEditor || readOnly,
-          onClick: () => run(() => editor!.chain().focus().toggleHeading({ level: 4 }).run()),
-        },
-        {
-          type: 'action',
-          label: 'Heading 5',
-          disabled: noEditor || readOnly,
-          onClick: () => run(() => editor!.chain().focus().toggleHeading({ level: 5 }).run()),
-        },
-        {
-          type: 'action',
-          label: 'Heading 6',
-          disabled: noEditor || readOnly,
-          onClick: () => run(() => editor!.chain().focus().toggleHeading({ level: 6 }).run()),
-        },
-        {
-          type: 'action',
           label: 'Normal text',
           shortcut: '⌘⌥0',
           disabled: noEditor || readOnly,
           onClick: () => run(() => editor!.chain().focus().setParagraph().run()),
         },
         { type: 'separator' },
+        // Alignment is image-only at the schema level (images round-trip as `{align=…}`).
         {
           type: 'action',
           label: 'Align left',
-          disabled: noEditor || readOnly,
+          disabled: !canAlign,
           onClick: () => run(() => editor!.chain().focus().setTextAlign('left').run()),
         },
         {
           type: 'action',
           label: 'Align center',
-          disabled: noEditor || readOnly,
+          disabled: !canAlign,
           onClick: () => run(() => editor!.chain().focus().setTextAlign('center').run()),
         },
         {
           type: 'action',
           label: 'Align right',
-          disabled: noEditor || readOnly,
+          disabled: !canAlign,
           onClick: () => run(() => editor!.chain().focus().setTextAlign('right').run()),
-        },
-        {
-          type: 'action',
-          label: 'Justify',
-          disabled: noEditor || readOnly,
-          onClick: () => run(() => editor!.chain().focus().setTextAlign('justify').run()),
         },
         { type: 'separator' },
         {
@@ -556,7 +586,9 @@ export function MarkdownMenuBar({
   return (
     <>
       <div
-        className="flex items-center gap-1 bg-transparent px-3 py-1.5 text-[13px] text-stone-700"
+        // py-0: the buttons' own padding is the row's only vertical air —
+        // the header cluster was too tall (founder, 2026-08-14).
+        className={`flex items-center gap-1 bg-transparent text-[13px] text-stone-700 ${className}`}
         role="menubar"
         data-testid="markdown-menu-bar"
       >
@@ -572,12 +604,30 @@ export function MarkdownMenuBar({
               onMouseDown={(event) => {
                 event.preventDefault();
                 setImageOpen(false);
+                if (openMenu === menu.id && hoverSwitchedRef.current) {
+                  // Hovered here from another open menu: this click commits
+                  // the switch instead of toggling closed.
+                  hoverSwitchedRef.current = false;
+                  return;
+                }
+                hoverSwitchedRef.current = false;
+                setOpenMenu((cur) => (cur === menu.id ? null : menu.id));
+              }}
+              // Keyboard/screen-reader activation arrives as a click with
+              // detail 0 (Enter/Space) — mouse clicks (detail > 0) already
+              // toggled on the mousedown above and must not re-toggle here.
+              onClick={(event) => {
+                if (event.detail !== 0) return;
+                setImageOpen(false);
                 setOpenMenu((cur) => (cur === menu.id ? null : menu.id));
               }}
               onMouseEnter={() => {
-                if (openMenu && openMenu !== menu.id) setOpenMenu(menu.id);
+                if (openMenu && openMenu !== menu.id) {
+                  hoverSwitchedRef.current = true;
+                  setOpenMenu(menu.id);
+                }
               }}
-              className={`rounded px-2.5 py-1 transition-colors ${
+              className={`rounded px-2.5 py-0.5 transition-colors ${
                 openMenu === menu.id ? 'bg-stone-200 text-stone-900' : 'hover:bg-stone-100'
               }`}
             >
@@ -603,6 +653,11 @@ export function MarkdownMenuBar({
                       event.preventDefault();
                       if (!item.disabled) item.onClick();
                     }}
+                    // Enter/Space: keyboard clicks carry detail 0; mouse
+                    // clicks already ran on mousedown (see the menu button).
+                    onClick={(event) => {
+                      if (event.detail === 0 && !item.disabled) item.onClick();
+                    }}
                     className={`flex w-full items-center justify-between px-3 py-1.5 text-left text-[12px] transition-colors ${
                       item.disabled
                         ? 'cursor-not-allowed text-stone-400'
@@ -612,9 +667,6 @@ export function MarkdownMenuBar({
                     <span>{item.label}</span>
                     {item.shortcut && (
                       <span className="ml-4 text-[11px] text-stone-400">{item.shortcut}</span>
-                    )}
-                    {item.trailing && !item.shortcut && (
-                      <span className="ml-4 text-[11px] text-stone-400">{item.trailing}</span>
                     )}
                   </button>
                 );
@@ -630,8 +682,13 @@ export function MarkdownMenuBar({
           </div>
         ))}
       </div>
-      {findOpen && editor ? (
-        <FindReplacePanel editor={editor} readOnly={readOnly} onClose={() => setFindOpen(false)} />
+      {findOpen && editor && !editor.isDestroyed ? (
+        <FindReplacePanel
+          editor={editor}
+          readOnly={readOnly}
+          showReplace
+          onClose={() => setFindOpen(false)}
+        />
       ) : null}
     </>
   );

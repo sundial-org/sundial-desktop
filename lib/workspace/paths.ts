@@ -1,6 +1,7 @@
 import { getWorkspaceRouteId, toShortIdRef, type WorkspaceRouteInput } from '@/lib/workspace/public-ids';
+import { WELCOME_TEX_PATH } from '@/lib/workspace/welcome-doc';
 
-type WorkspacePathParams = Record<
+export type WorkspacePathParams = Record<
   string,
   string | number | boolean | null | undefined
 >;
@@ -35,6 +36,14 @@ export function buildWorkspacePath(
   workspaceId: WorkspaceRouteInput,
   params?: WorkspacePathParams
 ) {
+  // A local project renders the same page under `/local/<id>` and has no
+  // cloud workspace at all — a `/w/` path from a sidecar project id resolves
+  // to nothing ("Workspace not found"). Every builder in this file, and every
+  // caller that copies or redirects to a workspace url, funnels through here,
+  // so the route id carrying its own verdict is what keeps them all honest.
+  if (typeof workspaceId === 'object' && workspaceId.local) {
+    return buildLocalProjectPath(workspaceId.id, params);
+  }
   const basePath = `/w/${normalizeWorkspaceId(workspaceId)}`;
   const searchParams = buildSearchParams(params);
   const query = searchParams.toString();
@@ -75,5 +84,9 @@ export function buildWorkspaceFilePath(
 }
 
 export function buildFreshOnboardingWorkspaceUrl(workspaceId: WorkspaceRouteInput) {
-  return buildWorkspacePath(workspaceId, { fresh: true });
+  return buildWorkspacePath(workspaceId, {
+    fresh: true,
+    filePath: WELCOME_TEX_PATH,
+    onboarding: 'tex',
+  });
 }

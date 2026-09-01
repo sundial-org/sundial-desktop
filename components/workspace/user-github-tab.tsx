@@ -148,7 +148,7 @@ export function UserGitHubTab() {
                 </div>
                 <p className="mt-2 text-xs text-stone-500">
                   {status.legacyAccess ? (
-                    'Access: all repositories (legacy) — Re-authorize to pick specific repos'
+                    'Access: all repositories (legacy) · Re-authorize to pick specific repos'
                   ) : (
                     <>
                       Access: only the repositories you granted ·{' '}

@@ -20,6 +20,10 @@ export interface LatexLogItem {
   severity: LatexLogSeverity;
   /** Workspace-relative source file when known, else the root fallback, else null. */
   file: string | null;
+  /** True when `file` came from the log's own context (paren stack or a
+   *  `path:line:` prefix) rather than the root fallback — resolvers must only
+   *  re-map log-sourced paths (a fallback is already a workspace path). */
+  fileFromLog: boolean;
   /** 1-based source line, or null when the log gives none (IC6 "line unknown"). */
   line: number | null;
   /** Normalized one-line message. */
@@ -100,9 +104,9 @@ function advanceFileStack(line: string, stack: string[]): void {
   }
 }
 
-function fileAt(stack: string[], rootFile: string | null | undefined): string | null {
-  if (stack.length > 0) return stack[stack.length - 1];
-  return rootFile ?? null;
+function fileAt(stack: string[], rootFile: string | null | undefined): { file: string | null; fromLog: boolean } {
+  if (stack.length > 0) return { file: stack[stack.length - 1], fromLog: true };
+  return { file: rootFile ?? null, fromLog: false };
 }
 
 function clampExcerpt(lines: string[]): string {
@@ -154,9 +158,11 @@ export function parseLatexLog(log: string, options: ParseLatexLogOptions = {}): 
           break;
         }
       }
+      const loc = fileAt(stack, rootFile);
       items.push({
         severity: 'error',
-        file: fileAt(stack, rootFile),
+        file: loc.file,
+        fileFromLog: loc.fromLog,
         line: Number.isFinite(sourceLine) ? sourceLine : null,
         message: errorMatch[1].trim() || 'LaTeX error',
         rawExcerpt: clampExcerpt(excerpt),
@@ -168,9 +174,11 @@ export function parseLatexLog(log: string, options: ParseLatexLogOptions = {}): 
     const badboxMatch = line.match(BADBOX_RE);
     if (badboxMatch) {
       const linesMatch = line.match(BADBOX_LINES_RE) || line.match(BADBOX_LINE_RE);
+      const loc = fileAt(stack, rootFile);
       items.push({
         severity: 'badbox',
-        file: fileAt(stack, rootFile),
+        file: loc.file,
+        fileFromLog: loc.fromLog,
         line: linesMatch ? Number(linesMatch[1]) : null,
         message: line.trim(),
         rawExcerpt: line.trimEnd(),
@@ -197,9 +205,11 @@ export function parseLatexLog(log: string, options: ParseLatexLogOptions = {}): 
         const inputMatch = lines[j].match(INPUT_LINE_RE);
         if (inputMatch) inputLine = Number(inputMatch[1]);
       }
+      const loc = fileAt(stack, rootFile);
       items.push({
         severity: 'warning',
-        file: fileAt(stack, rootFile),
+        file: loc.file,
+        fileFromLog: loc.fromLog,
         line: inputLine,
         message: warningMatch[1].trim(),
         rawExcerpt: clampExcerpt(excerpt),
@@ -220,6 +230,7 @@ export function parseLatexLog(log: string, options: ParseLatexLogOptions = {}): 
         items.push({
           severity: 'error',
           file: candidate,
+          fileFromLog: true,
           line: Number(fileLineMatch[2]),
           message: fileLineMatch[3].trim(),
           rawExcerpt: line.trimEnd(),
@@ -241,6 +252,7 @@ export function parseLatexLog(log: string, options: ParseLatexLogOptions = {}): 
     items.push({
       severity: 'error',
       file: rootFile,
+      fileFromLog: false,
       line: null,
       message: 'Compile failed (see log)',
       rawExcerpt: clampExcerpt(lines.slice(-MAX_EXCERPT_LINES)),

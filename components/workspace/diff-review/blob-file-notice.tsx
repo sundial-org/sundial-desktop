@@ -1,8 +1,11 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { formatBytes } from '@/components/workspace/diff-review/turn-edit-helpers';
+import { formatBytes } from '@/lib/workspace/uploads';
 import type { TurnEditFile } from '@/lib/workspace/turn-edits';
+import { withPathShareToken } from '@/lib/workspace/path-share-token-client';
+
+const pshareFetch = withPathShareToken((input, init) => fetch(input, init));
 
 // A binary (png, pdf…) the turn produced — there is no text diff to render.
 // Shows an Added/Updated notice and, for images, an inline preview fetched via
@@ -27,7 +30,7 @@ export function BlobFileNotice({
     setPreviewUrl(null);
     if (!isImage || !projectId || !file.fileId) return;
     const controller = new AbortController();
-    void fetch('/api/workspace/files/preview', {
+    void pshareFetch('/api/workspace/files/preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ projectId, fileId: file.fileId }),

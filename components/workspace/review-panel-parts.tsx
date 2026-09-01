@@ -23,7 +23,7 @@ import { activeFilterCount, deriveFolders, isEmptyFilter, summarizeFilter, type 
 import type { SnapshotFileDiff } from '@/lib/workspace/api-shared-types';
 import { ANON_PREFIX, type ChangeAuthorKind } from '@/lib/workspace/workspace-changes';
 
-const AUTHOR_KIND_LABEL: Record<ChangeAuthorKind, string> = { sunny: 'Sunny', local_agent: 'local agents', human: 'you & humans' };
+const AUTHOR_KIND_LABEL: Record<ChangeAuthorKind, string> = { sunny: 'Sundial Agent', local_agent: 'local agents', human: 'you & humans' };
 const toggle = <T,>(arr: T[], value: T): T[] => (arr.includes(value) ? arr.filter((v) => v !== value) : [...arr, value]);
 const parentFolderOf = (path: string | null | undefined): string | null => {
   if (!path) return null;
@@ -261,7 +261,7 @@ export function RangeCompareDetail({
           return shown.length === 0 ? (
             <div className="rounded-xl border border-dashed border-stone-200 px-4 py-10 text-center text-[13px] text-stone-400">
               {hidden > 0
-                ? `Nothing changed in the current filter — ${hidden} changed ${hidden === 1 ? 'file is' : 'files are'} outside it.`
+                ? `Nothing changed in the current filter. ${hidden} changed ${hidden === 1 ? 'file is' : 'files are'} outside it.`
                 : 'Nothing changed between these two points.'}
             </div>
           ) : (

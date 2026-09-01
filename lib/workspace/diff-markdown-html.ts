@@ -1,4 +1,4 @@
-import { Node as PMNode, DOMSerializer } from '@tiptap/pm/model';
+import { Node as PMNode, DOMSerializer, type DOMOutputSpec } from '@tiptap/pm/model';
 import { yDocToProsemirrorJSON } from 'y-prosemirror';
 import { markdownToHtml, renderMathInPlainText } from '@/lib/markdown/html.mjs';
 import { markdownSchema } from '@/lib/markdown/codec';
@@ -409,6 +409,27 @@ export function buildInlineMarkdownDiffHtmlFromLines(
  * (DOMSerializer); returns '' during SSR or on any codec error, so the caller
  * falls back to {@link buildInlineMarkdownDiffHtmlFromLines}.
  */
+// The editor schema keeps structural suggestion ids (a suggested code fence /
+// rule / image / blank bullet has no text to mark) in unrendered node attrs;
+// paint them with the same node classes the editor's decorations use.
+let structuralSerializer: DOMSerializer | null = null;
+function structuralSuggestionSerializer(): DOMSerializer {
+  if (structuralSerializer) return structuralSerializer;
+  const base = DOMSerializer.fromSchema(markdownSchema);
+  const nodes = Object.fromEntries(Object.entries(base.nodes).map(([name, toDOM]) => [name, (n: PMNode): DOMOutputSpec => {
+    const spec = toDOM(n);
+    const cls = n.attrs.suggestionInsertionId != null ? 'suggestion-node-insertion'
+      : n.attrs.suggestionDeletionId != null ? 'suggestion-node-deletion' : null;
+    if (!cls || !Array.isArray(spec)) return spec;
+    const [tag, second, ...rest] = spec;
+    const hasAttrs = second != null && typeof second === 'object' && !Array.isArray(second) && !('nodeType' in second);
+    const attrs = hasAttrs ? (second as Record<string, string>) : {};
+    return [tag, { ...attrs, class: [attrs.class, cls].filter(Boolean).join(' ') }, ...(hasAttrs ? rest : spec.slice(1))] as DOMOutputSpec;
+  }]));
+  structuralSerializer = new DOMSerializer(nodes, base.marks);
+  return structuralSerializer;
+}
+
 export function buildMarkedDiffHtmlFromLines(lines: TurnEditLine[], doc?: Document): string {
   const liveDoc = doc ?? (typeof document !== 'undefined' ? document : null);
   if (!liveDoc || lines.length === 0) return '';
@@ -429,7 +450,7 @@ export function buildMarkedDiffHtmlFromLines(lines: TurnEditLine[], doc?: Docume
     if (!applyMarkdownSuggestion(ydoc, before, after, 'card')) return '';
     const json = yDocToProsemirrorJSON(ydoc, 'default');
     const node = PMNode.fromJSON(markdownSchema, json);
-    const frag = DOMSerializer.fromSchema(markdownSchema).serializeFragment(node.content, { document: liveDoc });
+    const frag = structuralSuggestionSerializer().serializeFragment(node.content, { document: liveDoc });
     const holder = liveDoc.createElement('div');
     holder.appendChild(frag);
     // Safety net: an unchanged (context) line must NEVER render struck. When a
@@ -437,7 +458,7 @@ export function buildMarkedDiffHtmlFromLines(lines: TurnEditLine[], doc?: Docume
     // become hardBreak atoms that force a whole-block strike, marking unchanged
     // text. Detect that (the context line's text inside a <del>) and bail to the
     // legacy render rather than show a false deletion. (review finding)
-    const struck = Array.from(holder.querySelectorAll('del[data-suggestion]')).map((el) => el.textContent ?? '');
+    const struck = Array.from(holder.querySelectorAll('del[data-suggestion], .suggestion-node-deletion')).map((el) => el.textContent ?? '');
     const contextStruck = lines.some(
       (l) => l.type === 'context' && l.content.trim().length > 0 && struck.some((d) => d.includes(l.content.trim())),
     );

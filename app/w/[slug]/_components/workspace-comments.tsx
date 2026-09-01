@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ChatCircleIcon, ChatTeardropIcon, LinkSimpleIcon } from '@phosphor-icons/react';
 import type { Editor } from '@tiptap/react';
+import type { Transaction } from '@tiptap/pm/state';
+import { ySyncPluginKey } from '@tiptap/y-tiptap';
 import {
   buildDraftDocCommentSelection,
   observeCommentAnchorReflow,
@@ -11,6 +13,9 @@ import {
   selectWordAtCoords,
 } from '@/lib/workspace/doc-comments-client';
 import {
+  findOwnReaction,
+  isOptimisticCommentId,
+  isSingleEmoji,
   OPTIMISTIC_ID_PREFIX,
   type DraftDocCommentSelection,
   type DocCommentThread,
@@ -23,7 +28,12 @@ import type { WorkspaceFileRow } from '@/lib/workspace/types';
 import { isMarkdownImageContextMenuTarget } from '@/components/workspace/collab-editor';
 import { formatFileName, getFileName } from './workspace-file-helpers';
 
-type WorkspaceRouteId = string | { id: string; public_id: string | null };
+import type { WorkspaceRouteInput } from '@/lib/workspace/public-ids';
+
+// The page's own route id, `local` flag included — these hooks forward it
+// straight to buildWorkspacePath, which is what keeps a local project's
+// links and redirects off the cloud `/w/` route.
+type WorkspaceRouteId = WorkspaceRouteInput;
 type WorkspaceCommentMode = 'document' | 'workspace';
 
 type CommentContextMenu = {
@@ -59,6 +69,26 @@ function isCreateCommentShortcut(event: KeyboardEvent) {
   if (!isMKey || event.repeat) return false;
   if (event.metaKey && event.altKey && !event.ctrlKey) return true;
   return event.ctrlKey && event.altKey && !event.metaKey;
+}
+
+// tiptap's `editor.view` getter returns a Proxy that THROWS on any real
+// property access (e.g. `.dom`, `.coordsAtPos`) until the ProseMirror view is
+// mounted. An effect that reads it during a mount race (restored pane/chat
+// layout re-materializing before the view is created) throws synchronously and
+// error-boundaries the whole workspace page ("This page couldn't load").
+//
+// The try/catch is the robust probe: `isInitialized` is set AFTER the `create`
+// event fires (same tick), so a `create` handler still sees it false — but the
+// ProseMirror view IS available by then, so reading `view.dom` succeeds while
+// the flag would wrongly say "not mounted". Returns the live DOM node, or null
+// when the view isn't mounted yet.
+function mountedEditorDom(editor: Editor | null | undefined): HTMLElement | null {
+  if (!editor || editor.isDestroyed) return null;
+  try {
+    return editor.view.dom as HTMLElement;
+  } catch {
+    return null;
+  }
 }
 
 type OptimisticUser = { userId: string | null; name: string | null; username: string | null; imageUrl: string | null };
@@ -147,6 +177,7 @@ export function useWorkspaceComments({
   onSelectFile,
   onOpenSpace,
   showWorkspaceAppNotice,
+  initialLoadEnabled = true,
 }: {
   projectId: string;
   supabaseClient: ReturnType<typeof createBrowserClient>;
@@ -183,6 +214,9 @@ export function useWorkspaceComments({
   onSelectFile: (path: string) => void;
   onOpenSpace: () => void;
   showWorkspaceAppNotice: (type: 'success' | 'error', message: string) => void;
+  /** Hold comment reads/realtime until the initial document paint. A comment
+   * deep link or opening the comments lane overrides the hold immediately. */
+  initialLoadEnabled?: boolean;
 }) {
   // Wrapped (not `fetchImpl ?? fetch`) so the global fetch keeps its expected
   // receiver; local workspaces pass the sidecar-emulated fetch instead.
@@ -215,10 +249,29 @@ export function useWorkspaceComments({
   const [commentBusyAction, setCommentBusyAction] = useState<string | null>(null);
   const [docCommentAnchorOffsets, setDocCommentAnchorOffsets] = useState<Record<string, number>>({});
   const [draftCommentAnchorOffset, setDraftCommentAnchorOffset] = useState<number | null>(null);
+  // 1-based source start line per thread, reported by the Monaco measure pass —
+  // the PDF comment markers map these through SyncTeX forward search.
+  const [commentAnchorLines, setCommentAnchorLines] = useState<Record<string, number>>({});
+  // Ids a measurement pass has ATTEMPTED (threads + '__draft__'), successful or
+  // not. The lane hides a card only while its id was never in a pass — so a
+  // fresh card can't paint at the top:0 fallback, while a thread whose anchor
+  // never resolves (quote edited away) still falls back to visible after the
+  // pass that tried it. Per-id (not a boolean) because Monaco reports passes
+  // asynchronously: a pre-load empty pass must not mark later threads measured.
+  const [measuredCommentAnchorIds, setMeasuredCommentAnchorIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const markCommentAnchorsMeasured = useCallback((ids: string[]) => {
+    setMeasuredCommentAnchorIds((current) => {
+      if (current.size === ids.length && ids.every((id) => current.has(id))) return current;
+      return new Set(ids);
+    });
+  }, []);
   const [commentContextMenu, setCommentContextMenu] = useState<CommentContextMenu | null>(null);
   // Bumped as the editor applies CRDT-synced content, so comment anchors
   // re-resolve once the doc is populated (see the resolve memo + effect below).
   const [docSyncNonce, setDocSyncNonce] = useState(0);
+  const commentDataEnabled = initialLoadEnabled || showCommentLane || Boolean(deepLinkedCommentThreadId);
 
   const commentMenuRef = useRef<HTMLDivElement | null>(null);
   const commentLaneRowRef = useRef<HTMLDivElement | null>(null);
@@ -234,9 +287,49 @@ export function useWorkspaceComments({
   // can't drop the just-typed comment/reply until its own request reconciles.
   const pendingThreadsRef = useRef<DocCommentThread[]>([]);
   const pendingMessagesRef = useRef<Array<{ threadId: string; message: DocCommentMessage }>>([]);
-  const withOptimistic = useCallback((serverThreads: DocCommentThread[], filePath: string) => {
+  // In-flight optimistic resolve/reopen, re-merged like pendingThreadsRef so a
+  // GET racing the PATCH — document OR workspace scope — can't flash the old
+  // status back. An override outlives its PATCH: a reload that STARTED before
+  // the mutation settled may resolve after it with the old status, so each
+  // override records the settle generation and each load records the
+  // generation it started at — only a load started at-or-after the settle is
+  // fresh enough to confirm the server status and drop the override.
+  const pendingStatusRef = useRef<Record<string, { status: DocCommentThread['status']; settledSeq: number | null }>>({});
+  const commentsMutationSeqRef = useRef(0);
+  /** Start generations of in-flight comment GETs — an override may only be
+   *  purged once no load that predates its settle is still outstanding. */
+  const activeLoadSeqsRef = useRef<number[]>([]);
+  const applyPendingStatus = useCallback((threads: DocCommentThread[], loadStartSeq: number) => {
+    return threads.map((thread) => {
+      const pending = pendingStatusRef.current[thread.id];
+      if (!pending) return thread;
+      // A load started at-or-after the settle carries the authoritative
+      // status — use the server truth as-is (purging happens once every
+      // stale load has drained, see finishCommentLoad).
+      if (pending.settledSeq !== null && loadStartSeq >= pending.settledSeq) return thread;
+      return thread.status !== pending.status ? { ...thread, status: pending.status } : thread;
+    });
+  }, []);
+  const beginCommentLoad = useCallback(() => {
+    const seq = commentsMutationSeqRef.current;
+    activeLoadSeqsRef.current.push(seq);
+    return seq;
+  }, []);
+  const finishCommentLoad = useCallback((seq: number) => {
+    const idx = activeLoadSeqsRef.current.indexOf(seq);
+    if (idx !== -1) activeLoadSeqsRef.current.splice(idx, 1);
+    // Purge settled overrides no outstanding load can undercut anymore.
+    const oldest = activeLoadSeqsRef.current.length ? Math.min(...activeLoadSeqsRef.current) : Infinity;
+    for (const [id, entry] of Object.entries(pendingStatusRef.current)) {
+      if (entry.settledSeq !== null && entry.settledSeq <= oldest) delete pendingStatusRef.current[id];
+    }
+  }, []);
+  const withOptimistic = useCallback((serverThreads: DocCommentThread[], filePath: string, loadStartSeq?: number) => {
     const map = clientKeyByThreadIdRef.current;
-    let threads = serverThreads.map((thread) => {
+    // A snapshot without a start generation is treated as STALE — overrides
+    // keep shielding it. Every fetch path captures its own generation; this
+    // default only protects future call sites from silently going stale-unsafe.
+    let threads = applyPendingStatus(serverThreads, loadStartSeq ?? -1).map((thread) => {
       let clientKey = map[thread.id];
       // A realtime reload can echo the persisted row before the POST promise
       // settles (so the id→optimistic-id map isn't recorded yet). Match the echo
@@ -282,7 +375,7 @@ export function useWorkspaceComments({
       (p) => p.filePath === filePath && !stampedKeys.has(p.id) && !threads.some((thread) => thread.id === p.id),
     );
     return pendingForFile.length ? [...pendingForFile, ...threads] : threads;
-  }, []);
+  }, [applyPendingStatus]);
 
   // Comments are available on both markdown (ProseMirror) and code/LaTeX
   // (Monaco) files; only the rendering surface differs. Never on mobile: the
@@ -313,7 +406,23 @@ export function useWorkspaceComments({
   // The Monaco editor measures its own anchor offsets (the markdown layout
   // effect below can't — it walks the ProseMirror view) and reports them here.
   const reportCommentAnchors = useCallback(
-    (data: { offsets: Record<string, number>; draftOffset: number | null }) => {
+    (data: {
+      offsets: Record<string, number>;
+      draftOffset: number | null;
+      attempted?: boolean;
+      lines?: Record<string, number>;
+    }) => {
+      if (data.lines) {
+        const lines = data.lines;
+        setCommentAnchorLines((current) => {
+          const currentKeys = Object.keys(current);
+          const nextKeys = Object.keys(lines);
+          if (currentKeys.length === nextKeys.length && nextKeys.every((key) => current[key] === lines[key])) {
+            return current;
+          }
+          return lines;
+        });
+      }
       setDocCommentAnchorOffsets((current) => {
         const currentKeys = Object.keys(current);
         const nextKeys = Object.keys(data.offsets);
@@ -326,8 +435,21 @@ export function useWorkspaceComments({
         return data.offsets;
       });
       setDraftCommentAnchorOffset((current) => (current === data.draftOffset ? current : data.draftOffset));
+      // Monaco's pass covers the thread set it was rendered with, plus the
+      // draft only if one existed to attempt (refs: this callback stays stable
+      // across renders). A could-not-measure report (`attempted: false`, e.g.
+      // the lane row isn't mounted yet) resets instead — its empty offsets are
+      // not authoritative and cards must stay hidden until a real pass.
+      markCommentAnchorsMeasured(
+        data.attempted === false
+          ? []
+          : [
+              ...openCommentThreadIdsRef.current,
+              ...(draftCommentSelectionRef.current ? ['__draft__'] : []),
+            ],
+      );
     },
-    [],
+    [markCommentAnchorsMeasured],
   );
 
   const canCommentOnActiveFile = Boolean(canComment && commentsAvailableForActiveFile);
@@ -338,6 +460,11 @@ export function useWorkspaceComments({
         : [],
     [commentThreads, commentThreadsPath, activeFilePath],
   );
+  // For reportCommentAnchors above (declared before this memo can exist).
+  const openCommentThreadIdsRef = useRef<string[]>([]);
+  openCommentThreadIdsRef.current = openCommentThreads.map((thread) => thread.id);
+  const draftCommentSelectionRef = useRef(draftCommentSelection);
+  draftCommentSelectionRef.current = draftCommentSelection;
   const openWorkspaceCommentThreads = useMemo(
     () => workspaceCommentThreads.filter((thread) => thread.status === 'open'),
     [workspaceCommentThreads],
@@ -394,6 +521,28 @@ export function useWorkspaceComments({
       editor.off('update', onUpdate);
     };
   }, [markdownEditor, openCommentCount, allCommentsResolved]);
+  // A y-sync forced re-render replaces the WHOLE doc; when its content differs
+  // (a remote update arriving through a full re-render) the decoration cache
+  // maps the highlights away by design — stale absolute positions must never
+  // be recreated onto a changed document — and the effect above may already be
+  // disarmed (allCommentsResolved computed from the stale ranges). Re-resolve
+  // from the Yjs anchors whenever such a transaction lands. Rare (plugin
+  // reconfigure / remote full re-render), so no steady-state cost.
+  useEffect(() => {
+    const editor = markdownEditorRef.current;
+    if (!editor || editor.isDestroyed) return;
+    const onTransaction = ({ transaction }: { transaction: Transaction }) => {
+      if (!transaction.docChanged) return;
+      // No open threads ⇒ nothing to re-resolve; don't re-render the page.
+      if (openCommentThreadIdsRef.current.length === 0) return;
+      const meta = transaction.getMeta(ySyncPluginKey) as { binding?: unknown } | undefined;
+      if (meta?.binding) setDocSyncNonce((value) => value + 1);
+    };
+    editor.on('transaction', onTransaction);
+    return () => {
+      editor.off('transaction', onTransaction);
+    };
+  }, [markdownEditor]);
   const draftCommentRange = useMemo(
     () => resolveDocCommentDraftRange(draftCommentSelection, markdownEditorRef.current),
     [draftCommentSelection, markdownEditor],
@@ -430,6 +579,7 @@ export function useWorkspaceComments({
       if (!activeIsCode) {
         setDocCommentAnchorOffsets({});
         setDraftCommentAnchorOffset(null);
+        markCommentAnchorsMeasured([]);
       }
       return;
     }
@@ -437,6 +587,7 @@ export function useWorkspaceComments({
     if (!rowNode) {
       setDocCommentAnchorOffsets({});
       setDraftCommentAnchorOffset(null);
+      markCommentAnchorsMeasured([]);
       return;
     }
 
@@ -487,26 +638,48 @@ export function useWorkspaceComments({
         return next;
       });
       setDraftCommentAnchorOffset((current) => (current === nextDraftOffset ? current : nextDraftOffset));
+      // Every current thread was attempted this pass — even the ones whose
+      // anchors failed to resolve, which now fall back to visible. Two carve-
+      // outs keep a failure from being treated as authoritative too early:
+      // the draft counts only when one existed to attempt, and while the
+      // editor doc is still empty (initial CRDT sync hasn't landed) a failed
+      // resolve proves nothing — only the ids that actually resolved count,
+      // and the sync-driven re-resolve (docSyncNonce) retries the rest.
+      // Accepted residual: a doc whose content was deleted ENTIRELY keeps its
+      // orphaned cards hidden in this lane (indistinguishable from not-synced
+      // without a provider signal); they stay listed under All comments and
+      // reappear on the first pass after any content lands.
+      const docPopulated = editor.state.doc.content.size > 2;
+      markCommentAnchorsMeasured([
+        ...(docPopulated ? openCommentThreads.map((t) => t.id) : Object.keys(nextOffsets)),
+        ...(draftCommentSelection ? ['__draft__'] : []),
+      ]);
     };
     const scheduleAnchorOffsets = () => {
       if (frame) cancelAnimationFrame(frame);
       frame = window.requestAnimationFrame(updateAnchorOffsets);
     };
 
-    scheduleAnchorOffsets();
+    // First pass runs synchronously: this layout effect re-runs in the same
+    // commit that opens the lane / lands new threads, so measuring here (before
+    // paint) means cards never paint at offsets from the previous layout —
+    // the "card appears at the top then jumps to its anchor" bug. Later passes
+    // (reflow observer) stay rAF-coalesced.
+    updateAnchorOffsets();
     const teardownReflow = observeCommentAnchorReflow(editor, scheduleAnchorOffsets);
 
     return () => {
       if (frame) cancelAnimationFrame(frame);
       teardownReflow();
     };
-  }, [activeIsCode, activeIsMarkdown, commentPanelMode, draftCommentRange, markdownEditor, openCommentThreads, resolvedCommentRanges]);
+  }, [activeIsCode, activeIsMarkdown, commentPanelMode, draftCommentRange, draftCommentSelection, markCommentAnchorsMeasured, markdownEditor, openCommentThreads, resolvedCommentRanges, showInlineCommentLane]);
 
   const loadComments = useCallback(
     async (filePath: string, preferredThreadId?: string | null) => {
       if (!projectId) return;
       setCommentsLoading(true);
       setCommentsError(null);
+      const loadStartSeq = beginCommentLoad();
       try {
         const response = await api(
           `/api/workspace/comments?projectId=${encodeURIComponent(projectId)}&filePath=${encodeURIComponent(filePath)}`,
@@ -516,7 +689,7 @@ export function useWorkspaceComments({
         }
         const payload = (await response.json()) as { threads?: DocCommentThread[] };
         if (activeCommentFilePathRef.current !== filePath) return;
-        const threads = withOptimistic(Array.isArray(payload.threads) ? payload.threads : [], filePath);
+        const threads = withOptimistic(Array.isArray(payload.threads) ? payload.threads : [], filePath, loadStartSeq);
         setCommentThreads(threads);
         setCommentThreadsPath(filePath);
         setActiveCommentThreadId((current) => resolveActiveThreadId(threads, preferredThreadId ?? current));
@@ -529,18 +702,20 @@ export function useWorkspaceComments({
         setCommentThreadsPath(filePath);
         setCommentsError(error instanceof Error ? error.message : 'Failed to load comments');
       } finally {
+        finishCommentLoad(loadStartSeq);
         if (activeCommentFilePathRef.current === filePath) {
           setCommentsLoading(false);
         }
       }
     },
-    [api, projectId, withOptimistic],
+    [api, beginCommentLoad, finishCommentLoad, projectId, withOptimistic],
   );
 
   const loadWorkspaceComments = useCallback(async () => {
     if (!projectId) return;
     setWorkspaceCommentsLoading(true);
     setWorkspaceCommentsError(null);
+    const loadStartSeq = beginCommentLoad();
     try {
       const response = await api(
         `/api/workspace/comments?projectId=${encodeURIComponent(projectId)}&scope=workspace`,
@@ -549,14 +724,17 @@ export function useWorkspaceComments({
         throw new Error(await readErrorMessage(response, 'Failed to load workspace comments'));
       }
       const payload = (await response.json()) as { threads?: DocCommentThread[] };
-      setWorkspaceCommentThreads(Array.isArray(payload.threads) ? payload.threads : []);
+      // Pending resolve/reopen overlays apply here too — a reload landing
+      // mid-PATCH must not flash the old status in the All-comments view.
+      setWorkspaceCommentThreads(applyPendingStatus(Array.isArray(payload.threads) ? payload.threads : [], loadStartSeq));
     } catch (error) {
       setWorkspaceCommentThreads([]);
       setWorkspaceCommentsError(error instanceof Error ? error.message : 'Failed to load workspace comments');
     } finally {
+      finishCommentLoad(loadStartSeq);
       setWorkspaceCommentsLoading(false);
     }
-  }, [api, projectId]);
+  }, [api, applyPendingStatus, beginCommentLoad, finishCommentLoad, projectId]);
 
   const refreshWorkspaceComments = useCallback(() => {
     void loadWorkspaceComments();
@@ -614,12 +792,12 @@ export function useWorkspaceComments({
   }, [canCommentOnActiveFile, markdownEditor, openCommentDraft]);
 
   const applyCommentThreads = useCallback(
-    (filePath: string, threads: DocCommentThread[], preferredThreadId?: string | null) => {
+    (filePath: string, threads: DocCommentThread[], preferredThreadId?: string | null, loadStartSeq?: number) => {
       // Tag with the path the mutation was issued for, NOT the current ref: if the
       // user switched files while the request was in flight, the ref already points
       // at the new file and these threads would render on the wrong document. Tagging
       // with `filePath` lets the `commentThreadsPath === activeFilePath` gate drop them.
-      const decorated = withOptimistic(threads, filePath);
+      const decorated = withOptimistic(threads, filePath, loadStartSeq);
       setCommentThreads(decorated);
       setCommentThreadsPath(filePath);
       setCommentsError(null);
@@ -629,11 +807,18 @@ export function useWorkspaceComments({
   );
 
   const createComment = useCallback(
-    async (body: string) => {
+    /** `selectionOverride` lets a caller post against a selection it captured
+     *  itself (the emoji-reaction path) without going through the draft
+     *  composer — everything downstream is the same comment. */
+    async (body: string, selectionOverride?: DraftDocCommentSelection) => {
       const trimmed = body.trim();
-      if (!projectId || !activeWorkspaceFile || !draftCommentSelection || !trimmed) return;
+      const selection = selectionOverride ?? draftCommentSelection;
+      if (!projectId || !activeWorkspaceFile || !selection || !trimmed) return;
       const filePath = activeWorkspaceFile.path;
-      const selection = draftCommentSelection;
+      // A one-emoji body IS a reaction: it renders as an inline chip, so it
+      // must not yank the lane open or steal the active-thread selection the
+      // way a real comment does.
+      const asReaction = isSingleEmoji(trimmed);
       const now = new Date().toISOString();
       const author = optimisticAuthor(currentUser);
       // Show the comment the instant Enter is pressed — the draft selection
@@ -661,11 +846,17 @@ export function useWorkspaceComments({
       // file's load resolves can't surface the old file's threads in this lane.
       setCommentThreads((current) => [optimistic, ...current.filter((thread) => thread.filePath === filePath)]);
       setCommentThreadsPath(filePath);
-      setActiveCommentThreadId(optimistic.id);
-      setDraftCommentSelection(null);
+      // The lane is where a reaction is VISIBLE (it renders as a chip in the
+      // margin, never inline), so it has to open for both. Only a real comment
+      // takes the focus though: focusing pins the card to its anchor and flows
+      // every other card around it, which is far too much ceremony for a 👍 —
+      // and it would shove the comments the founder wants to keep seeing.
       setShowCommentLane(true);
+      if (!asReaction) setActiveCommentThreadId(optimistic.id);
+      if (!selectionOverride) setDraftCommentSelection(null);
       setCommentsError(null);
       setCommentBusyAction('create');
+      const loadStartSeq = beginCommentLoad();
       try {
         const response = await api('/api/workspace/comments', {
           method: 'POST',
@@ -704,26 +895,34 @@ export function useWorkspaceComments({
             prev[optimistic.id] === undefined ? prev : { ...prev, [created]: prev[optimistic.id] },
           );
         }
-        applyCommentThreads(filePath, threads, created);
+        applyCommentThreads(filePath, threads, asReaction ? undefined : created, loadStartSeq);
         refreshWorkspaceComments();
       } catch (error) {
         pendingThreadsRef.current = pendingThreadsRef.current.filter((t) => t.id !== optimistic.id);
         // Roll back the optimistic thread.
         setCommentThreads((current) => current.filter((thread) => thread.id !== optimistic.id));
         setActiveCommentThreadId((current) => (current === optimistic.id ? null : current));
+        const message = error instanceof Error ? error.message : 'Failed to create comment';
+        // A reaction has no draft to hand back and may have been posted with the
+        // lane closed, where `commentsError` renders nowhere — so its failure
+        // goes to the app notice instead, or the chip would just vanish.
+        if (selectionOverride) showWorkspaceAppNotice('error', message);
         // Hand the draft back — with the typed body — only if the user is still
         // on the originating file; otherwise restoring A's anchor under B would
         // let a retry create a comment anchored to the wrong document.
         if (activeCommentFilePathRef.current === filePath) {
-          setDraftCommentBody(trimmed);
-          setDraftCommentSelection(selection);
-          setCommentsError(error instanceof Error ? error.message : 'Failed to create comment');
+          if (!selectionOverride) {
+            setDraftCommentBody(trimmed);
+            setDraftCommentSelection(selection);
+          }
+          setCommentsError(message);
         }
       } finally {
+        finishCommentLoad(loadStartSeq);
         setCommentBusyAction(null);
       }
     },
-    [activeWorkspaceFile, api, applyCommentThreads, currentUser, draftCommentSelection, projectId, refreshWorkspaceComments],
+    [activeWorkspaceFile, api, applyCommentThreads, beginCommentLoad, currentUser, draftCommentSelection, finishCommentLoad, projectId, refreshWorkspaceComments, showWorkspaceAppNotice],
   );
 
   const replyToComment = useCallback(
@@ -744,6 +943,7 @@ export function useWorkspaceComments({
       );
       setCommentsError(null);
       setCommentBusyAction(`reply:${threadId}`);
+      const loadStartSeq = beginCommentLoad();
       try {
         const response = await api('/api/workspace/comments', {
           method: 'PATCH',
@@ -762,7 +962,7 @@ export function useWorkspaceComments({
         }
         const payload = (await response.json()) as { threads?: DocCommentThread[] };
         pendingMessagesRef.current = pendingMessagesRef.current.filter((p) => p.message.id !== message.id);
-        applyCommentThreads(filePath, Array.isArray(payload.threads) ? payload.threads : [], threadId);
+        applyCommentThreads(filePath, Array.isArray(payload.threads) ? payload.threads : [], threadId, loadStartSeq);
         refreshWorkspaceComments();
       } catch (error) {
         pendingMessagesRef.current = pendingMessagesRef.current.filter((p) => p.message.id !== message.id);
@@ -779,23 +979,54 @@ export function useWorkspaceComments({
         setReplyRestore({ threadId, body: trimmed, token: replyRestoreTokenRef.current });
         setCommentsError(error instanceof Error ? error.message : 'Failed to reply');
       } finally {
+        finishCommentLoad(loadStartSeq);
         setCommentBusyAction(null);
       }
     },
-    [activeWorkspaceFile, api, applyCommentThreads, currentUser, projectId, refreshWorkspaceComments],
+    [activeWorkspaceFile, api, applyCommentThreads, beginCommentLoad, currentUser, finishCommentLoad, projectId, refreshWorkspaceComments],
   );
 
   const updateCommentStatus = useCallback(
     async (threadId: string, action: 'resolve' | 'reopen') => {
       if (!projectId || !activeWorkspaceFile) return;
+      const filePath = activeWorkspaceFile.path;
+      const nextStatus = action === 'resolve' ? 'resolved' : 'open';
+      // Optimistic, like create/reply: the highlight and lane sections all
+      // derive from `status`, so flip it immediately, reconcile with the
+      // server snapshot, and roll back (with the error surfaced) on failure.
+      pendingStatusRef.current[threadId] = { status: nextStatus, settledSeq: null };
+      const applyStatus = (status: DocCommentThread['status']) => (current: DocCommentThread[]) =>
+        current.map((thread) => (thread.id === threadId && thread.status !== status ? { ...thread, status } : thread));
+      setCommentThreads(applyStatus(nextStatus));
+      setWorkspaceCommentThreads(applyStatus(nextStatus));
+      if (action === 'reopen') setActiveCommentThreadId(threadId);
+      // Resolving the LAST open thread releases the document lane outright —
+      // the editor takes its full width back instead of keeping a residual
+      // column (Sean's dead-column report). Scoped to this client's own
+      // resolve (a collaborator's resolve must not yank a panel someone is
+      // reading) and to the doc lane (the All-comments panel stays). The
+      // resolved threads stay reachable via the top-bar Comments button,
+      // which reopens the lane showing them directly.
+      let closedLaneForResolve = false;
+      if (
+        action === 'resolve' &&
+        commentPanelMode === 'document' &&
+        draftCommentSelection === null &&
+        !commentThreads.some((thread) => thread.status === 'open' && thread.id !== threadId)
+      ) {
+        closedLaneForResolve = true;
+        setShowCommentLane(false);
+        setActiveCommentThreadId(null);
+      }
       setCommentBusyAction(`${action}:${threadId}`);
+      const loadStartSeq = beginCommentLoad();
       try {
         const response = await api('/api/workspace/comments', {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             projectId,
-            filePath: activeWorkspaceFile.path,
+            filePath,
             threadId,
             action,
           }),
@@ -809,13 +1040,67 @@ export function useWorkspaceComments({
           );
         }
         const payload = (await response.json()) as { threads?: DocCommentThread[] };
-        applyCommentThreads(
-          activeWorkspaceFile.path,
-          Array.isArray(payload.threads) ? payload.threads : [],
-          action === 'resolve' ? null : threadId,
-        );
+        // Settle rather than delete: a reload that STARTED before this PATCH
+        // may still resolve with the old status, so the override keeps
+        // shielding until a load started after this generation confirms it.
+        const entry = pendingStatusRef.current[threadId];
+        if (entry) entry.settledSeq = ++commentsMutationSeqRef.current;
+        if (activeCommentFilePathRef.current === filePath) {
+          applyCommentThreads(
+            filePath,
+            Array.isArray(payload.threads) ? payload.threads : [],
+            action === 'resolve' ? null : threadId,
+            loadStartSeq,
+          );
+        }
         refreshWorkspaceComments();
       } catch (error) {
+        // Failed PATCH: this client's change didn't land, so drop the override
+        // and roll back locally…
+        delete pendingStatusRef.current[threadId];
+        const prevStatus = action === 'resolve' ? 'open' : 'resolved';
+        setCommentThreads(applyStatus(prevStatus));
+        setWorkspaceCommentThreads(applyStatus(prevStatus));
+        // The optimistic lane close must roll back with the status: the thread
+        // is open again, so hiding it (and the surfaced error) behind a closed
+        // lane would read as a silent success.
+        if (closedLaneForResolve) setShowCommentLane(true);
+        // …but the inverse guess can be wrong: a collaborator may have made
+        // the same change successfully in the meantime (their realtime event
+        // already consumed, and healthy realtime won't re-deliver). Reconcile
+        // with the authoritative snapshot — best-effort: if this fetch fails
+        // too, the local rollback stands.
+        const reconcileSeq = beginCommentLoad();
+        try {
+          const snapshot = await api(
+            `/api/workspace/comments?projectId=${encodeURIComponent(projectId)}&filePath=${encodeURIComponent(filePath)}`,
+          );
+          if (snapshot.ok) {
+            const payload = (await snapshot.json()) as { threads?: DocCommentThread[] };
+            const threads = Array.isArray(payload.threads) ? payload.threads : [];
+            // Re-arm the override with the AUTHORITATIVE status at a fresh
+            // settle generation: a reload that started before this failure
+            // (same generation — failures don't bump it) may still land after
+            // the reconcile and would otherwise overwrite it. The override
+            // shields those stale responses and purges once they drain.
+            const authoritative = threads.find((thread) => thread.id === threadId)?.status;
+            if (authoritative) {
+              pendingStatusRef.current[threadId] = {
+                status: authoritative,
+                settledSeq: ++commentsMutationSeqRef.current,
+              };
+            }
+            if (activeCommentFilePathRef.current === filePath) {
+              applyCommentThreads(filePath, threads, undefined, reconcileSeq);
+            }
+            refreshWorkspaceComments();
+          }
+        } catch {
+          /* keep the local rollback */
+        } finally {
+          finishCommentLoad(reconcileSeq);
+        }
+        // After the reconcile: applyCommentThreads clears the error field.
         setCommentsError(
           error instanceof Error
             ? error.message
@@ -824,16 +1109,18 @@ export function useWorkspaceComments({
               : 'Failed to reopen comment',
         );
       } finally {
+        finishCommentLoad(loadStartSeq);
         setCommentBusyAction(null);
       }
     },
-    [activeWorkspaceFile, api, applyCommentThreads, projectId, refreshWorkspaceComments],
+    [activeWorkspaceFile, api, applyCommentThreads, beginCommentLoad, commentPanelMode, commentThreads, draftCommentSelection, finishCommentLoad, projectId, refreshWorkspaceComments],
   );
 
   const editCommentMessage = useCallback(
     async (thread: DocCommentThread, messageId: string, body: string) => {
       if (!projectId || !body.trim()) return;
       setCommentBusyAction(`edit:${messageId}`);
+      const loadStartSeq = beginCommentLoad();
       try {
         const response = await api('/api/workspace/comments', {
           method: 'PATCH',
@@ -852,7 +1139,7 @@ export function useWorkspaceComments({
         }
         const payload = (await response.json()) as { threads?: DocCommentThread[] };
         if (activeWorkspaceFile?.path === thread.filePath) {
-          applyCommentThreads(thread.filePath, Array.isArray(payload.threads) ? payload.threads : [], thread.id);
+          applyCommentThreads(thread.filePath, Array.isArray(payload.threads) ? payload.threads : [], thread.id, loadStartSeq);
         }
         refreshWorkspaceComments();
       } catch (error) {
@@ -860,16 +1147,18 @@ export function useWorkspaceComments({
         setCommentsError(message);
         throw error instanceof Error ? error : new Error(message);
       } finally {
+        finishCommentLoad(loadStartSeq);
         setCommentBusyAction(null);
       }
     },
-    [activeWorkspaceFile, api, applyCommentThreads, projectId, refreshWorkspaceComments],
+    [activeWorkspaceFile, api, applyCommentThreads, beginCommentLoad, finishCommentLoad, projectId, refreshWorkspaceComments],
   );
 
   const deleteCommentMessage = useCallback(
     async (thread: DocCommentThread, messageId: string) => {
       if (!projectId) return;
       setCommentBusyAction(`delete:${messageId}`);
+      const loadStartSeq = beginCommentLoad();
       try {
         const response = await api('/api/workspace/comments', {
           method: 'DELETE',
@@ -886,7 +1175,7 @@ export function useWorkspaceComments({
         }
         const payload = (await response.json()) as { threads?: DocCommentThread[] };
         if (activeWorkspaceFile?.path === thread.filePath) {
-          applyCommentThreads(thread.filePath, Array.isArray(payload.threads) ? payload.threads : [], thread.id);
+          applyCommentThreads(thread.filePath, Array.isArray(payload.threads) ? payload.threads : [], thread.id, loadStartSeq);
         }
         refreshWorkspaceComments();
       } catch (error) {
@@ -894,10 +1183,52 @@ export function useWorkspaceComments({
         setCommentsError(message);
         throw error instanceof Error ? error : new Error(message);
       } finally {
+        finishCommentLoad(loadStartSeq);
         setCommentBusyAction(null);
       }
     },
-    [activeWorkspaceFile, api, applyCommentThreads, projectId, refreshWorkspaceComments],
+    [activeWorkspaceFile, api, applyCommentThreads, beginCommentLoad, finishCommentLoad, projectId, refreshWorkspaceComments],
+  );
+
+  // React with an emoji on the current selection. A reaction is just a comment
+  // whose single message is that emoji, so this reuses the whole create/delete
+  // pipeline — anchoring, realtime, permissions and history come for free.
+  // Picking the same emoji twice on the same words removes it.
+  const createReaction = useCallback(
+    (emoji: string) => {
+      const editor = markdownEditorRef.current;
+      if (!editor || !canCommentOnActiveFile) return false;
+      const { from, to } = editor.state.selection;
+      const own = findOwnReaction(openCommentThreads, resolvedCommentRanges, {
+        emoji,
+        from,
+        to,
+        userId: currentUser.userId,
+      });
+      if (own) {
+        // Still in flight — the POST owns it; a delete on the temp id would 404.
+        if (!isOptimisticCommentId(own.id)) {
+          void deleteCommentMessage(own, own.messages[0].id).catch((error) =>
+            // The lane may well be closed, where `commentsError` renders nowhere.
+            showWorkspaceAppNotice('error', error instanceof Error ? error.message : 'Failed to remove reaction'),
+          );
+        }
+        return true;
+      }
+      const selection = buildDraftDocCommentSelection(editor);
+      if (!selection) return false;
+      void createComment(emoji, selection);
+      return true;
+    },
+    [
+      canCommentOnActiveFile,
+      createComment,
+      currentUser.userId,
+      deleteCommentMessage,
+      openCommentThreads,
+      resolvedCommentRanges,
+      showWorkspaceAppNotice,
+    ],
   );
 
   const copyCommentLink = useCallback(
@@ -960,7 +1291,11 @@ export function useWorkspaceComments({
 
   const toggleCommentLane = useCallback(() => {
     const targetMode = commentsAvailableForActiveFile ? 'document' : 'workspace';
-    const shouldClose = showCommentLane && commentPanelMode === targetMode;
+    // A visible lane always closes on toggle, even mid mode-switch — clicking
+    // the button while "All comments" is up used to switch tabs and strand the
+    // column open (Sean's dead-column report). The mode-equality check still
+    // opens the lane when it's hidden but showCommentLane is stale-true.
+    const shouldClose = showInlineCommentLane || (showCommentLane && commentPanelMode === targetMode);
     setCommentContextMenu(null);
     setDraftCommentSelection(null);
     setCommentPanelMode(targetMode);
@@ -971,10 +1306,10 @@ export function useWorkspaceComments({
     if (shouldClose) {
       setActiveCommentThreadId(null);
     }
-  }, [commentPanelMode, commentsAvailableForActiveFile, showCommentLane]);
+  }, [commentPanelMode, commentsAvailableForActiveFile, showCommentLane, showInlineCommentLane]);
 
   useEffect(() => {
-    if (!projectId || !activeWorkspaceFile || !commentsAvailableForActiveFile) {
+    if (!commentDataEnabled || !projectId || !activeWorkspaceFile || !commentsAvailableForActiveFile) {
       setCommentThreads([]);
       setCommentThreadsPath(activeFilePath);
       setCommentsLoading(false);
@@ -982,7 +1317,7 @@ export function useWorkspaceComments({
       return;
     }
     void loadComments(activeWorkspaceFile.path, pendingWorkspaceCommentThreadIdRef.current);
-  }, [activeFilePath, commentsAvailableForActiveFile, activeWorkspaceFile, loadComments, projectId]);
+  }, [activeFilePath, commentDataEnabled, commentsAvailableForActiveFile, activeWorkspaceFile, loadComments, projectId]);
 
   useEffect(() => {
     if (!projectId || !showCommentLane || commentPanelMode !== 'workspace') return;
@@ -990,7 +1325,7 @@ export function useWorkspaceComments({
   }, [commentPanelMode, loadWorkspaceComments, projectId, showCommentLane]);
 
   useEffect(() => {
-    if (!projectId || !supabaseClient) return;
+    if (!commentDataEnabled || !projectId || !supabaseClient) return;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- realtime overloads
     const channel = supabaseClient.channel(`workspace-comments-${projectId}`) as any;
     let reloadTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1038,12 +1373,12 @@ export function useWorkspaceComments({
       if (pollTimer) clearInterval(pollTimer);
       supabaseClient.removeChannel(channel);
     };
-  }, [loadComments, loadWorkspaceComments, projectId, supabaseClient]);
+  }, [commentDataEnabled, loadComments, loadWorkspaceComments, projectId, supabaseClient]);
 
   // Local workspaces have no Supabase realtime; the sidecar's SSE stream
   // (comments-changed) fills the same role with the same debounced reload.
   useEffect(() => {
-    if (!projectId || !subscribeToChanges) return;
+    if (!commentDataEnabled || !projectId || !subscribeToChanges) return;
     let reloadTimer: ReturnType<typeof setTimeout> | null = null;
     const unsubscribe = subscribeToChanges(() => {
       if (reloadTimer) return;
@@ -1058,7 +1393,7 @@ export function useWorkspaceComments({
       if (reloadTimer) clearTimeout(reloadTimer);
       unsubscribe();
     };
-  }, [loadComments, loadWorkspaceComments, projectId, subscribeToChanges]);
+  }, [commentDataEnabled, loadComments, loadWorkspaceComments, projectId, subscribeToChanges]);
 
   useEffect(() => {
     if (!canCommentOnActiveFile || !markdownEditorRef.current) return;
@@ -1080,18 +1415,33 @@ export function useWorkspaceComments({
       dismissCommentContextMenu();
       if (startCommentDraft()) event.preventDefault();
     };
+    // Same seam for emoji reactions — preventDefault tells the bubble the
+    // reaction landed so it can collapse the selection and get out of the way.
+    const handleReactionEvent = (event: Event) => {
+      const detail = (event as CustomEvent<{ emoji?: unknown; source?: unknown }>).detail;
+      const emoji = detail?.emoji;
+      if (typeof emoji !== 'string' || !emoji) return;
+      // A split pane mounts a second bubble menu over a DIFFERENT editor and
+      // file; this hook only anchors against the primary one. Ignore anything
+      // that didn't come from it rather than posting against the primary's
+      // retained selection in the wrong document.
+      if (detail?.source && detail.source !== mountedEditorDom(markdownEditorRef.current)) return;
+      dismissCommentContextMenu();
+      if (createReaction(emoji)) event.preventDefault();
+    };
     window.addEventListener('keydown', handleKeyDown, { capture: true });
     window.addEventListener('sundial:start-comment-draft', handleStartDraftEvent);
+    window.addEventListener('sundial:add-doc-reaction', handleReactionEvent);
     return () => {
       window.removeEventListener('keydown', handleKeyDown, { capture: true });
       window.removeEventListener('sundial:start-comment-draft', handleStartDraftEvent);
+      window.removeEventListener('sundial:add-doc-reaction', handleReactionEvent);
     };
-  }, [canCommentOnActiveFile, dismissCommentContextMenu, markdownEditor, startCommentDraft]);
+  }, [canCommentOnActiveFile, createReaction, dismissCommentContextMenu, markdownEditor, startCommentDraft]);
 
   useEffect(() => {
     const editor = markdownEditorRef.current;
     if (!canCommentOnActiveFile || !editor) return;
-    const dom = editor.view.dom;
     const handleContextMenu = (event: MouseEvent) => {
       if (isMarkdownImageContextMenuTarget(event.target)) return;
       // No prior selection? Right-click collapses it to the click point, so
@@ -1110,9 +1460,34 @@ export function useWorkspaceComments({
         selection,
       });
     };
-    dom.addEventListener('contextmenu', handleContextMenu, true);
+    // Attach to the live view DOM — but only once it's mounted. Reading
+    // `editor.view.dom` before mount throws and crashes the page (the restored
+    // pane/chat race), so wait for the editor's `create` event when the view
+    // isn't up yet.
+    let detach: (() => void) | null = null;
+    let cancelled = false;
+    const attach = () => {
+      // Guard against a leaked `create` firing after cleanup (a fast file/layout
+      // switch during the mount race can unmount this effect before `create`).
+      if (cancelled) return;
+      const dom = mountedEditorDom(editor);
+      if (!dom) return;
+      dom.addEventListener('contextmenu', handleContextMenu, true);
+      detach = () => dom.removeEventListener('contextmenu', handleContextMenu, true);
+    };
+    if (mountedEditorDom(editor)) {
+      attach();
+    } else {
+      // `on`, not `once`: tiptap's `once` registers a WRAPPER, so a later
+      // `off(attach)` wouldn't remove it (the listener would leak). `create`
+      // fires at most once per editor, so `on` never double-attaches, and the
+      // cleanup below removes this exact reference.
+      editor.on('create', attach);
+    }
     return () => {
-      dom.removeEventListener('contextmenu', handleContextMenu, true);
+      cancelled = true;
+      editor.off('create', attach);
+      detach?.();
     };
   }, [canCommentOnActiveFile, markdownEditor]);
 
@@ -1188,6 +1563,8 @@ export function useWorkspaceComments({
     commentDocumentLabel,
     commentPanelMode,
     docCommentAnchorOffsets,
+    commentAnchorLines,
+    measuredCommentAnchorIds,
     draftCommentAnchorOffset,
     activeCommentThreadId,
     draftCommentSelection,
@@ -1232,7 +1609,7 @@ export function WorkspaceCommentContextMenu({
   return (
     <div
       ref={menuRef}
-      className="fixed z-[65] min-w-[220px] rounded-xl border border-[#dadce0] bg-white p-1.5 shadow-[0_1px_2px_rgba(60,64,67,0.3),0_2px_6px_2px_rgba(60,64,67,0.15)]"
+      className="fixed z-[65] min-w-[220px] rounded-xl border border-stone-200 bg-white p-1.5 shadow-[0_1px_2px_rgba(60,64,67,0.3),0_2px_6px_2px_rgba(60,64,67,0.15)]"
       style={{
         top: Math.max(12, menu.y - 1),
         left: Math.max(12, menu.x - 1),
@@ -1240,36 +1617,36 @@ export function WorkspaceCommentContextMenu({
     >
       <button
         type="button"
-        onClick={() => onOpenChat(menu.selection)}
-        className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm text-[#202124] transition-colors hover:bg-[#f1f3f4]"
+        onClick={() => onOpenDraft(menu.selection)}
+        className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm text-stone-800 transition-colors hover:bg-stone-100"
       >
         <span className="inline-flex items-center gap-2">
-          <ChatCircleIcon className="h-4 w-4 text-[#5f6368]" weight="regular" />
-          Open chat
+          <ChatTeardropIcon className="h-4 w-4 text-stone-500" weight="regular" />
+          Comment
         </span>
+        <span className="text-[11px] text-stone-500">Cmd Opt M</span>
       </button>
       <button
         type="button"
-        onClick={() => onOpenDraft(menu.selection)}
-        className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm text-[#202124] transition-colors hover:bg-[#f1f3f4]"
+        onClick={() => onOpenChat(menu.selection)}
+        className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm text-stone-800 transition-colors hover:bg-stone-100"
       >
         <span className="inline-flex items-center gap-2">
-          <ChatTeardropIcon className="h-4 w-4 text-[#5f6368]" weight="regular" />
-          Comment
+          <ChatCircleIcon className="h-4 w-4 text-stone-500" weight="regular" />
+          Reference in chat
         </span>
-        <span className="text-[11px] text-[#5f6368]">Cmd Opt M</span>
       </button>
       {onAddLink ? (
         <button
           type="button"
           onClick={onAddLink}
-          className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm text-[#202124] transition-colors hover:bg-[#f1f3f4]"
+          className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm text-stone-800 transition-colors hover:bg-stone-100"
         >
           <span className="inline-flex items-center gap-2">
-            <LinkSimpleIcon className="h-4 w-4 text-[#5f6368]" weight="regular" />
+            <LinkSimpleIcon className="h-4 w-4 text-stone-500" weight="regular" />
             Add link
           </span>
-          <span className="text-[11px] text-[#5f6368]">⌘K</span>
+          <span className="text-[11px] text-stone-500">⌘K</span>
         </button>
       ) : null}
     </div>

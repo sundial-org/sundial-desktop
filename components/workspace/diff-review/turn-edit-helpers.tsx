@@ -1,5 +1,6 @@
 import type { TurnEditChunk, TurnEditFile } from '@/lib/workspace/turn-edits';
 import { isMarkdownFile } from '@/lib/sync/policy';
+import { formatBytes } from '@/lib/workspace/uploads';
 import {
   buildLineChangeHighlights,
   buildRemovedLineHighlights,
@@ -63,6 +64,41 @@ export function countFileWords(file: TurnEditFile): { added: number; deleted: nu
   return { added, deleted };
 }
 
+// Character-level added/removed counts from the SAME highlight ranges the diff
+// renders (chat edit cards show chars, not words/lines — 2026-08-01). Falls
+// back to line counts only for oversized files (no chunk lines to diff).
+export function countFileChars(file: TurnEditFile): {
+  added: number;
+  deleted: number;
+  unit: 'chars' | 'lines';
+} {
+  if (file.oversized || file.chunks.length === 0) {
+    return { added: file.addedLineCount, deleted: file.deletedLineCount, unit: 'lines' };
+  }
+  const markdown = isMarkdownFile(file.filePath);
+  let added = 0;
+  let deleted = 0;
+  for (const chunk of file.chunks) {
+    for (const h of buildLineChangeHighlights(chunk.lines, { markdown })) {
+      for (const r of h.addedRanges) added += Math.max(0, r.end - r.start);
+    }
+    for (const r of buildRemovedLineHighlights(chunk.lines, { markdown })) {
+      const ranged = r.removedRanges.reduce((n, range) => n + Math.max(0, range.end - range.start), 0);
+      // A pure deletion has no paired addition to diff against — the whole
+      // line was dropped, so count all of it rather than reporting −0.
+      deleted += ranged > 0 ? ranged : r.delLine.length;
+    }
+  }
+  return { added, deleted, unit: 'chars' };
+}
+
+/** Compact counts for card headers: 89, 1.2k, 14k. */
+export function formatCompactCount(n: number): string {
+  if (n >= 10000) return `${Math.round(n / 1000)}k`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
+
 export function formatTurnFileSummary(file: TurnEditFile) {
   const { added, deleted } = countFileWords(file);
   const parts: string[] = [];
@@ -71,12 +107,6 @@ export function formatTurnFileSummary(file: TurnEditFile) {
   return parts.join(' ');
 }
 
-export function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
 
 // Placeholder shown for files too large to diff (`file.oversized`). Conveys the
 // turn touched the file and roughly how big it is, without rendering content.
@@ -89,7 +119,7 @@ export function OversizedFileNotice({ file }: { file: TurnEditFile }) {
   if (typeof file.byteSize === 'number') parts.push(formatBytes(file.byteSize));
   return (
     <div className="rounded-lg border border-dashed border-stone-300 bg-stone-50 px-3 py-2 text-[12px] text-stone-500">
-      {verb} — file too large to show a diff{parts.length ? ` (${parts.join(', ')})` : ''}.
+      {verb}: file too large to show a diff{parts.length ? ` (${parts.join(', ')})` : ''}.
     </div>
   );
 }

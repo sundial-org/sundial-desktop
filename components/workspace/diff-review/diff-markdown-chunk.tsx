@@ -142,8 +142,8 @@ export function DiffChunkActions({
         type="button"
         className="diff-pending-undo"
         onClick={onUndo}
-        aria-label="Undo suggestion"
-        title="Undo suggestion"
+        aria-label="Reject suggestion"
+        title="Reject suggestion"
       >
         ✕
       </button>
@@ -151,8 +151,8 @@ export function DiffChunkActions({
         type="button"
         className="diff-pending-keep"
         onClick={onKeep}
-        aria-label="Keep suggestion"
-        title="Keep suggestion"
+        aria-label="Accept suggestion"
+        title="Accept suggestion"
       >
         ✓
       </button>

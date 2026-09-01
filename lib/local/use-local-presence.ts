@@ -40,8 +40,11 @@ export function useLocalCollabPresence(
     let last: string | null = null;
     const read = () => {
       const next = collectAwarenessPeers(collab.socket);
+      // docName is part of the signature: a peer moving to another doc must
+      // publish (their bubble's jump target changed) even when the peer SET
+      // is unchanged.
       const signature = next
-        .map((peer) => peer.key)
+        .map((peer) => `${peer.key}@${peer.docName ?? ''}`)
         .sort()
         .join(',');
       if (signature === last) return;

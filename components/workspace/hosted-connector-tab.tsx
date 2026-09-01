@@ -53,13 +53,13 @@ export function HostedConnectorTab() {
           </span>
         </h2>
         <p className="mt-2 text-sm leading-relaxed text-stone-500">
-          Add Sundial as a connector in your assistant. Sign in once — it can then read and edit
+          Add Sundial as a connector in your assistant. Sign in once, and it can then read and edit
           every workspace you can access, right from the chat. No token to copy.
         </p>
 
         {!isHttps ? (
           <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
-            Chat connectors need a public <span className="font-medium">https</span> URL — you&apos;re on{' '}
+            Chat connectors need a public <span className="font-medium">https</span> URL. You&apos;re on{' '}
             <span className="font-mono">{origin || 'this dev server'}</span>. Open this on your deployed
             Sundial to connect ChatGPT or Claude.ai.
           </div>
@@ -76,7 +76,7 @@ export function HostedConnectorTab() {
         >
           Add to Claude.ai
         </a>
-        <p className="mt-2 text-xs text-stone-500">Opens claude.ai with Sundial pre-filled — just confirm and sign in.</p>
+        <p className="mt-2 text-xs text-stone-500">Opens claude.ai with Sundial pre-filled. Just confirm and sign in.</p>
 
         <button
           type="button"
@@ -91,7 +91,7 @@ export function HostedConnectorTab() {
           {copied === 'chatgpt' ? (
             <>
               <CheckIcon className="h-4 w-4" weight="bold" aria-hidden />
-              URL copied — opening ChatGPT…
+              URL copied · opening ChatGPT…
             </>
           ) : (
             'Add to ChatGPT'

@@ -81,6 +81,24 @@ export type PaletteActionSpec = {
   keywords?: string;
 };
 
+export type PaletteChatSpec = {
+  id: string;
+  /** Display title; untitled chats pass their placeholder (e.g. "New chat"). */
+  title: string;
+  /** Archived chats live in Settings — never in the palette. */
+  archived?: boolean;
+};
+
+/** Empty query → given (rail) order; otherwise fuzzy on the title. */
+export function rankChats<T extends PaletteChatSpec>(query: string, chats: T[], limit = 6): T[] {
+  const active = chats
+    .filter((chat) => !chat.archived)
+    .map((chat) => ({ id: chat.id, label: chat.title, chat }));
+  return rankActions(query, active)
+    .slice(0, limit)
+    .map((entry) => entry.chat);
+}
+
 /** Empty query → declared order; otherwise fuzzy on label + keywords. */
 export function rankActions<T extends PaletteActionSpec>(query: string, actions: T[]): T[] {
   const trimmed = query.trim();

@@ -22,11 +22,21 @@ export const SITE_URL = normalizeSiteUrl(
 
 export const SITE_NAME = 'Sundial';
 
+// Research-lab voice — only the '/' landing (served by the sundial-landing
+// repo) and the Organization JSON-LD. Must move together with the landing hero
+// (labs/geo-mixed/index.html + the '/' description in scripts/build.mjs, both
+// in sundial-landing) — proposals and chosen combo in /labs/og.
 export const SITE_DESCRIPTION =
-  'Sunny is an AI collaborator that lives in iMessage/RCS threads and works inside shared files.';
+  'Sundial is a research lab studying human-agent collaboration. We build infrastructure for people to understand the work models do, steer them, and shape how they improve.';
 
-export const SITE_TAGLINE =
-  'Where people and agents do their best work together.';
+export const SITE_TAGLINE = 'Foundations for human-AI collaboration';
+
+// Product voice — every other surface (app pages, /editor, /download, /releases).
+// Mirrors the /editor hero; its baked copy lives in the sundial-landing repo.
+export const PRODUCT_TAGLINE = 'The AI-native editor for LaTeX and research';
+
+export const PRODUCT_DESCRIPTION =
+  'A collaborative LaTeX editor where AI edits arrive as reviewable suggestions, and the agent compiles, fixes its own errors, and checks your citations while you write. No compile timeouts, unlimited collaborators.';
 
 export const TWITTER_HANDLE = '@sundialhub';
 
@@ -53,5 +63,7 @@ export function canonicalUrl(path = ''): string {
 /** Common OG image dimensions */
 export const OG_IMAGE_SIZE = { width: 1200, height: 630 };
 
-/** Default OG image URL — the dynamically generated root card (`app/opengraph-image.tsx`). */
-export const DEFAULT_OG_IMAGE = `${SITE_URL}/opengraph-image`;
+/** Default OG image URL — the static product card (`app/opengraph-image.png`).
+ * The extension matters: bare `/opengraph-image` 404s (caught by the marketing
+ * catch-all route). */
+export const DEFAULT_OG_IMAGE = `${SITE_URL}/opengraph-image.png`;

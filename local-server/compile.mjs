@@ -14,14 +14,23 @@ import { locateProjectPath } from './roots.mjs';
 const COMPILE_TIMEOUT_MS = 180_000;
 const MAX_LOG_CHARS = 200_000;
 
-/** GUI-launched apps inherit a minimal PATH (no /opt/homebrew/bin), so probe
+/** The desktop app ships tectonic as a Tauri externalBin next to the node
+ *  runtime running this sidecar (tauri/scripts/prepare-sidecar.mjs), so a
+ *  fresh machine compiles without installing anything; that copy wins.
+ *  GUI-launched apps inherit a minimal PATH (no /opt/homebrew/bin), so probe
  *  the common install locations explicitly. An explicit SUNDIAL_TECTONIC pin
  *  is authoritative — no silent fallback, no caching. Otherwise cache the
  *  first hit; a miss re-probes next compile so installing tectonic just works. */
-const tectonicCandidates = () =>
+export const tectonicCandidates = () =>
   process.env.SUNDIAL_TECTONIC
     ? [process.env.SUNDIAL_TECTONIC]
-    : ['tectonic', '/opt/homebrew/bin/tectonic', '/usr/local/bin/tectonic', path.join(os.homedir(), '.cargo/bin/tectonic')];
+    : [
+        path.join(path.dirname(process.execPath), process.platform === 'win32' ? 'tectonic.exe' : 'tectonic'),
+        'tectonic',
+        '/opt/homebrew/bin/tectonic',
+        '/usr/local/bin/tectonic',
+        path.join(os.homedir(), '.cargo/bin/tectonic'),
+      ];
 
 let cachedTectonic = null;
 
@@ -94,7 +103,7 @@ export async function compileLatexLocally({ project, relPath, source, docHost, w
       ok: false,
       failureKind: 'infra',
       error:
-        'tectonic is not installed — install it (macOS: brew install tectonic) and recompile. ' +
+        'tectonic is not installed. Install it (macOS: brew install tectonic) and recompile. ' +
         'Local projects compile on this computer.',
     };
   }
@@ -103,7 +112,9 @@ export async function compileLatexLocally({ project, relPath, source, docHost, w
   try {
     const { error, stdout, stderr } = await runTectonic(
       tectonic,
-      ['--untrusted', '--outdir', outDir, '--synctex', '--keep-logs', abs],
+      // Basename + cwd (not the absolute path) so the log's file references
+      // stay root-dir-relative, like the cloud compile pool's.
+      ['--untrusted', '--outdir', outDir, '--synctex', '--keep-logs', `./${path.basename(abs)}`],
       path.dirname(abs),
     );
     const base = path.basename(relPath).replace(/\.tex$/i, '');

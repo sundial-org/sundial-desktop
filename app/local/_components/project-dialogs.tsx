@@ -136,7 +136,7 @@ export function ProjectDialog({
       const stale = (err as { status?: number })?.status === 404;
       setError(
         stale
-          ? 'This feature needs a newer version of the Sundial app. Quit and reopen Sundial — if that doesn\'t help, update it via File → "Check for Updates…".'
+          ? 'This feature needs a newer version of the Sundial app. Quit and reopen Sundial. If that doesn\'t help, update it via "Check for Updates…" in the menu bar.'
           : err instanceof Error
             ? err.message
             : 'Something went wrong',
@@ -171,7 +171,7 @@ export function ProjectDialog({
         ) : pack ? (
           <>
             Start from the <span className="font-medium text-stone-700">{pack.title}</span> starter
-            pack — ready-made folders and starter files in the folder of your choice.
+            pack: ready-made folders and starter files in the folder of your choice.
           </>
         ) : (
           'An empty project in the folder of your choice.'
@@ -237,6 +237,7 @@ export function ProjectDialog({
             className="rounded-lg bg-stone-900 px-4 py-2 text-sm font-medium text-white hover:bg-stone-800 disabled:opacity-50"
             disabled={busy || !location.trim() || (isClone && !repo.trim())}
             data-testid="project-dialog-submit"
+            aria-busy={busy || undefined}
           >
             {busy ? (
               <span className="flex items-center gap-2">

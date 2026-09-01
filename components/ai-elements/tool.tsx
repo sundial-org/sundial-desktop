@@ -14,7 +14,7 @@ export const ToolInput = ({ className, input, ...props }: ToolInputProps) => {
   return (
     <div
       className={cn(
-        'overflow-x-auto rounded-md border border-stone-200/80 bg-stone-50 px-3 py-2',
+        'max-h-40 overflow-auto rounded-md border border-stone-200/80 bg-stone-50 px-3 py-2',
         className,
       )}
       {...props}
@@ -49,7 +49,9 @@ export const ToolOutput = ({
   return (
     <div
       className={cn(
-        'overflow-x-auto rounded-md border px-3 py-2',
+        // Clamped: a big Read/Bash payload scrolls inside instead of taking
+        // unbounded transcript height.
+        'max-h-40 overflow-auto rounded-md border px-3 py-2',
         isError ? 'border-red-200/80 bg-red-50' : 'border-stone-200/80 bg-stone-50',
         className,
       )}

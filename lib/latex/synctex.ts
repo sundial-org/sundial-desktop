@@ -25,19 +25,49 @@ export type SyncTexIndex = {
 };
 
 type Box = { x: number; y: number; w: number; h: number; d: number; file: string; line: number };
+type Point = { x: number; y: number; file: string; line: number };
+
+// A word-level point only refines the inverse hit when the click is really on
+// that text line: within one line-height of the point's baseline.
+const POINT_REFINE_MAX_VDIST_PT = 12;
 
 // Record line: leading type char, then `tag,line:x,y` and optional `:W,H,D`.
 // Types that carry a point: boxes `[ ( h v`, glyph/kern/glue/math `x k g $`.
 const RECORD_RE = /^[[(hvxkg$](\d+),(\d+):(-?\d+),(-?\d+)(?::(-?\d+),(-?\d+),(-?\d+))?/;
 
+/** Resolve `.`/`..` segments and drop empty ones (`a/./b/../c` → `a/c`). */
 function normalizePath(p: string): string {
-  return p.replace(/^\.\//, '').trim();
+  const out: string[] = [];
+  for (const seg of p.trim().split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..' && out.length && out[out.length - 1] !== '..') out.pop();
+    else out.push(seg);
+  }
+  return out.join('/');
 }
 
-function basename(p: string): string {
-  const norm = normalizePath(p);
-  const i = norm.lastIndexOf('/');
-  return i === -1 ? norm : norm.slice(i + 1);
+/** `to` expressed relative to the directory `fromDir` (both already normalized). */
+function relativeToDir(fromDir: string, to: string): string {
+  const from = fromDir ? fromDir.split('/') : [];
+  const toSegments = to.split('/');
+  let i = 0;
+  while (i < from.length && from[i] === toSegments[i]) i++;
+  return [...from.slice(i).map(() => '..'), ...toSegments.slice(i)].join('/');
+}
+
+/**
+ * Workspace path → the path tectonic recorded for it (relative to the root's
+ * directory, its cwd), so forward search on `paper/sections/intro.tex` under
+ * root `paper/main.tex` asks the index for `sections/intro.tex`, and a file
+ * outside that directory for `../shared/macros.tex`.
+ */
+export function pathRelativeToRoot(rootPath: string, path: string): string {
+  return relativeToDir(normalizePath(rootPath.slice(0, rootPath.lastIndexOf('/') + 1)), normalizePath(path));
+}
+
+/** Inverse of pathRelativeToRoot: a root-relative input back to its workspace path. */
+export function pathFromRoot(rootPath: string, rel: string): string {
+  return normalizePath(rootPath.slice(0, rootPath.lastIndexOf('/') + 1) + rel);
 }
 
 /** Parse already-decompressed SyncTeX text. Exposed for unit tests + reuse. */
@@ -48,6 +78,10 @@ export function parseSyncTexText(text: string): SyncTexIndex {
   // forward fallback: per tag, the sorted set of lines that have a record.
   const linesByTag = new Map<number, Set<number>>();
   const boxesByPage = new Map<number, Box[]>();
+  // Word-level records (glyph/kern/glue/math). Line boxes are tagged with ONE
+  // source line even when the paragraph spans several, so box-only inverse
+  // search systematically lands early; these points carry the per-word lines.
+  const pointsByPage = new Map<number, Point[]>();
 
   let page = 0;
   let inContent = false;
@@ -109,23 +143,41 @@ export function parseSyncTexText(text: string): SyncTexIndex {
           list = [];
           boxesByPage.set(page, list);
         }
-        list.push({ x, y, w, h, d, file: normalizePath(file), line });
+        list.push({ x, y, w, h, d, file: relToRoot(file), line });
+      }
+    } else {
+      const file = tagToFile.get(tag);
+      if (file) {
+        let list = pointsByPage.get(page);
+        if (!list) {
+          list = [];
+          pointsByPage.set(page, list);
+        }
+        list.push({ x, y, file: relToRoot(file), line });
       }
     }
   }
 
+  // Tectonic records each input as `<cwd>/<path as written>` (absolute under
+  // the compile pool's build dir), cwd being the root's directory and tag 1 the
+  // root itself. Strip that so inputs are keyed by their path relative to the
+  // root directory, `..` included — the form pathRelativeToRoot yields for a
+  // workspace path. Exact match only, no suffix/basename fallback: a workspace
+  // `drafts/sections/intro.tex` that wasn't compiled must not resolve to the
+  // compiled `sections/intro.tex`.
+  // Both sides are normalized before the comparison: engines record an input
+  // either as written (`<cwd>/../shared/macros.tex`) or already resolved, and
+  // the two must land on the same key.
+  function relToRoot(p: string): string {
+    const root = tagToFile.get(1) ?? '';
+    return relativeToDir(normalizePath(root.slice(0, root.lastIndexOf('/') + 1)), normalizePath(p));
+  }
   function tagFor(file: string): number | null {
-    // Prefer an exact / path-suffix match; only fall back to a bare basename
-    // match when nothing stronger exists, so two inputs sharing a basename
-    // (`sections/intro.tex` vs `appendix/intro.tex`) resolve to the right file.
     const q = normalizePath(file);
-    let basenameTag: number | null = null;
     for (const [tag, path] of tagToFile) {
-      const p = normalizePath(path);
-      if (p === q || p.endsWith('/' + q) || q.endsWith('/' + p)) return tag;
-      if (basenameTag === null && basename(p) === basename(q)) basenameTag = tag;
+      if (path && relToRoot(path) === q) return tag;
     }
-    return basenameTag;
+    return null;
   }
 
   return {
@@ -171,7 +223,29 @@ export function parseSyncTexText(text: string): SyncTexIndex {
           best = box;
         }
       }
-      return best ? { file: best.file, line: best.line } : null;
+      if (!best) return null;
+      // Word-level refinement: a line box carries one source line for the whole
+      // rendered line, but a paragraph typed across several source lines puts
+      // words from later lines on it — the box line then lands EARLY. When the
+      // click sits on a real text line (a word point within one line-height
+      // vertically), the point nearest the click carries the true per-word
+      // file + line. Whitespace clicks keep the box's snap-to-nearest-line.
+      const points = pointsByPage.get(page);
+      if (points) {
+        let refined: Point | null = null;
+        let refinedScore = Infinity;
+        for (const p of points) {
+          const vDist = Math.abs(p.y - yPt);
+          if (vDist > POINT_REFINE_MAX_VDIST_PT) continue;
+          const score = vDist * 4 + Math.abs(p.x - xPt);
+          if (score < refinedScore) {
+            refinedScore = score;
+            refined = p;
+          }
+        }
+        if (refined) return { file: refined.file, line: refined.line };
+      }
+      return { file: best.file, line: best.line };
     },
   };
 }

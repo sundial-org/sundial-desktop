@@ -10,7 +10,12 @@ export type VisibleWorkspaceSummary = {
   title: string | null;
   updated_at: string | null;
   status: string | null;
-  visibility: string | null;
   role: VisibleWorkspaceRole;
   canWrite: boolean;
+  /** Drive-style columns, enriched by /api/workspaces only (absent from other
+   *  listVisibleWorkspaces callers): the owner's display name (null when the
+   *  owner is the caller or unresolvable) and how many non-owner members the
+   *  workspace is shared with. */
+  ownerName?: string | null;
+  memberCount?: number;
 };

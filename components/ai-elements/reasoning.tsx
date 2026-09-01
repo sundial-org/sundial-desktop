@@ -70,13 +70,19 @@ export const Reasoning = memo(
 
     const [hasAutoClosed, setHasAutoClosed] = useState(false);
     const startTimeRef = useRef<number | null>(null);
+    // Total thinking time across EVERY streaming burst, not just the last one:
+    // reasoning interleaved with tool calls streams in several bursts, and
+    // reporting only the final burst is the "Thought for 1s" that was actually
+    // two minutes (user interviews). Reset only on unmount.
+    const accumulatedMsRef = useRef(0);
 
     // Track duration when streaming starts and ends
     useEffect(() => {
       if (isStreaming) {
         startTimeRef.current ??= Date.now();
       } else if (startTimeRef.current !== null) {
-        setMeasuredDuration(Math.ceil((Date.now() - startTimeRef.current) / MS_IN_S));
+        accumulatedMsRef.current += Date.now() - startTimeRef.current;
+        setMeasuredDuration(Math.ceil(accumulatedMsRef.current / MS_IN_S));
         startTimeRef.current = null;
       }
     }, [isStreaming]);
@@ -129,7 +135,15 @@ const defaultGetThinkingMessage = (isStreaming: boolean, duration?: number) => {
   if (duration === undefined) {
     return <p>Thought for a few seconds</p>;
   }
-  return <p>Thought for {duration} seconds</p>;
+  return <p>Thought for {formatThinkingDuration(duration)}</p>;
+};
+
+/** `95` → "1m 35s"; under a minute stays "{n} seconds". */
+export const formatThinkingDuration = (seconds: number): string => {
+  if (seconds < 60) return `${seconds} seconds`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return s === 0 ? `${m}m` : `${m}m ${s}s`;
 };
 
 export const ReasoningTrigger = memo(

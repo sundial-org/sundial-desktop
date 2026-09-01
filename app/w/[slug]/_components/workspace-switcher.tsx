@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import Link from 'next/link';
-import { ArchiveIcon, CloudIcon, FolderOpenIcon, HouseIcon, PencilSimpleIcon, PlusIcon } from '@phosphor-icons/react';
+import { ArchiveIcon, CloudIcon, FolderOpenIcon, GlobeHemisphereWestIcon, HouseIcon, PencilSimpleIcon, PlusIcon, UserIcon, UsersThreeIcon } from '@phosphor-icons/react';
 import { LocalRootGlyph } from './workspace-file-helpers';
 import { useAuth } from '@/lib/auth/optional-auth';
 import { createBrowserClient } from '@/lib/supabase/browser';
@@ -32,6 +32,11 @@ export function useWorkspaceSwitcher({
   const [workspaceSwitcherPos, setWorkspaceSwitcherPos] = useState<{ top: number; left: number; width: number } | null>(null);
   const [otherWorkspaces, setOtherWorkspaces] = useState<WorkspaceSwitcherItem[]>([]);
 
+  // Clerk-only ON PURPOSE: the packaged desktop app has no Clerk session, so
+  // `userId` (a Clerk id from the caller) is null there AND this anon-key
+  // Supabase query would be filtered out by RLS anyway. Listing cloud
+  // workspaces on desktop needs an authenticated API route (follow-up); the
+  // sidecar's local projects list below covers the desktop switcher today.
   const { isLoaded: isClerkLoaded } = useAuth();
   const loadOtherWorkspaces = useCallback(async () => {
     if (!userId) return;
@@ -44,6 +49,7 @@ export function useWorkspaceSwitcher({
         .select('id, public_id, title, updated_at')
         .eq('user_id', userId)
         .eq('status', 'active')
+        .eq('kind', 'standard')
         .order('updated_at', { ascending: false })
         .limit(10);
       setOtherWorkspaces(
@@ -61,14 +67,16 @@ export function useWorkspaceSwitcher({
   }, [projectId, userId, isClerkLoaded]);
 
   useEffect(() => {
+    if (!show) return;
     void loadOtherWorkspaces();
-  }, [loadOtherWorkspaces]);
+  }, [loadOtherWorkspaces, show]);
 
   // Local (on-disk) projects from the desktop sidecar — listed alongside cloud
   // workspaces so switching works across both worlds. Resolves to nothing in a
   // plain browser without a sidecar.
   const [localProjects, setLocalProjects] = useState<LocalProject[]>([]);
   useEffect(() => {
+    if (!show) return;
     let cancelled = false;
     (async () => {
       const config = await resolveSidecarConfig();
@@ -83,7 +91,7 @@ export function useWorkspaceSwitcher({
     return () => {
       cancelled = true;
     };
-  }, [projectId]);
+  }, [projectId, show]);
 
   useEffect(() => {
     if (!show) return;
@@ -137,6 +145,17 @@ export function useWorkspaceSwitcher({
   return { workspaceSwitcherRef, workspaceSwitcherPos, otherWorkspaces, localProjects };
 }
 
+/** Workspace share status glyph: private = you, shared = people, public = globe. */
+function WorkspaceShareStatusIcon({ status, className }: { status: string | null | undefined; className: string }) {
+  if (status === 'public') {
+    return <GlobeHemisphereWestIcon className={className} weight="regular" aria-hidden />;
+  }
+  if (status === 'shared') {
+    return <UsersThreeIcon className={className} weight="regular" aria-hidden />;
+  }
+  return <UserIcon className={className} weight="regular" aria-hidden />;
+}
+
 export function WorkspaceSwitcherMenu({
   position,
   otherWorkspaces,
@@ -145,6 +164,8 @@ export function WorkspaceSwitcherMenu({
   isArchived,
   isArchiving,
   archiveActionLabel,
+  onShare,
+  shareStatus,
   onSwitchWorkspace,
   onRename,
   onNewWorkspace,
@@ -160,6 +181,9 @@ export function WorkspaceSwitcherMenu({
   isArchived: boolean;
   isArchiving: boolean;
   archiveActionLabel: string;
+  /** Opens the workspace-level share modal (cloud) / local share modal at project scope. */
+  onShare?: () => void;
+  shareStatus?: string | null;
   onSwitchWorkspace: (workspaceId: string) => void;
   onRename: () => void;
   onNewWorkspace: () => void;
@@ -187,7 +211,7 @@ export function WorkspaceSwitcherMenu({
                 key={project.id}
                 href={`/local/${project.id}`}
                 className="flex items-center gap-2 px-3 py-2 text-sm text-stone-600 hover:bg-stone-50"
-                title={`${project.root} — on this device`}
+                title={`${project.root} · on this device`}
               >
                 {/* Wireframe origin icons: device = local, cloud = cloud. */}
                 <LocalRootGlyph className="h-3.5 w-3.5 shrink-0 text-stone-400" />
@@ -212,6 +236,17 @@ export function WorkspaceSwitcherMenu({
       )}
 
       <div className="py-1">
+        {onShare && (
+          <button
+            type="button"
+            data-testid="switcher-share-workspace"
+            onClick={onShare}
+            className="flex items-center gap-2 w-full px-3 py-2 text-sm text-stone-500 hover:text-stone-700 hover:bg-stone-50"
+          >
+            <WorkspaceShareStatusIcon status={shareStatus} className="w-3.5 h-3.5" />
+            Share workspace…
+          </button>
+        )}
         {canWrite && (
           <button
             type="button"

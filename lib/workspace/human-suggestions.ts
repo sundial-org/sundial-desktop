@@ -166,14 +166,19 @@ export type AppliedEditRow = {
   edit_mode?: string | null;
   author_id?: string | null;
   created_at?: string | null;
+  source?: string | null;
 };
 
 /** A direct (edit-mode, already-applied) edit by a human or local agent: no
- *  agent turn, not suggest mode. These are history, not a review unit. */
+ *  agent turn, not suggest mode. These are history, not a review unit.
+ *  Exception: a `suggestion_reject:` revert row carries the rejected turn's
+ *  `assistant_message_id` (legacy text-path convention) but IS the user's own
+ *  applied action — history must show "Rejected <suggester>'s suggestion", not
+ *  silently drop the record. */
 export function isAppliedEditRow(row: AppliedEditRow): boolean {
   const actor = row.actor;
   if (actor !== 'user' && actor !== 'anon' && actor !== 'local_agent') return false;
-  if (row.assistant_message_id) return false;
+  if (row.assistant_message_id && !row.source?.startsWith('suggestion_reject:')) return false;
   return (row.edit_mode ?? 'edit') !== 'suggest';
 }
 

@@ -46,7 +46,9 @@ export function useLocalShares(config: SidecarConfig | null, projectId: string |
     void authEpoch; // re-attempt after desktop credentials land
     if (!config || !projectId || shares.length === 0) return;
     for (const share of shares) {
-      if (refreshedTokens.current.has(share.id)) continue;
+      // Grants-model scope entries share ONE union row — refresh it once.
+      const tokenTarget = share.share_id ?? share.id;
+      if (refreshedTokens.current.has(tokenTarget)) continue;
       void fetch('/api/workspace/local-agent/join', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -56,12 +58,12 @@ export function useLocalShares(config: SidecarConfig | null, projectId: string |
         .then(async (res) => {
           const body = (await res.json().catch(() => ({}))) as { token?: string };
           if (!res.ok || !body.token) return;
-          await fetch(`${config.origin}/projects/${projectId}/shares/${share.id}/token`, {
+          await fetch(`${config.origin}/projects/${projectId}/shares/${tokenTarget}/token`, {
             method: 'POST',
             headers: { Authorization: `Bearer ${config.token}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({ token: body.token }),
           });
-          refreshedTokens.current.add(share.id);
+          refreshedTokens.current.add(tokenTarget);
         })
         .catch(() => {});
     }

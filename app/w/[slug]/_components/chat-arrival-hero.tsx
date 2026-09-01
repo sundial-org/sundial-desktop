@@ -2,9 +2,10 @@
 
 // The chat-first landing surface: what an empty chat shows when it IS the
 // workspace (chat-sole arrival). A greeting plus a few starter prompts that
-// pre-fill the composer — the first act is telling the agent what you want,
-// not staring at a blank page. Rendered as the chat pane's emptyState, so the
-// real composer below stays the single input.
+// SEND on click when the host provides `onSendPrompt` ("send quick prompt on
+// click" — user interviews; a chip that only pre-fills read as broken), and
+// fall back to pre-filling the composer otherwise. Rendered as the chat
+// pane's emptyState, so the real composer below stays the single input.
 
 import { SunnyAnimation } from '@/components/sunny-animation';
 
@@ -21,14 +22,18 @@ function fillComposer(text: string) {
 }
 
 export function ChatArrivalHero({
-  agentName = 'Sunny',
+  agentName = 'Sundial Agent',
   hasChat = true,
+  onSendPrompt,
 }: {
   agentName?: string;
   /** The fill-composer seam drops events with no active chat — keep the
    *  chips off-screen until the arrival draft/selection has an id. */
   hasChat?: boolean;
+  /** Send the prompt as a turn immediately; absent → pre-fill the composer. */
+  onSendPrompt?: (text: string) => void;
 }) {
+  const firePrompt = onSendPrompt ?? fillComposer;
   return (
     <div
       className="flex min-h-0 flex-1 flex-col items-center justify-center overflow-y-auto px-6 pb-7"
@@ -47,13 +52,42 @@ export function ChatArrivalHero({
           <button
             key={suggestion}
             type="button"
-            onClick={() => fillComposer(suggestion)}
-            className="rounded-full border border-stone-200 bg-white px-3 py-1.5 text-xs text-stone-600 transition-colors hover:border-stone-300 hover:bg-stone-50 hover:text-stone-800"
+            onClick={() => firePrompt(suggestion)}
+            className="rounded-full border border-stone-300 bg-white px-3 py-1.5 text-xs font-medium text-stone-800 shadow-sm transition-colors hover:border-stone-400 hover:bg-stone-50"
           >
             {suggestion}
           </button>
         ))}
       </div>
+    </div>
+  );
+}
+
+/** The one-chip empty state for ORDINARY empty chats (the arrival hero above
+ *  keeps the chat-sole landing). One suggestion only, deliberately: a quiet
+ *  on-ramp, not a menu. */
+export function EmptyChatPrompt({
+  hasChat = true,
+  onSendPrompt,
+}: {
+  hasChat?: boolean;
+  onSendPrompt?: (text: string) => void;
+}) {
+  const firePrompt = onSendPrompt ?? fillComposer;
+  return (
+    <div
+      className="flex min-h-0 flex-1 flex-col items-center justify-center px-6 pb-7"
+      data-testid="empty-chat-prompt"
+    >
+      {hasChat ? (
+        <button
+          type="button"
+          onClick={() => firePrompt('Give me a tour of this project')}
+          className="rounded-full border border-stone-300 bg-white px-3 py-1.5 text-xs font-medium text-stone-800 shadow-sm transition-colors hover:border-stone-400 hover:bg-stone-50"
+        >
+          Give me a tour of this project
+        </button>
+      ) : null}
     </div>
   );
 }

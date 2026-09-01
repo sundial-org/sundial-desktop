@@ -5,3 +5,12 @@
 @source '../../app';
 @source '../../components';
 @source '../../lib';
+
+/* The shell is an app window, not a page: kill macOS rubber-band scrolling so
+   reaching the end of a pane doesn't slide the whole "fixed" view down and
+   snap it back. Desktop-only — the marketing/web surfaces keep native
+   overscroll. */
+html,
+body {
+  overscroll-behavior: none;
+}

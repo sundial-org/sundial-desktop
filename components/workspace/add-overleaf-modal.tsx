@@ -1,15 +1,20 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
-import { ArrowSquareOutIcon, CheckCircleIcon, CircleNotchIcon, FileTextIcon, XIcon } from '@phosphor-icons/react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ArrowSquareOutIcon, CheckIcon, CopyIcon, FileTextIcon, XIcon } from '@phosphor-icons/react';
 import { ModalShell } from '@/components/modal-shell';
-import { useRequireSignIn } from '@/lib/auth/use-require-signin';
 import { IntegrationSignInGate } from '@/components/workspace/integration-signin-gate';
-import { CloneProgress } from '@/components/workspace/clone-progress';
-import { humanizeGitError } from '@/lib/git-remote/humanize-error';
-import { Spinner } from '@/components/ui/spinner';
+import { useRequireSignIn } from '@/lib/auth/use-require-signin';
+import { overleafBotEmail } from '@/lib/overleaf/bot-email';
 
-type OverleafStatus = { connected: boolean; overleafEmail: string | null };
+// Overleaf connection, EXPORT-first: from inside a workspace the natural
+// intent is "push what I have here to Overleaf", so the primary action creates
+// a new Overleaf project from this workspace's LaTeX-relevant files (bot-owned
+// until the first person opens the join link, then ownership transfers to them
+// and the bot stays on as the sync editor). Live two-way sync follows
+// automatically. The reverse direction (bring an existing Overleaf project
+// into Sundial by inviting the bot) lives on the get-started surface; a hint
+// here covers it.
 
 export function AddOverleafModal({
   open,
@@ -21,130 +26,124 @@ export function AddOverleafModal({
 }: {
   open: boolean;
   onClose: () => void;
-  projectId: string;
-  onLinked: (repositoryId: string) => void;
-  /** Overleaf projects already linked to this workspace — shown with a
-   *  shortcut to the Sync panel (where push/pull/commit live). */
-  linkedProjects?: { id: string; label: string }[];
+  projectId?: string;
+  onLinked?: (repositoryId: string) => void;
+  /** Overleaf projects already linked to this workspace. `joinLink` is set
+   *  while the exported project still awaits its first joiner (ownership
+   *  transfer pending), so the link survives a modal close or page reload. */
+  linkedProjects?: { id: string; label: string; joinLink?: string | null }[];
   /** Open the sidebar Sync section (host closes the modal first). */
   onOpenSync?: () => void;
 }) {
-  const { signedIn, isLoaded: authLoaded, requireSignIn } = useRequireSignIn();
-  const [status, setStatus] = useState<OverleafStatus | null>(null);
-  const [statusLoading, setStatusLoading] = useState(false);
-  const [busy, setBusy] = useState<'linking' | 'cloning' | 'saving' | null>(null);
+  const botEmail = overleafBotEmail();
+  // Export is account-scoped (the route rejects anonymous callers), so the
+  // export tab gates behind sign-in; the import (invite) flow is deliberately
+  // pre-auth and stays open to signed-out users.
+  const { signedIn, isLoaded: authLoaded } = useRequireSignIn();
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [projectUrl, setProjectUrl] = useState('');
-  const [importedPath, setImportedPath] = useState('');
-  const [token, setToken] = useState('');
-  const [tokenEmail, setTokenEmail] = useState('');
+  const [joinLink, setJoinLink] = useState<string | null>(null);
+  const [copied, setCopied] = useState<'email' | 'link' | null>(null);
+  const [tab, setTab] = useState<'export' | 'import'>('export');
+  // Invite (import) tracker: 'idle' until the user starts, 'waiting' while we
+  // poll for Sunny accepting their invite, 'accepted' once THEIR project's
+  // live link lands. The poll is scoped by the Overleaf project id parsed from
+  // the pasted project link, so concurrent onboarders never see each other's
+  // acceptance. The modal then points at the Overleaf chat.
+  const [invite, setInvite] = useState<'idle' | 'waiting' | 'accepted'>('idle');
+  const [inviteLink, setInviteLink] = useState('');
+  // 24-hex Overleaf project id from a pasted project URL (or a bare id).
+  const inviteProjectId = inviteLink.match(/[0-9a-f]{24}/i)?.[0]?.toLowerCase() ?? null;
+  const inviteProject = useRef<string>('');
 
-  const refresh = useCallback(async () => {
-    setStatusLoading(true);
+  const copy = useCallback(async (kind: 'email' | 'link', value: string) => {
     try {
-      const response = await fetch('/api/user/overleaf/connection', {
-        cache: 'no-store',
-        credentials: 'include',
-      });
-      const body = (await response.json().catch(() => null)) as OverleafStatus | null;
-      setStatus(body ?? { connected: false, overleafEmail: null });
-    } finally {
-      setStatusLoading(false);
+      await navigator.clipboard.writeText(value);
+      setCopied(kind);
+      setTimeout(() => setCopied(null), 2000);
+    } catch {
+      // clipboard unavailable; the value is visible to select
     }
   }, []);
 
+  // Ref'd so acceptance can notify the workspace without the poll effect
+  // restarting on every parent render (callback identity churn).
+  const onLinkedRef = useRef(onLinked);
+  onLinkedRef.current = onLinked;
+
   useEffect(() => {
-    if (!open || !authLoaded) return;
-    // Skip the account-scoped status fetch when logged out (would 401).
-    if (!signedIn) return;
-    void refresh();
-  }, [open, authLoaded, signedIn, refresh]);
-
-  const handleSaveToken = useCallback(async () => {
-    if (!requireSignIn()) return;
-    if (!token.trim()) return;
-    setBusy('saving');
-    setError(null);
-    try {
-      const res = await fetch('/api/user/overleaf/connection', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ accessToken: token.trim(), overleafEmail: tokenEmail.trim() || null }),
-      });
-      if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error ?? `Failed to save token (${res.status})`);
-      }
-      setToken('');
-      await refresh();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Failed to save Overleaf token');
-    } finally {
-      setBusy(null);
-    }
-  }, [token, tokenEmail, refresh, requireSignIn]);
-
-  const handleLink = useCallback(async () => {
-    if (!requireSignIn()) return;
-    if (!projectUrl.trim()) return;
-    setBusy('linking');
-    setError(null);
-    try {
-      const link = await fetch('/api/workspace/linked-repos', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({
-          projectId,
-          provider: 'overleaf',
-          projectUrl: projectUrl.trim(),
-          importedPath: importedPath.trim() || undefined,
-        }),
-      });
-      const linkBody = (await link.json().catch(() => null)) as
-        | { repositoryId?: string; error?: string }
-        | null;
-      if (!link.ok || !linkBody?.repositoryId) {
-        throw new Error(linkBody?.error ?? `Link failed (${link.status})`);
-      }
-
-      setBusy('cloning');
-      const clone = await fetch(`/api/workspace/linked-repos/${linkBody.repositoryId}/actions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ projectId, action: 'clone' }),
-      });
-      const cloneBody = (await clone.json().catch(() => null)) as
-        | { ok?: boolean; error?: string; output?: string }
-        | null;
-      if (!clone.ok || !cloneBody?.ok) {
-        const raw = cloneBody?.error || cloneBody?.output || `HTTP ${clone.status}`;
-        throw new Error(
-          `Project linked but initial clone failed: ${humanizeGitError('overleaf', raw)}`,
+    if (invite !== 'waiting') return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const res = await fetch(
+          `/api/workspace/overleaf/onboard-status?project=${encodeURIComponent(inviteProject.current)}`,
+          { cache: 'no-store' },
         );
+        const body = (await res.json().catch(() => null)) as { accepted?: number } | null;
+        if (!cancelled && (body?.accepted ?? 0) > 0) {
+          setInvite('accepted');
+          // The workspace must SAY it connected, not just this modal
+          // ("overleaf should say it connected" — user interviews): refetch
+          // linked repos so the badge appears, poll the incoming files, and
+          // open the Sync section — the same feedback the export path gets.
+          onLinkedRef.current?.(inviteProject.current);
+        }
+      } catch {
+        // transient; keep polling
       }
+    };
+    const timer = setInterval(() => void tick(), 3000);
+    void tick();
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [invite]);
 
-      onLinked(linkBody.repositoryId);
-      onClose();
+  const startInviteWait = useCallback(() => {
+    if (!inviteProjectId) return;
+    inviteProject.current = inviteProjectId;
+    setInvite('waiting');
+  }, [inviteProjectId]);
+
+  const handleExport = useCallback(async () => {
+    if (!projectId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/workspace/overleaf/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ projectId }),
+      });
+      const body = (await res.json().catch(() => null)) as
+        | { joinLink?: string; projectId?: string; error?: string }
+        | null;
+      if (!res.ok || !body?.joinLink) throw new Error(body?.error ?? `Export failed (${res.status})`);
+      setJoinLink(body.joinLink);
+      if (body.projectId) onLinked?.(body.projectId);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Failed to link Overleaf project');
+      setError(caught instanceof Error ? caught.message : 'Export failed');
     } finally {
-      setBusy(null);
+      setBusy(false);
     }
-  }, [projectUrl, importedPath, projectId, onClose, onLinked, requireSignIn]);
+  }, [projectId, onLinked]);
+
+  // A fresh export's link wins; otherwise recover the stored link of an
+  // exported project still waiting for its first joiner, so the link is not
+  // lost to the linked-repos refresh or a modal reopen.
+  const pendingJoinLink = joinLink ?? linkedProjects.find((p) => p.joinLink)?.joinLink ?? null;
 
   return (
     <ModalShell
       open={open}
       onClose={onClose}
-      ariaLabel="Add Overleaf project"
+      ariaLabel="Sync with Overleaf"
       panelClassName="relative flex w-full max-w-xl flex-col rounded-2xl border border-stone-200 bg-white shadow-xl"
-      // Same guard as the GitHub modal: don't let a stray click/Escape
-      // silently dismiss the modal while link/clone is in flight.
-      closeOnBackdrop={busy === null}
-      closeOnEscape={busy === null}
+      closeOnBackdrop={!busy}
+      closeOnEscape={!busy}
     >
       <button
         type="button"
@@ -158,157 +157,203 @@ export function AddOverleafModal({
       <header className="border-b border-stone-200 px-6 py-4">
         <h2 className="flex items-center gap-2 text-base font-semibold text-stone-900">
           <FileTextIcon className="h-5 w-5 text-emerald-700" weight="fill" aria-hidden />
-          Add an Overleaf project
+          Sync with Overleaf
         </h2>
         <p className="mt-1 text-xs text-stone-500">
-          Requires{' '}
-          <a
-            className="text-stone-700 underline"
-            href="https://www.overleaf.com/learn/how-to/Git_integration"
-            target="_blank"
-            rel="noreferrer"
-          >
-            Overleaf Premium git integration
-            <ArrowSquareOutIcon className="ml-0.5 inline h-3 w-3" weight="bold" aria-hidden />
-          </a>
-          .
+          {tab === 'export'
+            ? 'Create an Overleaf project from this workspace and keep them in sync.'
+            : 'Create a Sundial workspace from an existing Overleaf project and keep them in sync.'}{' '}
+          Works on free Overleaf accounts.
         </p>
+        <div className="mt-3 flex gap-1 rounded-lg bg-stone-100 p-1" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'export'}
+            data-testid="overleaf-tab-export"
+            onClick={() => setTab('export')}
+            className={`flex-1 rounded-md px-3 py-1.5 text-xs font-medium ${
+              tab === 'export' ? 'bg-white text-stone-900 shadow-sm' : 'text-stone-500 hover:text-stone-700'
+            }`}
+          >
+            New Overleaf project
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'import'}
+            data-testid="overleaf-tab-import"
+            onClick={() => setTab('import')}
+            className={`flex-1 rounded-md px-3 py-1.5 text-xs font-medium ${
+              tab === 'import' ? 'bg-white text-stone-900 shadow-sm' : 'text-stone-500 hover:text-stone-700'
+            }`}
+          >
+            New Sundial workspace
+          </button>
+        </div>
       </header>
 
-      {busy === 'linking' || busy === 'cloning' ? (
-        <CloneProgress
-          phase={busy}
-          target={projectUrl.trim() || 'your Overleaf project'}
-          icon={<FileTextIcon className="h-7 w-7 text-emerald-700" weight="fill" aria-hidden />}
-        />
-      ) : (
-      <>
       <div className="space-y-4 px-6 py-5 text-sm">
-        {linkedProjects.length > 0 && onOpenSync ? (
-          <div className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
-            <p className="min-w-0 truncate text-xs text-stone-600">
-              Linked: <span className="font-medium text-stone-800">{linkedProjects.map((p) => p.label).join(', ')}</span>
+        {tab === 'export' ? (
+        <>
+        {pendingJoinLink ? (
+          <div className="space-y-3">
+            <p className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
+              Your Overleaf project is ready and syncing. Open it to claim ownership; the first
+              person to open the link becomes the project owner.
             </p>
-            <button
-              type="button"
-              onClick={() => {
-                onClose();
-                onOpenSync();
-              }}
-              className="shrink-0 rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-100"
-            >
-              Open Sync panel
-            </button>
+            <div className="flex items-center gap-2">
+              <a
+                href={pendingJoinLink}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 rounded-lg bg-stone-900 px-4 py-2 text-sm font-medium text-white hover:bg-stone-800"
+              >
+                Open in Overleaf
+                <ArrowSquareOutIcon className="h-3.5 w-3.5" weight="bold" aria-hidden />
+              </a>
+              <button
+                type="button"
+                onClick={() => void copy('link', pendingJoinLink)}
+                aria-label="Copy join link"
+                title={copied === 'link' ? 'Copied' : 'Copy join link'}
+                className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-stone-300 text-stone-600 hover:bg-stone-100"
+              >
+                {copied === 'link' ? (
+                  <CheckIcon className="h-4 w-4" weight="bold" aria-hidden />
+                ) : (
+                  <CopyIcon className="h-4 w-4" weight="bold" aria-hidden />
+                )}
+              </button>
+            </div>
+            <p className="text-xs text-stone-500">
+              Anyone with the link can join and edit, so share it like a document link.
+            </p>
           </div>
-        ) : null}
-        {!authLoaded ? (
-          <Spinner label="Loading…" />
+        ) : linkedProjects.length > 0 ? (
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2">
+            <p className="min-w-0 truncate text-xs text-emerald-800">
+              Already synced with{' '}
+              <span className="font-medium">{linkedProjects.map((p) => p.label).join(', ')}</span>
+            </p>
+            {onOpenSync ? (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                  onOpenSync();
+                }}
+                className="shrink-0 rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-100"
+              >
+                Open Sync panel
+              </button>
+            ) : null}
+          </div>
+        ) : !authLoaded ? (
+          <p className="text-sm text-stone-500">Loading…</p>
         ) : !signedIn ? (
           <IntegrationSignInGate provider="Overleaf" returnParam={{ modal: 'addOverleaf' }} />
-        ) : statusLoading ? (
-          <div className="flex items-center justify-center gap-2 py-8 text-stone-400">
-            <CircleNotchIcon className="h-4 w-4 animate-spin" weight="bold" aria-hidden />
-            Checking Overleaf connection…
-          </div>
-        ) : !status?.connected ? (
+        ) : (
           <div className="space-y-3">
-            <p className="text-sm text-stone-700">
-              Paste your Overleaf{' '}
-              <a
-                className="text-stone-700 underline"
-                href="https://www.overleaf.com/user/settings"
-                target="_blank"
-                rel="noreferrer"
-              >
-                git-integration token
-              </a>{' '}
-              to clone, pull, and push. Stored once for your account.
-            </p>
-            <label className="block">
-              <span className="text-xs font-medium text-stone-500">Token</span>
-              <input
-                value={token}
-                onChange={(event) => setToken(event.target.value)}
-                type="password"
-                placeholder="olp_…"
-                className="mt-1 w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm outline-none focus:border-stone-500"
-              />
-            </label>
-            <label className="block">
-              <span className="text-xs font-medium text-stone-500">Email (optional)</span>
-              <input
-                value={tokenEmail}
-                onChange={(event) => setTokenEmail(event.target.value)}
-                placeholder="you@example.com"
-                className="mt-1 w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm outline-none focus:border-stone-500"
-              />
-            </label>
             <button
               type="button"
-              onClick={() => void handleSaveToken()}
-              disabled={busy !== null || !token.trim()}
+              onClick={() => void handleExport()}
+              disabled={busy || !projectId}
               className="inline-flex items-center gap-2 rounded-lg bg-stone-900 px-4 py-2 text-sm font-medium text-white hover:bg-stone-800 disabled:opacity-50"
+              data-testid="overleaf-export-button"
             >
-              {busy === 'saving' ? 'Saving…' : 'Save token'}
+              {busy ? 'Creating and syncing…' : 'Create and sync'}
             </button>
-          </div>
-        ) : (
-          <>
-            <p className="flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
-              <CheckCircleIcon className="h-4 w-4 shrink-0" weight="fill" aria-hidden />
-              <span>Connected as <span className="font-medium">{status.overleafEmail || 'your Overleaf account'}</span></span>
+            <p className="text-xs text-stone-500">
+              You get a join link; opening it makes you the project's owner in Overleaf. LaTeX
+              project files sync; agent files and build artifacts stay here. Large projects can
+              take a few minutes.
             </p>
-
-            <label className="block">
-              <span className="text-xs font-medium text-stone-500">Project URL or ID</span>
-              <input
-                value={projectUrl}
-                onChange={(event) => setProjectUrl(event.target.value)}
-                placeholder="https://www.overleaf.com/project/abc123… or git@git.overleaf.com:abc123…"
-                className="mt-1 w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm outline-none focus:border-stone-500"
-              />
-            </label>
-
-            <label className="block">
-              <span className="text-xs font-medium text-stone-500">Subfolder (optional)</span>
-              <input
-                value={importedPath}
-                onChange={(event) => setImportedPath(event.target.value)}
-                placeholder="e.g. paper-draft"
-                className="mt-1 w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm outline-none focus:border-stone-500"
-              />
-            </label>
-          </>
+          </div>
         )}
 
         {error ? (
-          <p className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
-            {error}
-          </p>
+          <div
+            role="alert"
+            className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700"
+          >
+            <p className="font-medium">Couldn’t create and sync the Overleaf project.</p>
+            <p className="mt-1">{error}</p>
+          </div>
         ) : null}
+        </>
+        ) : (
+        <div className="space-y-3 rounded-lg border border-stone-200 bg-stone-50 px-4 py-3">
+          <p className="text-xs font-medium text-stone-700">
+            Connect an existing Overleaf project in under a minute:
+          </p>
+          <ol className="space-y-2 text-xs text-stone-600">
+            <li className="flex items-center gap-2">
+              <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-stone-900 text-[10px] font-semibold text-white">1</span>
+              <span className="min-w-0">
+                In your Overleaf project: <span className="font-medium">Share</span> {'>'} invite{' '}
+                <span className="font-medium text-stone-800">{botEmail}</span>
+                <button
+                  type="button"
+                  onClick={() => void copy('email', botEmail)}
+                  aria-label="Copy address"
+                  title={copied === 'email' ? 'Copied' : 'Copy address'}
+                  className="mx-1 inline-flex h-4 w-4 items-center justify-center rounded align-text-bottom text-stone-500 hover:bg-stone-200 hover:text-stone-700"
+                >
+                  {copied === 'email' ? (
+                    <CheckIcon className="h-3 w-3" weight="bold" aria-hidden />
+                  ) : (
+                    <CopyIcon className="h-3 w-3" weight="bold" aria-hidden />
+                  )}
+                </button>
+                as <span className="font-medium">Editor</span>.
+              </span>
+            </li>
+            <li className="flex items-center gap-2">
+              <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-stone-900 text-[10px] font-semibold text-white">2</span>
+              {invite === 'accepted' ? (
+                <span className="flex items-center gap-1.5 font-medium text-emerald-700" data-testid="invite-accepted">
+                  <CheckIcon className="h-3.5 w-3.5" weight="bold" aria-hidden />
+                  Sunny accepted your invite.
+                </span>
+              ) : invite === 'waiting' ? (
+                <span className="flex items-center gap-1.5 text-stone-600" data-testid="invite-waiting">
+                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-stone-300 border-t-stone-600" aria-hidden />
+                  Waiting for Sunny to accept, usually about 10 seconds.
+                </span>
+              ) : (
+                <span className="flex min-w-0 flex-1 items-center gap-2">
+                  <input
+                    type="text"
+                    value={inviteLink}
+                    onChange={(e) => setInviteLink(e.target.value)}
+                    placeholder="Paste your Overleaf project link"
+                    data-testid="invite-project-input"
+                    className="min-w-0 flex-1 rounded-md border border-stone-300 bg-white px-2 py-1 text-xs text-stone-700 placeholder:text-stone-400"
+                  />
+                  <button
+                    type="button"
+                    onClick={startInviteWait}
+                    disabled={!inviteProjectId}
+                    data-testid="invite-sent-button"
+                    className="shrink-0 rounded-md border border-stone-300 bg-white px-2 py-1 text-xs font-medium text-stone-700 hover:bg-stone-100 disabled:opacity-50"
+                  >
+                    Connect Overleaf project
+                  </button>
+                </span>
+              )}
+            </li>
+            <li className="flex items-center gap-2">
+              <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-stone-900 text-[10px] font-semibold text-white">3</span>
+              <span className={invite === 'accepted' ? 'font-medium text-stone-800' : undefined}>
+                Back in Overleaf, open the chat in the left sidebar: Sundial just posted your
+                workspace link there. Open it to claim your workspace.
+              </span>
+            </li>
+          </ol>
+        </div>
+        )}
       </div>
-
-      {status?.connected ? (
-        <footer className="flex justify-end gap-2 border-t border-stone-200 px-6 py-3">
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-sm font-medium text-stone-700 hover:bg-stone-100"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={() => void handleLink()}
-            disabled={busy !== null || !projectUrl.trim()}
-            className="rounded-lg bg-stone-900 px-4 py-1.5 text-sm font-medium text-white hover:bg-stone-800 disabled:opacity-50"
-          >
-            Link &amp; clone
-          </button>
-        </footer>
-      ) : null}
-      </>
-      )}
     </ModalShell>
   );
 }

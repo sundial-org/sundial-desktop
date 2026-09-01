@@ -1,8 +1,8 @@
 'use client';
 
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react';
 // LinkIcon used by the Apps (Composio connectors) button, hidden for now — re-enable later.
-import { CaretDownIcon, FileIcon, PaperclipIcon, PlusIcon, QuotesIcon } from '@phosphor-icons/react';
+import { CaretDownIcon, CaretLeftIcon, CpuIcon, FileIcon, FolderIcon, PaperclipIcon, PlusIcon, QuotesIcon, XIcon } from '@phosphor-icons/react';
 import { IconTooltip } from '@/components/collab-bubbles';
 import { Spinner } from '@/components/ui/spinner';
 import { ChatAppsPicker } from './chat-apps-picker';
@@ -65,6 +65,9 @@ type ChatComposerProps = {
   chatId: string | null;
   showGroupChatUi: boolean;
   hasAssistant: boolean;
+  /** Non-null disables the whole composer with this message as the
+      placeholder (e.g. path-share guests: Sunny has no per-path rails yet). */
+  disabledNotice?: string | null;
   initialValue: string;
   textareaRef: MutableRefObject<HTMLElement | null>;
   shouldFocus: boolean;
@@ -102,9 +105,9 @@ type ChatComposerProps = {
   // top of the model menu; the model list is filtered to the harness's provider.
   harness: ChatHarness;
   onSelectHarness: (harness: ChatHarness) => void;
-  // Local workspaces: the Claude/Codex tabs run the user's OWN installed
-  // agents on this machine (subscription auth); the Vercel tab is Sunny.
-  // null = cloud workspace (cloud semantics).
+  // Local workspaces: the Claude/Codex rows run the user's OWN installed
+  // agents on this machine (subscription auth); the Sundial Agent row is
+  // the cloud agent. null = cloud workspace (cloud semantics).
   localEngines?: {
     claude: { available: boolean; loggedIn: boolean };
     codex: { available: boolean; loggedIn: boolean };
@@ -112,6 +115,10 @@ type ChatComposerProps = {
   // Local chats lock their engine once the conversation has messages —
   // switch engines by starting a new chat.
   harnessLocked?: boolean;
+  /** Starts a fresh chat already set to that agent. Given, a locked row stops
+   *  being a dead end: it offers the new chat in place instead of silently
+   *  refusing the click. Omitted (or absent) leaves the row explanatory only. */
+  onNewChatWithHarness?: (harness: ChatHarness) => void;
   models: ModelPickerOption[];
   modelsLoading: boolean;
   modelsEmptyReason: string | null;
@@ -123,7 +130,39 @@ type ChatComposerProps = {
   sendActionTitle: string;
   editMode: WorkspaceEditMode;
   onEditModeChange: (mode: WorkspaceEditMode) => void;
+  // Folder this chat was started from (chats.folder_scope). Display-only —
+  // null/empty for whole-workspace chats, which show no chip.
+  folderScope?: string | null;
+  // Path whose new doc comments are fed to this chat (chats.comment_watch_path);
+  // '*' = whole workspace, null = not listening (no chip).
+  commentWatchPath?: string | null;
+  onClearCommentWatch?: () => void;
+  /** Runs a `/watch`-family command instead of sending it ('*' = whole
+   *  workspace, null = stop). Omitted for draft chats — with no server row to
+   *  PATCH the commands stay un-intercepted (and unadvertised) rather than
+   *  swallowing the message. */
+  onCommentWatchCommand?: (path: string | null) => void;
 };
+
+// The composer's only slash commands. Matched on the WHOLE trimmed message, so
+// a mid-message slash or `/watchx` is ordinary text and still reaches the agent.
+const SLASH_COMMANDS = [
+  { command: '/watch', action: 'doc', hint: 'agent reads new comments on the open doc' },
+  { command: '/watch all', action: 'all', hint: 'agent reads new comments anywhere in this workspace' },
+  { command: '/unwatch', action: 'off', hint: 'stop listening to comments' },
+] as const;
+
+type WatchAction = (typeof SLASH_COMMANDS)[number]['action'];
+
+/** Normalized draft text, so `  /Watch   all ` matches (and completes) too. */
+function slashText(value: string) {
+  return value.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function parseWatchCommand(value: string): WatchAction | null {
+  const text = slashText(value);
+  return SLASH_COMMANDS.find((entry) => entry.command === text)?.action ?? null;
+}
 
 const WIKI_LINK_RE = /\[\[([^\]\n]+)\]\]/g;
 
@@ -136,9 +175,15 @@ function splitWikiTarget(raw: string): { target: string; label: string } {
   };
 }
 
-function makeWikiNode(path: string, label = getFileName(path)): HTMLElement {
+function makeWikiNode(path: string, label = getFileName(path), rawTarget?: string): HTMLElement {
   const node = document.createElement('span');
   node.dataset.wikiPath = path;
+  // A fragment-carrying target ([[note#Heading]]) resolves to the note for
+  // the chip, but serialization must re-emit the original target — otherwise
+  // a restored draft silently loses its #fragment.
+  if (rawTarget && rawTarget !== path && rawTarget.includes('#')) {
+    node.dataset.wikiTarget = rawTarget;
+  }
   node.contentEditable = 'false';
   node.className = 'wiki-file-link inline';
   node.title = path;
@@ -146,7 +191,7 @@ function makeWikiNode(path: string, label = getFileName(path)): HTMLElement {
   return node;
 }
 
-function renderComposerValue(root: HTMLElement, value: string, knownPaths: string[]) {
+export function renderComposerValue(root: HTMLElement, value: string, knownPaths: string[]) {
   root.replaceChildren();
   let lastIndex = 0;
   for (const match of value.matchAll(WIKI_LINK_RE)) {
@@ -156,13 +201,38 @@ function renderComposerValue(root: HTMLElement, value: string, knownPaths: strin
     if (index > lastIndex) root.append(document.createTextNode(value.slice(lastIndex, index)));
     const { target, label } = splitWikiTarget(raw);
     const path = resolveWikiTargetToPath(target, knownPaths) ?? target;
-    root.append(makeWikiNode(path, label));
+    root.append(makeWikiNode(path, label, target));
     lastIndex = index + full.length;
   }
   if (lastIndex < value.length) root.append(document.createTextNode(value.slice(lastIndex)));
+  ensureEditableLine(root);
 }
 
-export function serializeComposerValue(root: HTMLElement): string {
+/** WebKit paints no caret in an EMPTY contenteditable — there is no line box to
+ *  anchor it to — so a fresh or cleared composer showed no cursor in the desktop
+ *  WKWebView until the first character was typed. Keep the standard
+ *  contenteditable filler (`<br>`) in an empty editor so a caret line always
+ *  exists; `serializeComposerValue` treats one trailing root-level `<br>` as
+ *  that invisible filler, per the same convention browsers use. */
+export function ensureEditableLine(root: HTMLElement) {
+  if (!root.hasChildNodes()) root.append(root.ownerDocument.createElement('br'));
+}
+
+function isFillerOnly(root: HTMLElement): boolean {
+  return (
+    root.childNodes.length === 1 &&
+    root.firstChild instanceof HTMLElement &&
+    root.firstChild.tagName === 'BR'
+  );
+}
+
+export function serializeComposerValue(
+  root: HTMLElement,
+  // The whole-composer read treats one trailing root-level <br> as the caret
+  // filler (see ensureEditableLine). Cloned RANGE fragments must keep theirs —
+  // a prefix like `abc<br>` legitimately ends in a line break.
+  { stripTrailingFiller = true } = {},
+): string {
   // contentEditable represents newlines as block elements (<div>/<p>) and <br>,
   // not literal "\n". Reading textContent alone glues every line together — which
   // turned multi-line messages into a single line (e.g. a leading `## ` heading
@@ -176,7 +246,7 @@ export function serializeComposerValue(root: HTMLElement): string {
       }
       if (!(child instanceof HTMLElement)) return;
       if (child.dataset.wikiPath) {
-        out += formatWikiLink(child.dataset.wikiPath);
+        out += formatWikiLink(child.dataset.wikiTarget ?? child.dataset.wikiPath);
         return;
       }
       if (child.tagName === 'BR') {
@@ -196,11 +266,26 @@ export function serializeComposerValue(root: HTMLElement): string {
     });
   };
   walk(root);
+  // One trailing root-level <br> is the invisible caret filler (see
+  // ensureEditableLine), not content — browsers keep it after "abc<br>" and in
+  // an empty editor, and pressing Shift+Enter at the end inserts TWO <br>s.
+  const last = root.lastChild;
+  if (
+    stripTrailingFiller &&
+    last instanceof HTMLElement &&
+    last.tagName === 'BR' &&
+    out.endsWith('\n')
+  ) {
+    out = out.slice(0, -1);
+  }
   return out;
 }
 
 export function insertPlainTextIntoComposer(root: HTMLElement, text: string) {
   const doc = root.ownerDocument;
+  // Drop the caret filler before inserting — text must not land after it (a
+  // leading phantom newline). Removing it snaps any range inside to (root, 0).
+  if (isFillerOnly(root)) root.replaceChildren();
   const selection = doc.getSelection();
   let range = selection?.rangeCount ? selection.getRangeAt(0) : null;
   const ownsSelection = range && root.contains(range.commonAncestorContainer);
@@ -222,7 +307,9 @@ export function insertPlainTextIntoComposer(root: HTMLElement, text: string) {
       const afterRange = doc.createRange();
       afterRange.setStart(range.endContainer, range.endOffset);
       afterRange.setEnd(root, root.childNodes.length);
-      const after = serializeRange(root, afterRange);
+      // The suffix runs to the end of the draft, so its trailing <br> is the
+      // whole-draft caret filler — strip it like a whole-composer read would.
+      const after = serializeRange(root, afterRange, { stripTrailingFiller: true });
 
       const nextValue = before + text + after;
       const node = doc.createTextNode(nextValue);
@@ -247,10 +334,18 @@ export function insertPlainTextIntoComposer(root: HTMLElement, text: string) {
   selection?.addRange(range);
 }
 
-function serializeRange(root: HTMLElement, range: Range): string {
+// Fragments keep trailing <br>s by default (a prefix like `abc<br>` ends in a
+// REAL line break). A suffix fragment that runs to the end of the draft shares
+// the whole-draft convention instead — its trailing <br> IS the caret filler —
+// so those callers pass stripTrailingFiller: true.
+function serializeRange(
+  root: HTMLElement,
+  range: Range,
+  opts: { stripTrailingFiller?: boolean } = { stripTrailingFiller: false },
+): string {
   const wrapper = root.ownerDocument.createElement('div');
   wrapper.append(range.cloneContents());
-  return serializeComposerValue(wrapper);
+  return serializeComposerValue(wrapper, opts);
 }
 
 function startsAtComposerLineBoundary(root: HTMLElement, range: Range): boolean {
@@ -301,6 +396,7 @@ export const ChatComposer = memo(function ChatComposer({
   chatId,
   showGroupChatUi,
   hasAssistant,
+  disabledNotice = null,
   initialValue,
   textareaRef: externalTextareaRef,
   shouldFocus,
@@ -333,6 +429,7 @@ export const ChatComposer = memo(function ChatComposer({
   onSelectHarness,
   localEngines = null,
   harnessLocked = false,
+  onNewChatWithHarness,
   models,
   modelsLoading,
   modelsEmptyReason,
@@ -344,20 +441,23 @@ export const ChatComposer = memo(function ChatComposer({
   sendActionTitle,
   editMode,
   onEditModeChange,
+  folderScope = null,
+  commentWatchPath = null,
+  onClearCommentWatch,
+  onCommentWatchCommand,
 }: ChatComposerProps) {
   const localTextareaRef = useRef<HTMLDivElement | null>(null);
   const chatFileInputRef = useRef<HTMLInputElement>(null);
   const plusMenuRef = useRef<HTMLDivElement | null>(null);
   const composerTextareaShellRef = useRef<HTMLDivElement | null>(null);
-  const toolbarRowRef = useRef<HTMLDivElement | null>(null);
   const mentionRangeRef = useRef<Range | null>(null);
   const [inputValue, setInputValue] = useState(initialValue);
   const [fileMention, setFileMention] = useState<FileMentionMatch | null>(null);
   const [mentionHighlight, setMentionHighlight] = useState(0);
+  const [slashHighlight, setSlashHighlight] = useState(0);
+  // Escape dismisses the slash picker for the draft as typed; editing re-opens it.
+  const [slashDismissedFor, setSlashDismissedFor] = useState<string | null>(null);
   const [showPlusMenu, setShowPlusMenu] = useState(false);
-  // Whether the model picker is folded into the + menu (toolbar too narrow).
-  const [modelFolded, setModelFolded] = useState(false);
-  const [toolbarWidth, setToolbarWidth] = useState(0);
 
   const setPlusContainerRef = useCallback(
     (node: HTMLDivElement | null) => {
@@ -378,21 +478,13 @@ export const ChatComposer = memo(function ChatComposer({
     return () => document.removeEventListener('mousedown', handleClick);
   }, [showPlusMenu]);
 
-  useEffect(() => {
-    const row = toolbarRowRef.current;
-    if (!row || typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver((entries) => {
-      setToolbarWidth(entries[0]?.contentRect.width ?? 0);
-    });
-    observer.observe(row);
-    setToolbarWidth(row.getBoundingClientRect().width);
-    return () => observer.disconnect();
-  }, []);
-
   const setTextareaRef = useCallback(
     (node: HTMLDivElement | null) => {
       localTextareaRef.current = node;
       externalTextareaRef.current = node;
+      // JSX renders the editor with no children; give the empty editor its
+      // caret filler on mount (fresh chat, post-send remount).
+      if (node) ensureEditableLine(node);
     },
     [externalTextareaRef],
   );
@@ -449,14 +541,63 @@ export const ChatComposer = memo(function ChatComposer({
     if (!shouldFocus || !chatId || !hasAssistant) return;
     // A single focus() loses a race on "new chat": the assistant-picker menu
     // closes and restores focus to <body> just after we focus, leaving the
-    // composer blurred. Retry briefly until the composer actually holds focus.
+    // composer blurred. Retry until the composer actually HOLDS focus, because
+    // the steal lands after we've already focused — the old loop checked focus
+    // in the same tick it called focus(), declared success, and stopped.
+    //
+    // Three rules keep this from becoming a focus fight:
+    //  - focus must survive two consecutive ticks before we call it settled;
+    //  - we only focus over what was already focused when the chat opened (the
+    //    trigger keeps focus in Chrome, and a menu restores focus to it on
+    //    close) or over <body> (the picker's steal). Anything ELSE is the user
+    //    choosing a new target after the fact — a file in the tree, a toolbar
+    //    button — and we stand down immediately rather than yanking the caret
+    //    back every 40ms for the rest of the window;
+    //  - a missing ref waits on the SAME budget, so a composer that never
+    //    mounts can't leave a 40ms timer polling forever with the focus request
+    //    unresolved.
+    const FOCUS_BUDGET = 25; // ~1s at 40ms, covering a late picker close.
     let attempts = 0;
+    let held = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // Captured before the first focus() so it is the pre-existing focus, not
+    // anything this effect caused.
+    const openedFrom = document.activeElement;
+    /** A place the user could be typing — never take the caret out of one. */
+    const isTextEntry = (node: Element | null) =>
+      node instanceof HTMLElement &&
+      (node.isContentEditable ||
+        node.tagName === 'INPUT' ||
+        node.tagName === 'TEXTAREA' ||
+        node.tagName === 'SELECT');
+    /** Focus we may take: the opening trigger, or nothing focused at all. */
+    const isOurs = (node: Element | null) =>
+      !isTextEntry(node) && (!node || node === document.body || node === openedFrom);
+    const spend = () => {
+      attempts += 1;
+      return attempts >= FOCUS_BUDGET;
+    };
     const tryFocus = () => {
       const el = localTextareaRef.current;
-      if (el && document.activeElement !== el) el.focus();
-      attempts += 1;
-      if ((el && document.activeElement === el) || attempts >= 6) {
+      if (!el) {
+        if (spend()) {
+          onFocusHandled();
+          return;
+        }
+        timer = setTimeout(tryFocus, 40);
+        return;
+      }
+      const active = document.activeElement;
+      if (active === el) {
+        held += 1;
+      } else if (isOurs(active)) {
+        el.focus();
+        held = 0;
+      } else {
+        onFocusHandled();
+        return;
+      }
+      if (held >= 2 || spend()) {
         onFocusHandled();
         return;
       }
@@ -499,6 +640,10 @@ export const ChatComposer = memo(function ChatComposer({
     setMentionHighlight(0);
   }, [fileMention?.query]);
 
+  useEffect(() => {
+    setSlashHighlight(0);
+  }, [inputValue]);
+
   // Only files the user explicitly tags (via [[wiki links]]) get a pill. The
   // open file is still sent to the agent as context, just not shown here.
   const mergedContextFiles = useMemo(
@@ -528,8 +673,9 @@ export const ChatComposer = memo(function ChatComposer({
   const hasDraftText = inputValue.trim().length > 0;
   const hasAttachments = attachments.length > 0;
   const hasContextSnippets = contextSnippets.length > 0;
+  const composerEnabled = hasAssistant && !disabledNotice;
   const canSend =
-    hasAssistant &&
+    composerEnabled &&
     (hasDraftText || hasAttachments || hasContextSnippets) &&
     !chatUploadsInFlight;
 
@@ -555,8 +701,28 @@ export const ChatComposer = memo(function ChatComposer({
       const range = mentionRangeRef.current;
       if (!el || !range) return;
       range.deleteContents();
-      range.insertNode(makeWikiNode(path));
-      range.collapse(false);
+      // The caret must land INSIDE a text node: merely "after" a trailing
+      // contentEditable=false chip (no text node to live in), WebKit paints it
+      // in the wrong place — outside the composer box or at position 0 — which
+      // read as an invisible caret in the desktop WKWebView. Reuse the text
+      // node that already follows the mention (mid-draft completion — adding a
+      // space there would shove one before existing punctuation/words);
+      // otherwise append a space spacer, which is also the natural
+      // end-of-draft post-mention UX.
+      const chip = makeWikiNode(path);
+      range.insertNode(chip);
+      let anchor = chip.nextSibling;
+      while (anchor?.nodeType === Node.TEXT_NODE && anchor.textContent === '') {
+        anchor = anchor.nextSibling;
+      }
+      if (anchor?.nodeType === Node.TEXT_NODE) {
+        range.setStart(anchor, 0);
+      } else {
+        const space = document.createTextNode(' ');
+        chip.after(space);
+        range.setStart(space, 1);
+      }
+      range.collapse(true);
       const selection = window.getSelection();
       selection?.removeAllRanges();
       selection?.addRange(range);
@@ -579,7 +745,18 @@ export const ChatComposer = memo(function ChatComposer({
       for (const target of extractWikiLinkTargets(inputValue)) {
         if (resolveWikiTargetToPath(target, workspaceFilePaths) !== path) continue;
         const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const nextValue = inputValue.replace(new RegExp(`\\s*\\[\\[${escaped}\\]\\]`), '');
+        // Remove the token plus AT MOST ONE adjacent space, preferring the
+        // trailing one (the spacer pickMentionFile inserts). This keeps every
+        // neighborhood intact: `Read [[x]], then` → `Read, then` (leading
+        // space eaten), `See: [[x]] next` → `See: next` (trailing eaten),
+        // `a [[x]] b` → `a b`, and a lone `[[x]] ` → ``.
+        const match = inputValue.match(new RegExp(`\\[\\[${escaped}\\]\\]`));
+        if (match?.index === undefined) continue;
+        let start = match.index;
+        let end = start + match[0].length;
+        if (inputValue[end] === ' ') end += 1;
+        else if (start > 0 && /\s/.test(inputValue[start - 1] ?? '')) start -= 1;
+        const nextValue = inputValue.slice(0, start) + inputValue.slice(end);
         const el = localTextareaRef.current;
         if (el) renderComposerValue(el, nextValue, workspaceFilePaths);
         setInputValue(nextValue);
@@ -595,6 +772,9 @@ export const ChatComposer = memo(function ChatComposer({
     if (!chatId) return;
     const el = localTextareaRef.current;
     if (!el) return;
+    // Deleting the last character can leave a truly empty editor (WebKit) —
+    // restore the filler so the caret stays visible.
+    ensureEditableLine(el);
     const nextValue = serializeComposerValue(el);
     setInputValue(nextValue);
     onDraftChange(chatId, nextValue);
@@ -625,6 +805,71 @@ export const ChatComposer = memo(function ChatComposer({
     setFileMention(match);
   }, [chatId, onDraftChange]);
 
+  // Write both the editor DOM and the draft state (the box is uncontrolled).
+  const setComposerText = (next: string, caretToEnd = false) => {
+    const el = localTextareaRef.current;
+    if (el) {
+      renderComposerValue(el, next, workspaceFilePathsRef.current);
+      if (caretToEnd) {
+        el.focus();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        range.collapse(false);
+        const selection = window.getSelection();
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+      }
+    }
+    setInputValue(next);
+    if (chatId) onDraftChange(chatId, next);
+  };
+
+  const runWatchCommand = (action: WatchAction) => {
+    // `/watch` is doc-scoped by contract — with no open doc it must NOT
+    // silently widen to the whole workspace (that's `/watch all`). Refuse:
+    // the draft stays put and the picker (which hides `/watch` in that
+    // state) shows the alternatives (Codex P2).
+    if (action === 'doc' && !openFilePath) return;
+    onCommentWatchCommand?.(action === 'off' ? null : action === 'all' ? '*' : openFilePath);
+    setComposerText('');
+  };
+
+  // Sending, with the `/watch` family peeled off first: a command runs locally
+  // and clears the box — it is never persisted as a message nor sent to the agent.
+  // While a turn streams the send control IS Stop, so the interception is off
+  // entirely: Enter must stay inert and the button must interrupt, not swallow
+  // the draft and leave the agent running (Codex P2).
+  const send = (trigger: SendTrigger) => {
+    const command = isChatInterruptible ? null : parseWatchCommand(inputValue);
+    if (!command || !onCommentWatchCommand) {
+      onAction(trigger, inputValue);
+      return;
+    }
+    runWatchCommand(command);
+  };
+
+  // Discoverability: the commands matching what's typed so far, as a picker.
+  // Hidden while streaming — it would advertise commands that can't run.
+  const slashPickerOpen = Boolean(onCommentWatchCommand) && !isChatInterruptible && inputValue.startsWith('/');
+  const slashOptions = slashPickerOpen
+      ? SLASH_COMMANDS.filter(
+          (entry) =>
+            entry.command.startsWith(slashText(inputValue)) &&
+            // Doc-scoped `/watch` needs an open doc — otherwise offer only
+            // `/watch all` / `/unwatch` so the choice is explicit.
+            (entry.action !== 'doc' || Boolean(openFilePath)),
+        )
+      : [];
+  // A draft that IS exactly `/watch` with no doc open must not commit the
+  // workspace-wide row that would otherwise sit highlighted under Enter:
+  // nothing is preselected, Enter refuses, and the picker says why (Codex P2).
+  const docWatchUnavailable = slashPickerOpen && !openFilePath && slashText(inputValue) === '/watch';
+  const showSlashHint =
+    (slashOptions.length > 0 || docWatchUnavailable) && slashDismissedFor !== inputValue;
+  const slashChoice = docWatchUnavailable
+    ? undefined
+    : slashOptions[Math.min(slashHighlight, slashOptions.length - 1)];
+
   // While a turn is running we let the button stay live so the user can click
   // it as an explicit stop, even with an empty input.
   const sendDisabled = !canSend && !isChatInterruptible;
@@ -644,7 +889,36 @@ export const ChatComposer = memo(function ChatComposer({
     () => moreSections.flatMap((section) => section.options),
     [moreSections]
   );
-  const [showMoreModels, setShowMoreModels] = useState(false);
+  // `null` = untouched, so the picker can default itself open: a chat whose
+  // model has been demoted out of the featured row (a newer sibling took the
+  // slot) would otherwise show no selected entry until "More models" is
+  // clicked. An explicit toggle wins until the picker closes.
+  const [showMoreModels, setShowMoreModels] = useState<boolean | null>(null);
+  const modelsExpanded =
+    showMoreModels ?? moreOptions.some((option) => option.id === currentChatModel);
+  const [modelSearch, setModelSearch] = useState('');
+  // A non-empty query replaces the browse view with a flat match list
+  // (options are already featured-first / newest-first, so matches read in
+  // relevance order).
+  const modelQuery = modelSearch.trim().toLowerCase();
+  const modelSearchResults = useMemo(
+    () =>
+      modelQuery
+        ? chatRuntimeOptions.filter((option) =>
+            `${option.label} ${option.id} ${option.providerLabel}`.toLowerCase().includes(modelQuery),
+          )
+        : null,
+    [chatRuntimeOptions, modelQuery],
+  );
+  // Drop the override on *every* close path — the trigger, an outside click,
+  // picking a model — so the next open re-derives its default.
+  useEffect(() => {
+    if (!showModelPicker) {
+      setShowMoreModels(null);
+      setModelSearch('');
+    }
+  }, [showModelPicker]);
+  const [showHarnessFlyout, setShowHarnessFlyout] = useState(false);
   const selectedRuntimeOption = useMemo(
     () => chatRuntimeOptions.find((option) => option.id === currentChatModel) ?? null,
     [chatRuntimeOptions, currentChatModel]
@@ -652,37 +926,17 @@ export const ChatComposer = memo(function ChatComposer({
   const currentModelLabel =
     selectedRuntimeOption?.label ?? getChatModelLabel(currentChatModel, 'Model');
 
-  // Everything that changes the toolbar row's content width (voice button,
-  // model label, edit-mode label) plus its available width.
-  const toolbarFitInputs =
-    `${toolbarWidth}|${isVoiceSupported}|${currentModelLabel}|${editMode}`;
-  const lastToolbarFitRef = useRef('');
-
-  // The toolbar is a single row that never wraps. When the model picker doesn't
-  // fit, fold it into the + menu. Whenever the fit inputs change — width OR
-  // content, in either direction — re-expand and re-measure from scratch, then
-  // fold if it doesn't fit. This re-tests both ways (the panel widening, or a
-  // shorter model label freeing room) without reading layout on every
-  // keystroke. useLayoutEffect → the fold is applied before paint, so there's
-  // no flash.
-  useLayoutEffect(() => {
-    const row = toolbarRowRef.current;
-    if (!row) return;
-    if (toolbarFitInputs !== lastToolbarFitRef.current) {
-      lastToolbarFitRef.current = toolbarFitInputs;
-      if (modelFolded) {
-        setModelFolded(false);
-        return;
-      }
-    }
-    if (!modelFolded && row.scrollWidth > row.clientWidth + 1) {
-      setModelFolded(true);
-    }
-  }, [toolbarFitInputs, modelFolded]);
+  // Stored without surrounding slashes; the chip renders it as `<path>/`.
+  const folderScopeLabel = folderScope?.trim().replace(/^\/+|\/+$/g, '') ?? '';
+  const watchedPath = commentWatchPath?.trim() ?? '';
+  const commentWatchLabel =
+    watchedPath === '*' ? 'whole workspace' : watchedPath.split('/').pop() ?? '';
+  const watching = commentWatchLabel.length > 0;
 
   const renderChatRuntimeOption = (option: ChatRuntimePickerOption) => {
     const isSelected = option.id === currentChatModel;
-    const ProviderIcon = getProviderIcon(option);
+    // Providers without a brand icon get a neutral placeholder so rows align.
+    const ProviderIcon = getProviderIcon(option) ?? CpuIcon;
 
     return (
       <button
@@ -700,24 +954,26 @@ export const ChatComposer = memo(function ChatComposer({
           isSelected ? 'bg-stone-50 text-stone-800' : 'text-stone-700'
         }`}
       >
-        {ProviderIcon ? (
-          <ProviderIcon className="h-3.5 w-3.5 shrink-0 text-stone-500" />
-        ) : (
-          <span className="h-3.5 w-3.5 shrink-0" aria-hidden />
-        )}
+        <ProviderIcon className="h-3.5 w-3.5 shrink-0 text-stone-500" />
         <span className="truncate">{option.label}</span>
       </button>
     );
   };
 
-  const SelectedProviderIcon = selectedRuntimeOption
-    ? getProviderIcon(selectedRuntimeOption)
-    : getProviderIcon({ provider: currentChatModel.split('/')[0] ?? null, id: currentChatModel });
+  const SelectedProviderIcon =
+    (selectedRuntimeOption
+      ? getProviderIcon(selectedRuntimeOption)
+      : getProviderIcon({ provider: currentChatModel.split('/')[0] ?? null, id: currentChatModel })) ??
+    CpuIcon;
 
   return (
     <>
-      <div className="p-4">
-        <div className="max-w-2xl mx-auto space-y-2">
+      {/* Only when there's something to show: this block used to render its
+          padding unconditionally, costing 32px of transcript height on every
+          chat that had no uploads or attachments — which is nearly all of them. */}
+      {uploads.length > 0 || attachments.length > 0 ? (
+      <div className="pt-4 pb-2">
+        <div className="max-w-2xl mx-auto px-4 space-y-2">
           {uploads.length > 0 && (
             <div className="space-y-1">
               {uploads.map((upload) => (
@@ -782,13 +1038,55 @@ export const ChatComposer = memo(function ChatComposer({
           )}
         </div>
       </div>
-      <div className="px-3 pb-3 lg:px-6 lg:pb-4">
-        <div className="max-w-2xl mx-auto">
+      ) : null}
+      {/* The padding sits INSIDE the max-w-2xl cap, mirroring the transcript's
+          own `mx-auto max-w-2xl` + `p-4`. Outside the cap it would be ignored
+          once the pane got wider than 2xl, leaving the composer 16px prouder
+          than the message and diff cards; inside, the edges line up at every
+          pane width. */}
+      <div className="pb-3">
+        <div className="max-w-2xl mx-auto px-4">
+          <div className="relative">
           <div
             ref={composerTextareaShellRef}
             data-testid="composer-shell"
-            className="bg-stone-200/70 border border-stone-300/60 rounded-xl relative"
+            // Flat at rest, but with real contrast: a lighter field and a solid
+            // border, so the toolbar's dark glyphs and their stone-300 hover
+            // fill both read (the old stone-400-on-stone-200 toolbar looked
+            // disabled — Florent, 2026-08-06).
+            className="bg-stone-100 border border-stone-300 rounded-xl relative"
           >
+            {showSlashHint ? (
+              <div
+                role="listbox"
+                aria-label="Slash commands"
+                data-testid="composer-slash-hint"
+                className="absolute bottom-full left-0 z-50 mb-1 w-full overflow-hidden rounded-xl border border-stone-200 bg-white p-1.5 shadow-[0_1px_2px_rgba(60,64,67,0.3),0_2px_6px_2px_rgba(60,64,67,0.15)]"
+              >
+                {slashOptions.map((entry, index) => (
+                  <button
+                    key={entry.command}
+                    type="button"
+                    role="option"
+                    aria-selected={entry === slashChoice}
+                    onMouseEnter={() => setSlashHighlight(index)}
+                    onMouseDown={(event) => event.preventDefault()} // keep the caret in the box
+                    onClick={() => runWatchCommand(entry.action)}
+                    className={`flex w-full items-baseline gap-2 rounded-lg px-2 py-1 text-left text-[12px] ${
+                      entry === slashChoice ? 'bg-stone-100' : ''
+                    }`}
+                  >
+                    <span className="font-medium text-stone-700">{entry.command}</span>
+                    <span className="truncate text-stone-400">{entry.hint}</span>
+                  </button>
+                ))}
+                {docWatchUnavailable ? (
+                  <p data-testid="composer-slash-note" className="px-2 py-1 text-[12px] text-stone-400">
+                    <span className="font-medium text-stone-500">/watch</span> needs an open document
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
             {fileMention && mentionPickerItems.length > 0 ? (
               <FilePickerPopover
                 items={mentionPickerItems}
@@ -809,7 +1107,7 @@ export const ChatComposer = memo(function ChatComposer({
                   <span
                     data-testid="composer-open-file-chip"
                     className="inline-flex max-w-full items-center gap-1 rounded-md border border-stone-300/70 px-1.5 py-0.5 text-[11px] text-stone-500"
-                    title={`${ambientOpenFilePath} — automatically in Sunny's context`}
+                    title={`${ambientOpenFilePath} · automatically in the agent's context`}
                   >
                     <FileIcon className="h-3 w-3 shrink-0 text-stone-400" aria-hidden />
                     <span className="max-w-[180px] truncate">
@@ -824,7 +1122,7 @@ export const ChatComposer = memo(function ChatComposer({
                   return (
                     <span
                       key={snippet.id}
-                      className="inline-flex max-w-[min(280px,100%)] items-center gap-1 rounded-md bg-white/70 px-1.5 py-0.5 text-[11px] text-stone-600"
+                      className="inline-flex max-w-[min(280px,100%)] items-center gap-1 rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[11px] text-stone-600"
                       title={snippet.text}
                     >
                       <QuotesIcon className="h-3 w-3 shrink-0 text-stone-400" weight="fill" aria-hidden />
@@ -846,7 +1144,7 @@ export const ChatComposer = memo(function ChatComposer({
                 {visibleContextFiles.map((file) => (
                   <span
                     key={`ctx:${file.path}`}
-                    className="inline-flex max-w-full items-center gap-1 rounded-md bg-white/70 px-1.5 py-0.5 text-[11px] text-stone-600"
+                    className="inline-flex max-w-full items-center gap-1 rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[11px] text-stone-600"
                     title={file.path}
                   >
                     <FileIcon className="h-3 w-3 shrink-0 text-stone-400" aria-hidden />
@@ -869,18 +1167,18 @@ export const ChatComposer = memo(function ChatComposer({
               {!inputValue ? (
                 <div
                   aria-hidden
-                  className={`pointer-events-none absolute inset-0 px-4 pb-1 text-sm leading-snug text-stone-400 ${
+                  className={`pointer-events-none absolute inset-0 px-4 pb-1 text-sm leading-snug text-stone-500 ${
                     hasComposerContext ? 'pt-1.5' : 'pt-2.5'
                   }`}
                 >
-                  {hasAssistant ? 'What would you like to do today?' : 'Start a new chat to message Sunny'}
+                  {disabledNotice ?? (hasAssistant ? 'What would you like to do today?' : 'Start a new chat to message Sundial Agent')}
                 </div>
               ) : null}
               <div
                 ref={setTextareaRef}
                 data-testid="chat-composer-input"
                 role="textbox"
-                contentEditable={hasAssistant}
+                contentEditable={composerEnabled}
                 suppressContentEditableWarning
                 spellCheck={false}
                 onInput={syncDraftFromEditor}
@@ -901,6 +1199,36 @@ export const ChatComposer = memo(function ChatComposer({
                   onOpenEditedFile(path);
                 }}
                 onKeyDown={(event) => {
+                  // Slash picker owns these keys ONLY while it shows — closed,
+                  // Enter/Tab/arrows keep their ordinary composer behavior.
+                  if (showSlashHint && slashChoice) {
+                    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                      event.preventDefault();
+                      const delta = event.key === 'ArrowDown' ? 1 : slashOptions.length - 1;
+                      // Clamp first: a narrowed list must move from the row the
+                      // user actually sees highlighted, never a stale index.
+                      setSlashHighlight(
+                        (current) => (Math.min(current, slashOptions.length - 1) + delta) % slashOptions.length,
+                      );
+                      return;
+                    }
+                    if (event.key === 'Tab') {
+                      // Complete the text only — Enter is what commits.
+                      event.preventDefault();
+                      setComposerText(slashChoice.command, true);
+                      return;
+                    }
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                      event.preventDefault();
+                      runWatchCommand(slashChoice.action);
+                      return;
+                    }
+                    if (event.key === 'Escape') {
+                      event.preventDefault();
+                      setSlashDismissedFor(inputValue);
+                      return;
+                    }
+                  }
                   if (fileMention && mentionPickerItems.length > 0) {
                     const last = mentionPickerItems.length - 1;
                     if (event.key === 'ArrowDown') {
@@ -947,15 +1275,18 @@ export const ChatComposer = memo(function ChatComposer({
                   }
                   if (event.key === 'Enter' && !event.shiftKey) {
                     event.preventDefault();
-                    onAction('enter', inputValue);
+                    send('enter');
                   }
                 }}
                 className={`relative min-h-[32px] w-full whitespace-pre-wrap break-words bg-transparent px-4 pb-1 text-sm leading-snug caret-stone-900 focus:outline-none [overflow-wrap:anywhere] ${
-                  hasAssistant ? '' : 'pointer-events-none opacity-60'
+                  composerEnabled ? '' : 'pointer-events-none opacity-60'
                 } ${hasComposerContext ? 'pt-1.5' : 'pt-2.5'}`}
               />
             </div>
-            <div ref={toolbarRowRef} className="flex items-center gap-1 px-2 pb-1.5 pt-0.5">
+            {/* @container/toolbar: the model trigger drops to its icon when
+                this row is narrow (see below), which depends on the row's own
+                width, not the viewport's. */}
+            <div className="@container/toolbar flex items-center gap-1 px-2 pb-1.5 pt-0.5">
               <div className="relative" ref={setPlusContainerRef}>
                 <button
                   type="button"
@@ -965,7 +1296,7 @@ export const ChatComposer = memo(function ChatComposer({
                     setShowModelPicker(false);
                   }}
                   aria-label="Add context"
-                  className="relative group/tip p-1.5 rounded-lg text-stone-400 hover:text-stone-600 hover:bg-stone-200/50 disabled:cursor-not-allowed disabled:opacity-40"
+                  className="relative group/tip p-1.5 rounded-lg text-stone-700 transition-colors hover:text-stone-900 hover:bg-stone-300 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <PlusIcon className="w-4 h-4" aria-hidden />
                   <IconTooltip
@@ -1016,26 +1347,6 @@ export const ChatComposer = memo(function ChatComposer({
                       )}
                     </button>
                     */}
-                    {modelFolded ? (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setShowPlusMenu(false);
-                          setShowAppsPicker(false);
-                          setShowModelPicker(true);
-                        }}
-                        className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-stone-700 hover:bg-stone-50"
-                      >
-                        {SelectedProviderIcon ? (
-                          // eslint-disable-next-line react-hooks/static-components -- false positive: rendering a captured component reference, not creating a new component.
-                          <SelectedProviderIcon className="h-3.5 w-3.5 text-stone-500" />
-                        ) : (
-                          <span className="h-3.5 w-3.5" aria-hidden />
-                        )}
-                        <span className="flex-1 text-left">Model</span>
-                        <span className="max-w-24 truncate text-[10px] text-stone-400">{currentModelLabel}</span>
-                      </button>
-                    ) : null}
                   </div>
                 )}
                 <ChatAppsPicker
@@ -1050,93 +1361,245 @@ export const ChatComposer = memo(function ChatComposer({
                 mode={editMode}
                 onChange={onEditModeChange}
                 menuPlacement="up"
+                tone="strong"
                 disabled={!hasAssistant}
                 modes={CHAT_EDIT_MODES}
+                // Last label to go: only a row too narrow for even the icons
+                // drops it (the tooltip and aria-label still name the mode).
+                labelClassName="hidden @[17rem]/toolbar:block"
               />
-              <div className="ml-auto flex items-center gap-1">
-                <div className="relative" ref={modelPickerRef}>
-                  {!modelFolded ? (
-                    <button
-                      type="button"
-                      data-testid="model-picker-trigger"
-                      onClick={() => {
-                        setShowModelPicker(!showModelPicker);
-                        setShowAppsPicker(false);
-                        if (showModelPicker) setShowMoreModels(false);
-                      }}
-                      aria-label="Model"
-                      className="flex items-center gap-1.5 whitespace-nowrap rounded-lg px-2.5 py-1 text-[13px] text-stone-600 hover:bg-stone-200/50 hover:text-stone-800 disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      <span className="shrink-0 text-stone-400">Model:</span>
-                      {SelectedProviderIcon ? (
-                        // eslint-disable-next-line react-hooks/static-components -- false positive: rendering a captured component reference, not creating a new component.
-                        <SelectedProviderIcon className="h-3.5 w-3.5 shrink-0 text-stone-500" />
-                      ) : null}
-                      <span>{currentModelLabel}</span>
-                      <CaretDownIcon className="h-3 w-3 shrink-0 text-stone-400" weight="bold" aria-hidden />
-                    </button>
-                  ) : null}
+              {folderScopeLabel ? (
+                <span
+                  data-testid="composer-folder-scope"
+                  title={`This chat works from ${folderScopeLabel}/`}
+                  className="flex min-w-0 max-w-[180px] items-center gap-1.5 rounded-lg px-2.5 py-1 text-[13px] text-stone-500"
+                >
+                  <FolderIcon className="h-3.5 w-3.5 shrink-0 text-stone-400" aria-hidden />
+                  <span className="hidden truncate @[19rem]/toolbar:block">{folderScopeLabel}/</span>
+                </span>
+              ) : null}
+              <div className="ml-auto flex min-w-0 items-center gap-1">
+                {/* No `relative`: a `right-0` w-72 menu anchored here opened off
+                    the left edge of the screen on a narrow panel (measured
+                    -22px at 360px wide, worse below). It anchors to the
+                    composer shell instead, which is always on-screen. */}
+                <div className="flex min-w-[30px] items-center gap-1" ref={modelPickerRef}>
+                  {/* The trigger is on the toolbar at every panel width: it used
+                      to fold away into the + menu, which read as "the model
+                      selector went missing". A narrow row drops the label and
+                      caret for the provider icon alone (30px, the container's
+                      floor); a long model name truncates. */}
+                  <button
+                    type="button"
+                    data-testid="model-picker-trigger"
+                    onClick={() => {
+                      setShowModelPicker(!showModelPicker);
+                      setShowAppsPicker(false);
+                      setShowHarnessFlyout(false);
+                    }}
+                    aria-label={`Model: ${currentModelLabel}`}
+                    title={currentModelLabel}
+                    className="flex min-w-0 items-center gap-1.5 overflow-hidden rounded-lg px-2 py-1 text-[13px] font-medium text-stone-700 transition-colors hover:bg-stone-300 hover:text-stone-900 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {/* eslint-disable-next-line react-hooks/static-components -- false positive: rendering a captured component reference, not creating a new component. */}
+                    <SelectedProviderIcon className="h-3.5 w-3.5 shrink-0 text-stone-600" />
+                    <span className="hidden truncate @[19rem]/toolbar:block">{currentModelLabel}</span>
+                    <CaretDownIcon
+                      className="hidden h-3 w-3 shrink-0 text-stone-600 @[19rem]/toolbar:block"
+                      weight="bold"
+                      aria-hidden
+                    />
+                  </button>
                   {showModelPicker && (
                     <div
                       data-testid="model-picker-menu"
                       className="absolute bottom-full right-0 z-20 mb-1 w-72 rounded-lg border border-stone-200 bg-white py-1 shadow-lg"
                     >
-                      <div
-                        data-testid="harness-picker"
-                        role="tablist"
-                        aria-label="Agent harness"
-                        className="mx-1.5 mb-1 flex gap-0.5 rounded-lg bg-stone-100 p-0.5"
-                      >
-                        {CHAT_HARNESSES.map((h) => {
-                          const engine =
-                            localEngines && h === 'claude'
-                              ? localEngines.claude
-                              : localEngines && h === 'openai'
-                                ? localEngines.codex
-                                : null;
-                          const detected = Boolean(engine?.available && engine?.loggedIn);
-                          const locked = harnessLocked && h !== harness;
-                          return (
-                            <button
-                              key={h}
-                              type="button"
-                              role="tab"
-                              aria-selected={harness === h}
-                              aria-disabled={locked}
-                              data-testid={`harness-tab-${h}`}
-                              onClick={() => {
-                                if (!locked) onSelectHarness(h);
-                              }}
-                              className={`flex min-w-0 flex-1 items-center justify-center gap-1 truncate rounded-md px-1.5 py-1 text-center text-[11px] transition-colors ${
-                                harness === h
-                                  ? 'bg-white text-stone-800 shadow-sm'
-                                  : locked
-                                    ? 'cursor-not-allowed text-stone-300'
-                                    : 'text-stone-500 hover:text-stone-700'
-                              }`}
-                            >
-                              <span className="truncate">
-                                {localEngines && h === 'vercel' ? 'Sunny' : CHAT_HARNESS_LABELS[h]}
-                              </span>
-                              {engine ? (
-                                // Presence dot, not a checkmark — a ✓ next to a
-                                // tab reads as "selected", this means "signed in
-                                // on this computer" (footer spells it out).
-                                <span
-                                  className={`h-1.5 w-1.5 shrink-0 rounded-full ${detected ? 'bg-green-500' : 'bg-stone-300'}`}
-                                  data-testid={`harness-detected-${h}`}
-                                  data-detected={detected}
-                                  role="img"
-                                  aria-label={detected ? 'Connected on this computer' : 'Not set up on this computer'}
-                                />
-                              ) : null}
-                            </button>
-                          );
-                        })}
+                      {/* Compact agent row — the descriptive rows open in a
+                          side flyout so switching agents never resizes the
+                          menu (the inline rows made the whole thing jump). */}
+                      <div className="relative mx-1.5 mb-1">
+                        <button
+                          type="button"
+                          data-testid="harness-flyout-trigger"
+                          aria-haspopup="menu"
+                          aria-expanded={showHarnessFlyout}
+                          onClick={() => setShowHarnessFlyout((prev) => !prev)}
+                          className="flex w-full items-center gap-1.5 rounded-md px-1.5 py-1.5 text-left text-[12px] text-stone-600 hover:bg-stone-50"
+                        >
+                          <span className="text-stone-400">Agent:</span>
+                          <span className="font-medium text-stone-800">{CHAT_HARNESS_LABELS[harness]}</span>
+                          {(() => {
+                            const engine =
+                              localEngines && harness === 'claude'
+                                ? localEngines.claude
+                                : localEngines && harness === 'openai'
+                                  ? localEngines.codex
+                                  : null;
+                            return engine ? (
+                              <span
+                                className={`h-1.5 w-1.5 shrink-0 rounded-full ${engine.available && engine.loggedIn ? 'bg-green-500' : 'bg-stone-300'}`}
+                                aria-hidden
+                              />
+                            ) : null;
+                          })()}
+                          <CaretLeftIcon
+                            className={`ml-auto h-3 w-3 text-stone-400 transition-transform ${showHarnessFlyout ? '-rotate-180' : ''}`}
+                            aria-hidden
+                          />
+                        </button>
+                        {showHarnessFlyout && (
+                          <div
+                            data-testid="harness-picker"
+                            role="tablist"
+                            aria-label="Agent harness"
+                            // Above the menu, always — the old beside-the-menu
+                            // (right-full) variant escaped the chat pane and got
+                            // clipped at the pane boundary in split view
+                            // (2026-07-31). Overlay, never inline, so the menu
+                            // itself never resizes.
+                            className="absolute bottom-full left-0 mb-1 flex w-full flex-col gap-0.5 rounded-lg border border-stone-200 bg-white p-1 shadow-lg"
+                          >
+                            {CHAT_HARNESSES.map((h) => {
+                              const engine =
+                                localEngines && h === 'claude'
+                                  ? localEngines.claude
+                                  : localEngines && h === 'openai'
+                                    ? localEngines.codex
+                                    : null;
+                              const detected = Boolean(engine?.available && engine?.loggedIn);
+                              const locked = harnessLocked && h !== harness;
+                              // A locked row used to swallow its own click with
+                              // no explanation. Offer the only move that works
+                              // (a fresh chat on that agent) right on the row,
+                              // and say why on hover.
+                              const relocatable = locked && Boolean(onNewChatWithHarness);
+                              // One line under each agent naming what running
+                              // it means here — connection state included, so
+                              // the presence dot never stands alone.
+                              const status = !engine
+                                ? CHAT_HARNESS_HINTS[h]
+                                : h === 'claude'
+                                  ? !engine.available
+                                    ? 'Install Claude Code to chat on your subscription'
+                                    : !engine.loggedIn
+                                      ? 'Run `claude login` to connect your subscription'
+                                      : 'Claude subscription connected'
+                                  : !engine.available
+                                    ? 'Install Codex to chat on your ChatGPT subscription'
+                                    : !engine.loggedIn
+                                      ? 'Run `codex login` to connect your subscription'
+                                      : 'ChatGPT subscription connected';
+                              return (
+                                <button
+                                  key={h}
+                                  type="button"
+                                  role="tab"
+                                  aria-selected={harness === h}
+                                  aria-disabled={locked && !relocatable}
+                                  data-locked={locked || undefined}
+                                  data-testid={`harness-tab-${h}`}
+                                  onClick={() => {
+                                    if (locked) {
+                                      if (!relocatable) return;
+                                      onNewChatWithHarness?.(h);
+                                      setShowHarnessFlyout(false);
+                                      setShowModelPicker(false);
+                                      return;
+                                    }
+                                    onSelectHarness(h);
+                                    setShowHarnessFlyout(false);
+                                  }}
+                                  className={`relative flex flex-col items-start rounded-md border px-2.5 py-1.5 text-left transition-colors ${
+                                    harness === h
+                                      ? 'border-stone-300 bg-stone-50'
+                                      : locked && !relocatable
+                                        ? 'cursor-not-allowed border-transparent opacity-50'
+                                        : 'border-transparent hover:bg-stone-50'
+                                  }`}
+                                >
+                                  {locked ? (
+                                    <IconTooltip
+                                      label={`This chat is running ${CHAT_HARNESS_LABELS[harness]}. Create a new chat to use ${CHAT_HARNESS_LABELS[h]}.`}
+                                      side="top"
+                                      align="left"
+                                    />
+                                  ) : null}
+                                  <span className="flex w-full items-center gap-1.5 text-[13px] font-medium text-stone-800">
+                                    {CHAT_HARNESS_LABELS[h]}
+                                    {engine ? (
+                                      // Presence dot, not a checkmark — a ✓
+                                      // would read as "selected"; the status
+                                      // line spells out what the color means.
+                                      <span
+                                        className={`h-1.5 w-1.5 shrink-0 rounded-full ${detected ? 'bg-green-500' : 'bg-stone-300'}`}
+                                        data-testid={`harness-detected-${h}`}
+                                        data-detected={detected}
+                                        role="img"
+                                        aria-label={detected ? 'Connected on this computer' : 'Not set up on this computer'}
+                                      />
+                                    ) : null}
+                                    {relocatable ? (
+                                      <span
+                                        data-testid={`harness-new-chat-${h}`}
+                                        className="ml-auto shrink-0 rounded-full border border-stone-200 px-1.5 py-0.5 text-[10px] font-medium text-stone-500"
+                                      >
+                                        New chat
+                                      </span>
+                                    ) : null}
+                                  </span>
+                                  <span className="text-[11px] text-stone-400">
+                                    {locked
+                                      ? relocatable
+                                        ? `Create a new chat to use ${CHAT_HARNESS_LABELS[h]}`
+                                        : 'Create a new chat to use a different agent'
+                                      : status}
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
-                      <div className="max-h-[360px] overflow-y-auto">
-                        {(showMoreModels ? chatRuntimeOptions : featuredOptions).map(
-                          renderChatRuntimeOption,
+                      <div className="border-t border-stone-100 px-3 pb-0.5 pt-1.5 text-[10px] font-medium uppercase tracking-wide text-stone-400">
+                        Model
+                      </div>
+                      {modelsExpanded ? (
+                        <input
+                          data-testid="model-picker-search"
+                          value={modelSearch}
+                          onChange={(event) => setModelSearch(event.target.value)}
+                          placeholder="Search models"
+                          autoFocus
+                          className="w-full border-b border-stone-100 bg-transparent px-3 py-1.5 text-sm text-stone-700 placeholder:text-stone-400 focus:outline-none"
+                        />
+                      ) : null}
+                      <div className="max-h-[300px] overflow-y-auto">
+                        {modelSearchResults ? (
+                          modelSearchResults.length > 0 ? (
+                            modelSearchResults.map(renderChatRuntimeOption)
+                          ) : (
+                            <div className="px-3 py-1.5 text-[11px] text-stone-400">
+                              No models match
+                            </div>
+                          )
+                        ) : (
+                          <>
+                            {featuredOptions.map(renderChatRuntimeOption)}
+                            {modelsExpanded
+                              ? moreSections.map((section) => (
+                                  <div key={section.key}>
+                                    <div
+                                      data-testid="model-picker-section-label"
+                                      className="border-t border-stone-100 px-3 pb-0.5 pt-1.5 text-[10px] font-medium uppercase tracking-wide text-stone-400"
+                                    >
+                                      {section.label}
+                                    </div>
+                                    {section.options.map(renderChatRuntimeOption)}
+                                  </div>
+                                ))
+                              : null}
+                          </>
                         )}
                         {modelsLoading ? (
                           <Spinner label="Loading…" size={13} className="px-3 py-1.5 text-[11px]" />
@@ -1148,36 +1611,17 @@ export const ChatComposer = memo(function ChatComposer({
                             {modelsEmptyReason}
                           </div>
                         ) : null}
-                        {moreOptions.length > 0 ? (
+                        {moreOptions.length > 0 && !modelSearchResults ? (
                           <button
                             type="button"
                             data-testid="model-picker-toggle-more"
-                            onClick={() => setShowMoreModels((prev) => !prev)}
+                            onClick={() => setShowMoreModels(!modelsExpanded)}
                             className="mt-0.5 flex w-full items-center justify-between border-t border-stone-100 px-3 py-1.5 text-left text-[11px] text-stone-400 hover:bg-stone-50 hover:text-stone-600"
                           >
-                            <span>{showMoreModels ? 'Show less' : 'More models'}</span>
-                            <span aria-hidden>{showMoreModels ? '▴' : '▾'}</span>
+                            <span>{modelsExpanded ? 'Show less' : 'More models'}</span>
+                            <span aria-hidden>{modelsExpanded ? '▴' : '▾'}</span>
                           </button>
                         ) : null}
-                      </div>
-                      <div className="border-t border-stone-100 px-3 pb-0.5 pt-1.5 text-[10px] text-stone-400">
-                        {harnessLocked
-                          ? 'This chat keeps its engine — start a new chat to switch'
-                          : !localEngines
-                            ? CHAT_HARNESS_HINTS[harness]
-                            : harness === 'claude'
-                              ? !localEngines.claude.available
-                                ? 'Install Claude Code and run `claude login` to chat on your subscription'
-                                : !localEngines.claude.loggedIn
-                                  ? 'Claude Code found — run `claude login` to chat on your subscription'
-                                  : 'Connected — runs on your Claude Code subscription on this computer'
-                              : harness === 'openai'
-                                ? !localEngines.codex.available
-                                  ? 'Install Codex (`npm i -g @openai/codex`) and run `codex login` to chat on your ChatGPT subscription'
-                                  : !localEngines.codex.loggedIn
-                                    ? 'Codex found — run `codex login` to chat on your ChatGPT subscription'
-                                    : 'Connected — runs on your ChatGPT subscription on this computer'
-                                : 'Sunny — Sundial’s cloud agent · any model'}
                       </div>
                     </div>
                   )}
@@ -1185,7 +1629,7 @@ export const ChatComposer = memo(function ChatComposer({
                 {isVoiceSupported && (
                   <button onClick={() => { toggleVoice(); }}
                     aria-label="Voice"
-                    className={`relative group/tip p-1.5 rounded-lg transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${isVoiceListening ? 'text-stone-500 bg-stone-50' : 'text-stone-400 hover:text-stone-600 hover:bg-stone-200/50'}`}>
+                    className={`relative group/tip p-1.5 rounded-lg transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${isVoiceListening ? 'bg-stone-300 text-stone-900' : 'text-stone-700 hover:text-stone-900 hover:bg-stone-300'}`}>
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z" />
                     </svg>
@@ -1193,7 +1637,7 @@ export const ChatComposer = memo(function ChatComposer({
                   </button>
                 )}
                 <button
-                  onClick={() => onAction('button', inputValue)}
+                  onClick={() => send('button')}
                   disabled={sendDisabled}
                   aria-label={sendActionTitle}
                   className={`p-1.5 rounded-full disabled:opacity-30 disabled:cursor-not-allowed ${isChatInterruptible ? 'bg-stone-200 text-stone-700 border border-stone-300 hover:bg-stone-300' : 'bg-stone-900 text-white hover:bg-stone-800'}`}>
@@ -1205,7 +1649,35 @@ export const ChatComposer = memo(function ChatComposer({
                 </button>
               </div>
             </div>
+            {watching ? (
+              // The bar is clipped by a copy of the composer's rounded rect, so
+              // its ends taper with the corners instead of looking chopped.
+              <span
+                aria-hidden
+                data-testid="composer-watch-bar"
+                className="pointer-events-none absolute inset-0 overflow-hidden rounded-xl"
+              >
+                <span className="composer-watch-bar absolute inset-x-0 bottom-0 h-[3px]" />
+              </span>
+            ) : null}
           </div>
+          </div>
+          {watching ? (
+            <div
+              data-testid="composer-comment-watch"
+              className="mt-1 flex items-center justify-center gap-1.5 text-[10px] leading-4 text-stone-400"
+            >
+              <span className="truncate">listening to comments in {commentWatchLabel}</span>
+              <button
+                type="button"
+                onClick={onClearCommentWatch}
+                aria-label="Stop watching comments"
+                className="rounded p-0.5 hover:text-stone-600"
+              >
+                <XIcon className="h-2.5 w-2.5" weight="bold" aria-hidden />
+              </button>
+            </div>
+          ) : null}
         </div>
       </div>
     </>

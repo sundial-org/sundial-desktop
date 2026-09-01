@@ -1,4 +1,4 @@
-import { getExtension, isCrdtFile } from '@/lib/sync/policy';
+import { getExtension, isCrdtFile, normalizeWorkspacePath } from '@/lib/sync/policy';
 
 export const MAX_TEXT_UPLOAD_BYTES = 10 * 1024 * 1024;
 export const MAX_FILE_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
@@ -13,6 +13,22 @@ export const MAX_ZIP_ENTRY_COUNT = 1000;
 export const MAX_ZIP_ENTRY_BYTES = 50 * 1024 * 1024;
 
 export { getExtension };
+
+/**
+ * Normalize a path read out of a zip entry, refusing anything that would escape
+ * the destination folder (zip-slip) — `../`, absolute paths, NUL bytes.
+ * Returns null when the entry must be skipped.
+ *
+ * Shared by every zip-extracting route: this is a security guard, and a second
+ * copy is how one of them silently loses the check.
+ */
+export function cleanZipPath(value: string) {
+  const normalized = normalizeWorkspacePath(value);
+  if (!normalized || normalized.includes('\0')) return null;
+  const parts = normalized.split('/').filter(Boolean);
+  if (parts.some((part) => part === '..')) return null;
+  return parts.join('/');
+}
 
 export function formatBytes(value?: number | null) {
   if (!value && value !== 0) return '';
@@ -29,6 +45,51 @@ export function formatBytes(value?: number | null) {
 
 export function sanitizeFilename(value: string) {
   return value.replace(/[\\/]/g, '-');
+}
+
+/** Sanitize a (possibly nested) upload path segment by segment, dropping
+ *  empty / `.` / `..` segments so a folder drop can never escape its target. */
+export function sanitizeUploadPath(value: string) {
+  return value
+    .split('/')
+    .map((part) => sanitizeFilename(part.trim()))
+    .filter((part) => part && part !== '.' && part !== '..')
+    .join('/');
+}
+
+// A directory dropped from the OS arrives as a bogus zero-byte `File`; reading
+// its bytes throws NotFoundError. Say what to do instead of leaking the raw
+// DOMException ("A requested file or directory could not be found…").
+export const FOLDER_UPLOAD_ERROR = "Folders can't be uploaded here. Zip the folder first.";
+
+export function describeUploadError(error: unknown) {
+  const message = error instanceof Error ? error.message : '';
+  if (
+    (typeof DOMException !== 'undefined' && error instanceof DOMException && error.name === 'NotFoundError') ||
+    /file or directory could not be found/i.test(message)
+  ) {
+    return FOLDER_UPLOAD_ERROR;
+  }
+  return message || 'Upload failed.';
+}
+
+// New-entry draft names treat `/` as a path separator (VS Code/Obsidian):
+// "notes/Meeting Notes.md" creates folder `notes` with the file inside.
+// Each segment is still sanitized; `.`/`..`/empty segments are dropped.
+// Returns the full workspace path, or null when nothing valid remains.
+export function resolveDraftPath(
+  rawName: string,
+  type: 'text' | 'folder',
+  parentPath: string | null,
+) {
+  const segments = rawName
+    .split('/')
+    .map((part) => sanitizeFilename(part.trim()))
+    .filter((part) => part && part !== '.' && part !== '..');
+  let name = segments.pop();
+  if (!name) return null;
+  if (type === 'text' && !name.includes('.')) name = `${name}.md`;
+  return [parentPath, ...segments, name].filter(Boolean).join('/');
 }
 
 export function isTextLikeUploadDescriptor(args: {

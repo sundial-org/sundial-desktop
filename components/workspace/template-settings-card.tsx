@@ -106,7 +106,7 @@ export function TemplateSettingsCard({
   }
 
   async function removeTemplate() {
-    if (!window.confirm(`Remove the ${templateName} template from this workspace? Sunny will stop following the venue's guidelines. Your files stay.`)) {
+    if (!window.confirm(`Remove the ${templateName} template from this workspace? Sundial Agent will stop following the venue's guidelines. Your files stay.`)) {
       return;
     }
     const ok = await patch({ template_slug: null });

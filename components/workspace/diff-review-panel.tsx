@@ -12,7 +12,9 @@ interface DiffReviewPanelProps {
   workspaceHref?: string | null;
   /** Workspace title for the eyebrow. */
   workspaceTitle?: string | null;
-  onClose: () => void;
+  /** Omitted when the host owns the close affordance (as a pane tab, the tab's
+   *  own × is the one way to shut it — a second X in the header is dead chrome). */
+  onClose?: () => void;
 }
 
 export function DiffReviewPanel({
@@ -76,14 +78,16 @@ export function DiffReviewPanel({
             <ArrowSquareOut className="h-3.5 w-3.5" weight="bold" />
           </a>
         ) : null}
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close review"
-          className="flex h-8 w-8 items-center justify-center rounded text-stone-500 hover:bg-stone-100 hover:text-stone-800"
-        >
-          <X weight="bold" className="h-4 w-4" />
-        </button>
+        {onClose ? (
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close review"
+            className="flex h-8 w-8 items-center justify-center rounded text-stone-500 hover:bg-stone-100 hover:text-stone-800"
+          >
+            <X weight="bold" className="h-4 w-4" />
+          </button>
+        ) : null}
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto">

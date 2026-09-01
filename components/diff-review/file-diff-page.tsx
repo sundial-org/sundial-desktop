@@ -23,7 +23,12 @@ import { OversizedFileNotice } from '@/components/workspace/diff-review/turn-edi
 import type { FilePendingTurn } from '@/lib/workspace/use-file-pending-turns';
 import type { TurnEditFile, TurnEditsResponse } from '@/lib/workspace/turn-edits';
 import { useAuth } from '@/lib/auth/optional-auth';
+import { usePathShareRealtimeAuthReady } from '@/lib/workspace/use-path-share-realtime-ready';
 import { createBrowserClient } from '@/lib/supabase/browser';
+import { withPathShareToken } from '@/lib/workspace/path-share-token-client';
+
+// Review actions must carry the sticky ?pshare= token for path-share editors.
+const pshareFetch = withPathShareToken((input, init) => fetch(input, init));
 import {
   getCachedTurnEdits,
   setCachedTurnEdits,
@@ -159,7 +164,7 @@ export function FileDiffPage({
 
   const refetch = useCallback(async () => {
     try {
-      const res = await fetch(
+      const res = await pshareFetch(
         `/api/workspace/turn-edits?assistantMessageId=${encodeURIComponent(assistantMessageId)}`,
         { cache: 'no-store' },
       );
@@ -175,7 +180,7 @@ export function FileDiffPage({
 
   const refetchLatestId = useCallback(async () => {
     try {
-      const res = await fetch(
+      const res = await pshareFetch(
         `/api/workspace/messages?chatId=${encodeURIComponent(chatId)}`,
         { cache: 'no-store' },
       );
@@ -194,9 +199,13 @@ export function FileDiffPage({
   }, [chatId]);
 
   // ── Realtime: new turn detection + chunk-decision sync from other surfaces.
+  // Clerk-only ON PURPOSE (not useAuthReady): sd_ desktop credentials carry
+  // no Supabase JWT, so this postgres_changes subscribe would join as anon
+  // and receive nothing. Desktop parity is an sd_ -> Realtime-token follow-up.
   const { isLoaded: isClerkLoaded } = useAuth();
+  const pshareRealtimeReady = usePathShareRealtimeAuthReady();
   useEffect(() => {
-    if (!isClerkLoaded) return; // ensure Realtime subscribes with the Clerk JWT
+    if (!isClerkLoaded || !pshareRealtimeReady) return; // realtime needs the Clerk or pshare JWT
     const supabase = createBrowserClient();
     if (!supabase) return;
     const channel = supabase.channel(
@@ -237,7 +246,7 @@ export function FileDiffPage({
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [chatId, assistantMessageId, refetch, isClerkLoaded]);
+  }, [chatId, assistantMessageId, refetch, isClerkLoaded, pshareRealtimeReady]);
 
   // Visibility-gated polling fallback. Catches Realtime disconnects, tab
   // restores, offline → online transitions.
@@ -279,7 +288,7 @@ export function FileDiffPage({
       // status === 'pending'. We mark it 'kept' before the server call.
       updateChunkStatus(filePath, chunkId, 'kept');
       const tryRequest = async () => {
-        const res = await fetch('/api/workspace/turn-edits/keep-chunk', {
+        const res = await pshareFetch('/api/workspace/turn-edits/keep-chunk', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -316,7 +325,7 @@ export function FileDiffPage({
       const undoKey = `${turnAssistantMessageId}:${filePath}:${chunkId}`;
       setActiveUndoKey(undoKey);
       try {
-        const res = await fetch('/api/workspace/turn-edits/undo-chunk', {
+        const res = await pshareFetch('/api/workspace/turn-edits/undo-chunk', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -329,7 +338,7 @@ export function FileDiffPage({
           // Stale — file changed since the turn. Refetch to get the truth.
           await refetch();
           setToast({
-            msg: 'This change is stale — the file changed since the turn.',
+            msg: 'This change is stale. The file changed since the turn.',
           });
           return;
         }
@@ -594,7 +603,7 @@ function EmptyState({
             : undone > 0 && kept === 0
               ? `undone (${undone})`
               : kept > 0 && undone > 0
-                ? `decided — ${kept} kept · ${undone} undone`
+                ? `decided: ${kept} kept · ${undone} undone`
                 : 'reviewed'
         }.`;
   return (

@@ -24,11 +24,19 @@ export type LinkedRepoSummary = {
   lastAction: string | null;
   lastActionStatus: string | null;
   connectedByUserId: string;
+  mode: 'manual' | 'auto';
+  bridgeState: {
+    conflict: { paths: string[]; at: string } | null;
+    lastError: string | null;
+    updatedAt: string | null;
+    joinLink?: string | null;
+    transport?: string | null;
+  } | null;
 };
 
 type Response = { repositories: LinkedRepoSummary[] };
 
-export function useLinkedRepos(projectId: string, refreshKey: number = 0) {
+export function useLinkedRepos(projectId: string, refreshKey: number = 0, enabled: boolean = true) {
   const [repos, setRepos] = useState<LinkedRepoSummary[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -53,8 +61,9 @@ export function useLinkedRepos(projectId: string, refreshKey: number = 0) {
   }, [projectId]);
 
   useEffect(() => {
+    if (!enabled) return;
     void refetch();
-  }, [refetch, refreshKey]);
+  }, [enabled, refetch, refreshKey]);
 
   const repoByImportedPath = useMemo(() => {
     const map = new Map<string, LinkedRepoSummary>();
@@ -74,7 +83,9 @@ export function useLinkedRepos(projectId: string, refreshKey: number = 0) {
         if (idx === -1) break;
         cursor = cursor.slice(0, idx);
       }
-      return null;
+      // A root-level import (importedPath '', e.g. a flattened Overleaf live
+      // workspace) owns every path the walk above didn't claim.
+      return repoByImportedPath.get('') ?? null;
     },
     [repoByImportedPath],
   );

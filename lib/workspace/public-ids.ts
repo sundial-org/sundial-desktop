@@ -13,6 +13,10 @@ export type WorkspaceRouteInput =
       id: string;
       public_id?: string | null;
       publicId?: string | null;
+      /** A local (desktop sidecar) project: it renders the workspace page
+       *  under `/local/<id>`, and its id names no cloud workspace at all.
+       *  buildWorkspacePath routes on this — see the note there. */
+      local?: boolean;
     };
 
 function encodeBase62(value: bigint) {

@@ -15,6 +15,15 @@
  */
 import type { WorkspaceFileRow } from '@/lib/workspace/types';
 import * as tus from 'tus-js-client';
+import {
+  currentPathShareToken,
+  withPathShareToken,
+} from '@/lib/workspace/path-share-token-client';
+import { PATH_SHARE_TOKEN_HEADER } from '@/lib/workspace/path-grants';
+
+// Path-share editors' only credential is the sticky ?pshare= token — forward
+// it on every upload-rail call (precheck / TUS bytes / finalize).
+const pshareFetch = withPathShareToken((input, init) => fetch(input, init));
 
 export type DirectUploadProgress = (fractionUploaded: number) => void;
 
@@ -52,6 +61,11 @@ async function tusUpload(args: {
       uploadDataDuringCreation: true,
       retryDelays: [0, 1000, 3000, 5000, 10000],
       removeFingerprintOnSuccess: true,
+      headers: {
+        ...(currentPathShareToken()
+          ? { [PATH_SHARE_TOKEN_HEADER]: currentPathShareToken()! }
+          : {}),
+      },
       metadata: {
         projectId: args.projectId,
         sha: args.sha,
@@ -73,7 +87,7 @@ export async function finalizeDirectUpload(args: {
   sha: string;
   mime?: string | null;
 }): Promise<WorkspaceFileRow> {
-  const res = await fetch('/api/workspace/uploads/finalize', {
+  const res = await pshareFetch('/api/workspace/uploads/finalize', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(args),
@@ -87,7 +101,7 @@ export async function finalizeDirectUpload(args: {
 }
 
 async function precheckBlob(args: { projectId: string; sha: string }): Promise<boolean> {
-  const res = await fetch('/api/workspace/uploads/precheck', {
+  const res = await pshareFetch('/api/workspace/uploads/precheck', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(args),

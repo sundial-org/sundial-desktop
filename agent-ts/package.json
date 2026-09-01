@@ -17,6 +17,8 @@
     "@ai-sdk/gateway": "^3.0.148",
     "@ai-sdk/google": "^3.0.91",
     "@ai-sdk/openai": "^3.0.84",
+    "@ai-sdk/openai-compatible": "2.0.64",
+    "@ai-sdk/provider": "^3.0.14",
     "@anthropic-ai/claude-agent-sdk": "^0.3.185",
     "@composio/core": "^0.10.0",
     "@composio/vercel": "^0.9.2",

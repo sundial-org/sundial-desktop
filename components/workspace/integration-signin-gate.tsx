@@ -23,7 +23,7 @@ export function IntegrationSignInGate({
       <SignInIcon className="mx-auto h-8 w-8 text-stone-400" weight="bold" aria-hidden />
       <p className="mt-3 text-sm font-medium text-stone-800">Sign in to connect {provider}</p>
       <p className="mt-1 text-xs text-stone-500">
-        Sign in to Sundial first — you can link {provider} right after.
+        Sign in to Sundial first. You can link {provider} right after.
       </p>
       <button
         type="button"

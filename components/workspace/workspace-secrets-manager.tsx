@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { useUser, SignInButton } from '@/lib/auth/optional-auth';
+import { SignInButton } from '@/lib/auth/optional-auth';
+import { useHybridAuth } from '@/lib/auth/use-auth-ready';
 import {
   EyeIcon as PhEyeIcon,
   EyeSlashIcon,
@@ -123,7 +124,9 @@ export function WorkspaceSecretsManager({
   // the API rejects them and the cipher would have no identity to attach to.
   // Surface a clear "sign in" CTA instead of a broken form. Hooks are
   // called unconditionally above the return below to satisfy rules-of-hooks.
-  const { isSignedIn, isLoaded: userLoaded } = useUser();
+  // Hybrid (Clerk OR sd_ desktop credentials) — the secrets API accepts sd_
+  // bearers, so a signed-in desktop user must not see the sign-in CTA.
+  const { signedIn: isSignedIn, ready: userLoaded } = useHybridAuth();
 
   const [secrets, setSecrets] = useState<WorkspaceSecret[]>(sortSecrets(initialSecrets));
   const [secretsLoading, setSecretsLoading] = useState(initialSecrets.length === 0);
@@ -466,7 +469,7 @@ export function WorkspaceSecretsManager({
         ) : secrets.length === 0 ? (
           <div className="flex flex-col items-center rounded-2xl border border-dashed border-stone-200 bg-stone-50 px-3 py-9 text-center">
             <span className="text-[15px] font-medium text-stone-600">{emptyStateLabel}</span>
-            <span className="mt-1 text-[13px] text-stone-400">Sunny will keep them safe.</span>
+            <span className="mt-1 text-[13px] text-stone-400">Sundial Agent will keep them safe.</span>
             <SunnyMascot variant="laptop" className="mt-3 h-44 w-56" />
           </div>
         ) : (

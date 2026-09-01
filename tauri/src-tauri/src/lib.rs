@@ -328,7 +328,7 @@ fn spawn_sidecar_monitor(app: tauri::AppHandle, port: u16, token: String, remote
 /// (fragments never reach the remote origin). Shared by the File ▸ Open
 /// Folder… menu item and the web app's "Open a folder…" marker navigation.
 fn open_folder_flow(app: tauri::AppHandle, dest: url::Url) {
-    app.clone().dialog().file().pick_folder(move |folder| {
+    pick_folder(app.clone(), move |app, folder| {
         let Some(folder) = folder else { return };
         let Some(window) = app.get_webview_window("main") else { return };
         let sidecar = app.state::<Sidecar>();
@@ -358,12 +358,57 @@ fn open_folder_flow(app: tauri::AppHandle, dest: url::Url) {
     });
 }
 
+/// The native folder picker lives outside the DOM, so the launcher's
+/// auto-update can't see it. While this is set the shell neither announces
+/// an update nor accepts a relaunch marker (a relaunch would close the picker
+/// and drop the choice). It stays set through the handoff of a chosen folder
+/// — the page marks itself busy only once it has the open in hand — and
+/// clears at once on cancel.
+static PICKER_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const OPEN_HANDOFF: Duration = Duration::from_secs(5);
+
+fn pick_folder(
+    app: tauri::AppHandle,
+    done: impl FnOnce(&tauri::AppHandle, Option<tauri_plugin_dialog::FilePath>) + Send + 'static,
+) {
+    PICKER_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    app.clone().dialog().file().pick_folder(move |folder| {
+        let chosen = folder.is_some();
+        done(&app, folder);
+        if !chosen {
+            PICKER_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+            announce_pending_update(&app, false);
+            return;
+        }
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(OPEN_HANDOFF).await;
+            PICKER_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+            announce_pending_update(&app, false);
+        });
+    });
+}
+
+/// Re-announce a staged update; `after_open_handoff` defers it past the
+/// window in which a just-picked folder is still travelling to the page.
+fn announce_pending_update(app: &tauri::AppHandle, after_open_handoff: bool) {
+    let Some(version) = pending_update_version(app) else { return };
+    if !after_open_handoff {
+        notify_update_ready(app, &version);
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(OPEN_HANDOFF).await;
+        notify_update_ready(&app, &version);
+    });
+}
+
 /// Native folder picker for a dialog's Location field: return the choice in
 /// the URL fragment (`pickedPath`) of the CURRENT page — a same-document
 /// navigation the open dialog picks up via its hashchange listener. Unlike
 /// open_folder_flow this must not leave the page (a dialog is open on it).
 fn pick_location_flow(app: tauri::AppHandle) {
-    app.clone().dialog().file().pick_folder(move |folder| {
+    pick_folder(app, move |app, folder| {
         let Some(folder) = folder else { return };
         let Some(window) = app.get_webview_window("main") else { return };
         let Ok(mut url) = window.url() else { return };
@@ -404,19 +449,60 @@ fn kill_sidecar(app: &tauri::AppHandle) {
 // The shell checks /api/desktop/update in the background, downloads the
 // update, and announces readiness to the webview (which owns the toast UI —
 // the shell has no UI surface of its own). Installing waits for the user's
-// "Relaunch": the /desktop/relaunch-update marker navigation.
+// "Relaunch" (the /desktop/relaunch-update marker navigation) or, failing
+// that, happens on quit so the next launch is current.
 
 struct PendingUpdate(Mutex<Option<(tauri_plugin_updater::Update, Vec<u8>)>>);
 
+/// True while `update.install` runs on its worker thread: a user quit then
+/// would kill the process mid-bundle-swap, so the run loop holds the exit
+/// until the install finishes (its own restart passes `code: Some`).
+static INSTALLING_UPDATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A version the user was offered by the native Check for Updates dialog:
+/// its Relaunch/Later choice is theirs, so announcements for it are marked
+/// `manual` and the launcher never applies it by itself.
+static MANUAL_UPDATE: Mutex<Option<String>> = Mutex::new(None);
+
+// {:?} JSON-escapes the version string for the JS literal.
+fn update_ready_js(version: &str, manual: bool) -> String {
+    format!(
+        "window.__SUNDIAL_UPDATE_READY={v:?};window.__SUNDIAL_UPDATE_MANUAL={m};window.dispatchEvent(new CustomEvent('sundial:update-ready',{{detail:{{version:{v:?},manual:{m}}}}}));",
+        v = version,
+        m = manual
+    )
+}
+
 fn notify_update_ready(app: &tauri::AppHandle, version: &str) {
-    if let Some(window) = app.get_webview_window("main") {
-        // {:?} JSON-escapes the version string for the JS literal.
-        let js = format!(
-            "window.__SUNDIAL_UPDATE_READY={v:?};window.dispatchEvent(new CustomEvent('sundial:update-ready',{{detail:{{version:{v:?}}}}}));",
-            v = version
-        );
-        let _ = window.eval(&js);
+    if PICKER_OPEN.load(std::sync::atomic::Ordering::SeqCst) {
+        return; // pick_folder re-announces when the picker returns
     }
+    let manual = MANUAL_UPDATE.lock().unwrap().as_deref() == Some(version);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.eval(&update_ready_js(version, manual));
+    }
+}
+
+/// Interactive offer: the native dialog decides, and the launcher's
+/// automatic install stands down for this version from here on.
+fn offer_update_dialog(app: &tauri::AppHandle, version: &str) {
+    *MANUAL_UPDATE.lock().unwrap() = Some(version.to_string());
+    notify_update_ready(app, version);
+    let handle = app.clone();
+    app.dialog()
+        .message(format!("Sundial {version} is downloaded and ready."))
+        .buttons(MessageDialogButtons::OkCancelCustom("Relaunch".into(), "Later".into()))
+        .show(move |relaunch| {
+            if relaunch {
+                install_pending_update(&handle);
+            }
+        });
+}
+
+fn pending_update_version(app: &tauri::AppHandle) -> Option<String> {
+    let pending = app.state::<PendingUpdate>();
+    let guard = pending.0.lock().unwrap();
+    guard.as_ref().map(|(update, _)| update.version.clone())
 }
 
 /// Check + download. `interactive` (the menu item) also reports "up to date"
@@ -429,23 +515,11 @@ async fn check_for_update(app: tauri::AppHandle, interactive: bool) {
         return;
     }
     // Already downloaded and waiting — just re-announce.
-    let pending_version = {
-        let pending = app.state::<PendingUpdate>();
-        let guard = pending.0.lock().unwrap();
-        guard.as_ref().map(|(update, _)| update.version.clone())
-    };
-    if let Some(version) = pending_version {
-        notify_update_ready(&app, &version);
+    if let Some(version) = pending_update_version(&app) {
         if interactive {
-            let handle = app.clone();
-            app.dialog()
-                .message(format!("Sundial {version} is downloaded and ready."))
-                .buttons(MessageDialogButtons::OkCancelCustom("Relaunch".into(), "Later".into()))
-                .show(move |relaunch| {
-                    if relaunch {
-                        install_pending_update(&handle);
-                    }
-                });
+            offer_update_dialog(&app, &version);
+        } else {
+            notify_update_ready(&app, &version);
         }
         return;
     }
@@ -463,17 +537,10 @@ async fn check_for_update(app: tauri::AppHandle, interactive: bool) {
             match update.download(|_, _| {}, || {}).await {
                 Ok(bytes) => {
                     *app.state::<PendingUpdate>().0.lock().unwrap() = Some((update, bytes));
-                    notify_update_ready(&app, &version);
                     if interactive {
-                        let handle = app.clone();
-                        app.dialog()
-                            .message(format!("Sundial {version} is downloaded and ready."))
-                            .buttons(MessageDialogButtons::OkCancelCustom("Relaunch".into(), "Later".into()))
-                            .show(move |relaunch| {
-                                if relaunch {
-                                    install_pending_update(&handle);
-                                }
-                            });
+                        offer_update_dialog(&app, &version);
+                    } else {
+                        notify_update_ready(&app, &version);
                     }
                 }
                 Err(error) => eprintln!("[sundial] update download failed: {error}"),
@@ -496,15 +563,38 @@ async fn check_for_update(app: tauri::AppHandle, interactive: bool) {
 }
 
 fn install_pending_update(app: &tauri::AppHandle) {
+    // Own thread: callers are webview/dialog callbacks, and this path blocks
+    // (kill_sidecar waits up to 2s, install extracts the bundle) — run inline
+    // it freezes the UI and the toast's "Relaunching…" state never paints.
+    // Guard up BEFORE the pending slot is taken: a quit during kill_sidecar's
+    // wait would otherwise find both empty and false and exit under the install.
     let taken = app.state::<PendingUpdate>().0.lock().unwrap().take();
     let Some((update, bytes)) = taken else { return };
-    // Release the sidecar's port and flush persists before the bundle swap.
-    kill_sidecar(app);
-    if let Err(error) = update.install(bytes) {
-        eprintln!("[sundial] update install failed: {error}");
-        return;
-    }
-    app.restart();
+    INSTALLING_UPDATE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // The sidecar must die BEFORE install: it flushes persists, frees the
+        // port for the relaunch, and on Windows install() replaces the exe
+        // and exits the process without ever returning.
+        kill_sidecar(&app);
+        let installed = update.install(&bytes);
+        INSTALLING_UPDATE.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Err(error) = installed {
+            // The webview is SERVED by the sidecar just killed — without
+            // recovery the app is a dead page. Restart the (still current)
+            // app: fresh sidecar, and the background check re-offers the
+            // update. Restart on dismiss, not before, so the dialog is seen.
+            eprintln!("[sundial] update install failed: {error}");
+            let handle = app.clone();
+            app.dialog()
+                .message(format!(
+                    "Couldn't install the update: {error}\n\nSundial will restart on the current version."
+                ))
+                .show(move |_| handle.restart());
+            return;
+        }
+        app.restart();
+    });
 }
 
 /// App menu ▸ Uninstall Sundial…: remove the app's own data (never the user's
@@ -765,7 +855,10 @@ pub fn run() {
             let remote_domain = app_host(&remote);
             let builder =
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::External(parsed.clone()))
-                    .title("Sundial")
+                    // Dev: parallel agent-run instances override the title so
+                    // windows are distinguishable (pairs with a --config
+                    // identifier/productName overlay for full isolation).
+                    .title(std::env::var("SUNDIAL_WINDOW_TITLE").unwrap_or_else(|_| "Sundial".into()))
                     .inner_size(1400.0, 900.0)
                     .min_inner_size(800.0, 600.0)
                     // Tauri's own drag-drop handler swallows OS file drops
@@ -796,6 +889,15 @@ pub fn run() {
                             return false;
                         }
                         if is_marker(url, &app_scheme, &app_domain, "/desktop/relaunch-update") {
+                            // A native picker is open (outside the DOM, so
+                            // the page couldn't see it): decline — the toast
+                            // drops back to its manual Relaunch.
+                            if PICKER_OPEN.load(std::sync::atomic::Ordering::SeqCst) {
+                                if let Some(window) = nav_handle.get_webview_window("main") {
+                                    let _ = window.eval("window.dispatchEvent(new CustomEvent('sundial:update-deferred'));");
+                                }
+                                return false;
+                            }
                             install_pending_update(&nav_handle);
                             return false;
                         }
@@ -811,6 +913,18 @@ pub fn run() {
                             return false;
                         }
                         true
+                    })
+                    // The update-ready announcement is a one-shot eval — a hard
+                    // navigation or reload wipes it and the toast stays gone
+                    // until the next hourly check. Re-announce on every load.
+                    // (deferred when the load carries a picked folder — the
+                    // page must take that open over before the launcher's
+                    // auto-update may see the announcement.)
+                    .on_page_load(|window, payload| {
+                        if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                            let handoff = payload.url().fragment().is_some_and(|f| f.contains("openPath="));
+                            announce_pending_update(window.app_handle(), handoff);
+                        }
                     });
             #[cfg(target_os = "macos")]
             let builder = builder
@@ -858,10 +972,20 @@ pub fn run() {
             let open_folder = MenuItemBuilder::with_id("open-folder", "Open Folder…")
                 .accelerator("CmdOrCtrl+O")
                 .build(app)?;
+            // Cmd+W closes the active tab in the web UI, not the window —
+            // Close Window moves to Shift+Cmd+W (standard macOS tabbed-app
+            // convention).
+            let close_tab = MenuItemBuilder::with_id("close-tab", "Close Tab")
+                .accelerator("CmdOrCtrl+W")
+                .build(app)?;
+            let close_window = MenuItemBuilder::with_id("close-window", "Close Window")
+                .accelerator("Shift+CmdOrCtrl+W")
+                .build(app)?;
             let file_menu = SubmenuBuilder::new(app, "File")
                 .item(&open_folder)
                 .separator()
-                .close_window()
+                .item(&close_tab)
+                .item(&close_window)
                 .build()?;
             let edit_menu = SubmenuBuilder::new(app, "Edit")
                 .undo()
@@ -913,6 +1037,16 @@ pub fn run() {
             app.on_menu_event(move |app, event| {
                 if event.id() == "open-folder" {
                     open_folder_flow(app.clone(), dest.clone());
+                } else if event.id() == "close-tab" {
+                    // Pages without a listener ignore the event, so Cmd+W is a
+                    // no-op outside the workspace UI rather than closing the app.
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.eval("window.dispatchEvent(new CustomEvent('sundial:close-tab'))");
+                    }
+                } else if event.id() == "close-window" {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.close();
+                    }
                 } else if event.id() == "reload" {
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.eval("location.reload()");
@@ -932,9 +1066,11 @@ pub fn run() {
             if !cfg!(debug_assertions) {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    // First check shortly after boot (let the window settle),
-                    // then hourly.
-                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    // First check right after boot — an update the user needs
+                    // should surface immediately, and the ready toast is
+                    // re-announced on every page load so checking before the
+                    // webview settles loses nothing. Then hourly.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     loop {
                         check_for_update(handle.clone(), false).await;
                         tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -946,10 +1082,41 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    app.run(|app, event| {
-        if let RunEvent::Exit = event {
-            kill_sidecar(app);
+    app.run(|app, event| match event {
+        // `code: None` is user interaction (Cmd+Q, window close) — never the
+        // install thread's own restart/exit, which passes a code.
+        RunEvent::ExitRequested { code: None, api, .. } => {
+            if INSTALLING_UPDATE.load(std::sync::atomic::Ordering::SeqCst) {
+                api.prevent_exit();
+                return;
+            }
+            // A downloaded update the user never relaunched into installs on
+            // the way out, so the next launch is current. Without this an
+            // install could sit on an old build across every restart (seen:
+            // 0.1.3 still running a month after 0.1.10 shipped, its month-old
+            // sidecar failing chats under today's UI). Off the event loop: on
+            // macOS an install that needs admin authorization queues its
+            // prompt onto the main thread, which this callback is holding.
+            // Best effort: a failure just leaves the current build in place.
+            let taken = app.state::<PendingUpdate>().0.lock().unwrap().take();
+            let Some((update, bytes)) = taken else { return };
+            api.prevent_exit();
+            // Guard up BEFORE the worker starts: a second Cmd+Q during
+            // kill_sidecar's wait would otherwise find the pending slot empty
+            // and let the process exit under the install.
+            INSTALLING_UPDATE.store(true, std::sync::atomic::Ordering::SeqCst);
+            let handle = app.clone();
+            std::thread::spawn(move || {
+                kill_sidecar(&handle);
+                if let Err(error) = update.install(&bytes) {
+                    eprintln!("[sundial] update install on quit failed: {error}");
+                }
+                INSTALLING_UPDATE.store(false, std::sync::atomic::Ordering::SeqCst);
+                handle.exit(0);
+            });
         }
+        RunEvent::Exit => kill_sidecar(app),
+        _ => {}
     });
 }
 
@@ -1129,6 +1296,20 @@ mod tests {
         assert!(!constant_time_eq("abc123", "abc124"));
         assert!(!constant_time_eq("abc", "abc123"));
         assert!(!constant_time_eq("", "abc"));
+    }
+
+    #[test]
+    fn update_ready_js_escapes_for_js_literal() {
+        use super::update_ready_js;
+        assert_eq!(
+            update_ready_js("0.2.0", false),
+            "window.__SUNDIAL_UPDATE_READY=\"0.2.0\";window.__SUNDIAL_UPDATE_MANUAL=false;window.dispatchEvent(new CustomEvent('sundial:update-ready',{detail:{version:\"0.2.0\",manual:false}}));"
+        );
+        assert!(update_ready_js("0.2.0", true).contains("manual:true"));
+        // A hostile version string from the update manifest must not escape
+        // the JS string literal.
+        let js = update_ready_js("1.0\";alert(1);//\\", false);
+        assert!(js.contains("\"1.0\\\";alert(1);//\\\\\""));
     }
 
     #[test]

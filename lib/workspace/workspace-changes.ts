@@ -110,8 +110,10 @@ export type ChangeEntry = {
   docEditId: number;
   /** `turn` = a Sunny chat turn; `run` = a local-agent / human suggestion run
    *  (reviewable); `session` = a local-agent / human *applied* edit session
-   *  (already-landed direct edits, grouped by author + time window; read-only). */
-  kind: 'turn' | 'run' | 'session';
+   *  (already-landed direct edits, grouped by author + time window; read-only);
+   *  `comment` = a comment created/resolved/reopened (from `comment.*`
+   *  activity events, anchored to the doc state at write time; read-only). */
+  kind: 'turn' | 'run' | 'session' | 'comment';
   author: ChangeAuthor;
   /** Chat the turn belongs to (null for runs — they have no thread). */
   chatId: string | null;
@@ -137,6 +139,13 @@ export type ChangeEntry = {
    *  cursor re-derives under a different id — this span lets the client drop
    *  that partial duplicate. */
   firstRowId?: number;
+  /** Comment entries only: what happened and what was said. */
+  comment?: {
+    threadId: string;
+    event: 'created' | 'resolved' | 'reopened';
+    body: string | null;
+    quote: string | null;
+  };
 };
 
 export type WorkspaceChangesResponse = {
@@ -155,7 +164,16 @@ export type WorkspaceChangesResponse = {
    *  returned). Pass it back as `beforeId` to fetch the next-older page —
    *  only `doc_edits` rows with `id` strictly below it are scanned. */
   nextBeforeId?: number | null;
+  /** Opaque change fingerprint for the poll short-circuit: pass it back as
+   *  `ifUnchanged=` and the route answers `{unchanged: true}` without running
+   *  the index pipeline when nothing relevant changed. Absent for scoped
+   *  (path-share) responses and older payloads. */
+  pollToken?: string | null;
 };
+
+/** Poll answer when the fingerprint matched: nothing changed since the page
+ *  the client already holds. */
+export type WorkspaceChangesUnchanged = { unchanged: true; pollToken: string };
 
 export function summarizeRunPreview(filePaths: string[]): string {
   if (filePaths.length === 0) return 'Suggested edit';
@@ -170,13 +188,15 @@ export function summarizeSessionPreview(filePaths: string[], editCount: number):
   return `${edits} ${name}`;
 }
 
-/** Label for an applied session that accepted a suggestion: who proposed it. */
+/** Label for an applied session that resolved a suggestion: the decision verb
+ *  plus who proposed it. */
 export function summarizeAcceptedPreview(accepted: AcceptedSuggestion): string {
-  return `Accepted ${accepted.name}'s suggestion`;
+  const verb = accepted.decision === 'rejected' ? 'Rejected' : 'Accepted';
+  return `${verb} ${accepted.name}'s suggestion`;
 }
 
 /**
- * Display name for a `doc_edits` author: 'Sunny' for the agent, the brand label
+ * Display name for a `doc_edits` author: 'Sundial Agent' for the agent, the brand label
  * for a local agent, else the Clerk-resolved name (caller passes it in) or a
  * generic fallback. Single source for both the changes index and the
  * applied-edit detail so the two surfaces never show a different name.
@@ -186,7 +206,7 @@ export function authorDisplayName(
   id: string | null,
   resolvedName?: string | null,
 ): string {
-  if (kind === 'sunny') return 'Sunny';
+  if (kind === 'sunny') return 'Sundial Agent';
   if (kind === 'local_agent') return brandForAgentId(id).displayName;
   return resolvedName || 'Someone';
 }

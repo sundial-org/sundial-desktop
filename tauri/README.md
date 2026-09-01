@@ -34,7 +34,7 @@ Requires Rust (`cargo`, `rustc`) and platform-native webview deps:
 The shell spawns `local-server/` (local folders as projects) at boot. `scripts/prepare-sidecar.mjs` — run automatically by the `tauri dev`/`tauri build` hooks — makes packaged builds self-contained:
 
 - esbuild-bundles the sidecar and all its cross-repo imports into one file under `src-tauri/resources/` (inlining `lib/sync/policy.json`), so installed apps need no repo checkout, no node_modules, and no Node ≥ 23 type stripping.
-- downloads the pinned official Node runtime into `src-tauri/binaries/` for Tauri's `externalBin` (dev builds just copy the host's Node to satisfy the build check).
+- downloads the pinned official Node runtime and the pinned tectonic release into `src-tauri/binaries/` for Tauri's `externalBin` (dev builds just copy the host's Node/tectonic to satisfy the build check). The sidecar probes the shipped `tectonic` first, so local LaTeX compiles on a fresh Mac with nothing installed.
 
 Resolution order at runtime (`lib.rs`): `SUNDIAL_SIDECAR_DIR` override → live repo checkout (debug builds) → bundled resources + shipped Node. Both directories are generated — run `node scripts/prepare-sidecar.mjs --dev` once before a bare `cargo build`/`cargo test`.
 
@@ -46,9 +46,17 @@ Updater artifacts are minisign-signed. `createUpdaterArtifacts` is on, so **`pnp
 
 ```bash
 export TAURI_SIGNING_PRIVATE_KEY=$HOME/.tauri/sundial-updater.key   # accepts contents or a path; keep this file safe — losing it orphans installed apps
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""   # key has no password; without this, non-interactive builds die prompting for one after the bundles are done
+export APPLE_SIGNING_IDENTITY="Developer ID Application: Long Horizon Research, Inc. (8KBD332MV9)"
+source ~/.config/sundial-signing.env       # org Apple ID + app-specific password + team id → Tauri auto-notarizes the .app
 cd tauri && pnpm build
+xcrun notarytool submit src-tauri/target/release/bundle/dmg/Sundial_*.dmg --keychain-profile lhr-notary --wait && xcrun stapler staple src-tauri/target/release/bundle/dmg/Sundial_*.dmg
 node ../scripts/desktop-release.mjs        # uploads artifacts + latest.json to the desktop-releases bucket (prod Supabase)
 ```
+
+If the updater-signature step still prompted and failed, sign the tarball manually — `env -u TAURI_SIGNING_PRIVATE_KEY pnpm tauri signer sign -f $HOME/.tauri/sundial-updater.key -p "" src-tauri/target/release/bundle/macos/Sundial.app.tar.gz` (`-f` and the env var are mutually exclusive) — then run the release script.
+
+Release builds must be signed as **Long Horizon Research, Inc. (8KBD332MV9)** — never the personal "Florent Tavernier (Q6323QWRP9)" cert, which is a legacy fallback only.
 
 The matching public key lives in `tauri.conf.json` (`plugins.updater.pubkey`). The update manifest and the `/download` page both read `latest.json` from the public `desktop-releases` Supabase Storage bucket — publishing a release never needs a web redeploy.
 

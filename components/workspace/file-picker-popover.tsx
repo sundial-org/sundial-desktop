@@ -128,7 +128,7 @@ export function FilePickerPopover({
   return (
     <div
       role="listbox"
-      className={`${positionClass} max-w-[calc(100vw-1rem)] overflow-hidden rounded-xl border border-[#dadce0] bg-white p-1.5 shadow-[0_1px_2px_rgba(60,64,67,0.3),0_2px_6px_2px_rgba(60,64,67,0.15)] ${positionMode === 'inline' ? '' : 'w-80'} ${className}`}
+      className={`${positionClass} max-w-[calc(100vw-1rem)] overflow-hidden rounded-xl border border-stone-200 bg-white p-1.5 shadow-[0_1px_2px_rgba(60,64,67,0.3),0_2px_6px_2px_rgba(60,64,67,0.15)] ${positionMode === 'inline' ? '' : 'w-80'} ${className}`}
       style={positionStyle}
       onMouseDown={(event) => {
         const target = event.target as HTMLElement | null;
@@ -137,7 +137,7 @@ export function FilePickerPopover({
       }}
     >
       {header ? (
-        <div className="px-3 pb-1 pt-1 text-[10px] font-medium uppercase tracking-wide text-[#5f6368]">
+        <div className="px-3 pb-1 pt-1 text-[10px] font-medium uppercase tracking-wide text-stone-500">
           {header}
         </div>
       ) : null}
@@ -146,7 +146,7 @@ export function FilePickerPopover({
         className="max-h-[260px] overflow-y-auto overscroll-contain"
       >
         {items.length === 0 ? (
-          <div className="px-3 py-2 text-[13px] text-[#5f6368]">{emptyLabel}</div>
+          <div className="px-3 py-2 text-[13px] text-stone-500">{emptyLabel}</div>
         ) : (
           items.map((item, index) => {
             const active = index === highlightedIndex;
@@ -159,7 +159,7 @@ export function FilePickerPopover({
                 aria-selected={active}
                 className={[
                   'flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm transition-colors',
-                  active ? 'bg-[#f1f3f4] text-[#202124]' : 'text-[#202124] hover:bg-[#f1f3f4]',
+                  active ? 'bg-stone-100 text-stone-800' : 'text-stone-800 hover:bg-stone-100',
                 ].join(' ')}
                 onMouseEnter={() => onHighlight(index)}
                 onMouseDown={(event) => {
@@ -167,10 +167,10 @@ export function FilePickerPopover({
                   onPick(item);
                 }}
               >
-                <FileTextIcon className="h-4 w-4 shrink-0 text-[#5f6368]" weight="regular" aria-hidden />
+                <FileTextIcon className="h-4 w-4 shrink-0 text-stone-500" weight="regular" aria-hidden />
                 <span className="min-w-0 flex-1 truncate">{primary}</span>
                 {item.secondary ? (
-                  <span className="min-w-0 shrink truncate text-[11px] text-[#5f6368]">
+                  <span className="min-w-0 shrink truncate text-[11px] text-stone-500">
                     {item.secondary}
                   </span>
                 ) : null}

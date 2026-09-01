@@ -76,18 +76,19 @@ function LineCountBadge({ added, deleted }: { added: number; deleted: number }) 
   );
 }
 
-// Whole-turn accept/reject as a ✓/✕ box — the same small bordered control the
-// editor's suggestion review uses, so the chat card and the doc read as one
-// system (replaces the old "Undo all · Keep all" text links).
-function IconAction({
-  glyph,
+// Whole-turn accept/reject as quiet WORD links ("Keep" / "Undo") — no boxed
+// icon buttons, no red/green chrome (2026-08-01 feedback; word labels over
+// icons per standing preference). The aria-labels keep the descriptive names
+// ("Keep all", "Reject file"…) so tooling and tests stay stable.
+function ReviewAction({
+  word,
   title,
   onClick,
   disabled,
   loading,
   variant,
 }: {
-  glyph: string;
+  word: string;
   title: string;
   onClick: () => void;
   disabled?: boolean;
@@ -101,16 +102,16 @@ function IconAction({
       disabled={disabled || loading}
       title={title}
       aria-label={title}
-      className={`inline-flex h-[18px] w-[18px] items-center justify-center rounded-md border bg-white text-[11px] leading-none transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+      className={`shrink-0 text-[12px] transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
         variant === 'accept'
-          ? 'border-[var(--diff-add-border)] text-[var(--diff-add-text)] hover:bg-[var(--diff-add-bg)]'
-          : 'border-[var(--diff-del-border)] text-[var(--diff-del-text)] hover:bg-[var(--diff-del-bg)]'
+          ? 'text-emerald-700 hover:text-emerald-900'
+          : 'text-stone-500 hover:text-stone-800'
       }`}
     >
       {loading ? (
         <span className="inline-block h-2.5 w-2.5 animate-spin rounded-full border border-current border-t-transparent opacity-60" />
       ) : (
-        glyph
+        word
       )}
     </button>
   );
@@ -119,9 +120,7 @@ function IconAction({
 function FileStatusPill({ file }: { file: TurnEditFile }) {
   if (file.isDeleted) {
     return (
-      <span className="rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-[10px] font-medium text-red-700">
-        Deleted
-      </span>
+      <span className="shrink-0 text-[11px] text-stone-400">Deleted</span>
     );
   }
   return null;
@@ -198,8 +197,8 @@ function FileBlock({
       </div>
       {actionable && pending > 0 && firstPending ? (
         <div className="ml-auto flex shrink-0 items-center gap-1" onClick={(e) => e.stopPropagation()}>
-          <IconAction glyph="✕" title="Reject file" onClick={() => onUndoChunk(file.filePath, firstPending)} loading={fileUndoActive} variant="reject" />
-          <IconAction glyph="✓" title="Keep file" onClick={() => onKeepChunk(file.filePath, firstPending)} disabled={fileUndoActive} variant="accept" />
+          <ReviewAction word="Undo" title="Reject file" onClick={() => onUndoChunk(file.filePath, firstPending)} loading={fileUndoActive} variant="reject" />
+          <ReviewAction word="Keep" title="Keep file" onClick={() => onKeepChunk(file.filePath, firstPending)} disabled={fileUndoActive} variant="accept" />
         </div>
       ) : null}
     </div>
@@ -317,9 +316,12 @@ export function InlineTurnReview({
   };
 
   return (
+    // Flat, quiet line — no card chrome on the collapsed row (2026-08-01
+    // feedback: the boxed card + circled icon buttons read as clutter). The
+    // expanded diff body below gets its own bordered container.
     <div
       data-testid="inline-turn-review"
-      className="group/turn mt-2 w-fit max-w-full overflow-hidden rounded-lg border border-stone-200 bg-stone-50/60 text-[12px] text-stone-600"
+      className="group/turn mt-1 w-fit max-w-full text-[12px] text-stone-600"
     >
       {files.map((file) => (
         <span
@@ -329,7 +331,7 @@ export function InlineTurnReview({
           data-file-path={file.filePath}
         />
       ))}
-      <div className="flex min-w-0 items-center gap-2 px-2 py-1">
+      <div className="flex h-6 min-w-0 items-center gap-2">
         <button
           type="button"
           onClick={toggleDiff}
@@ -341,7 +343,7 @@ export function InlineTurnReview({
             className={`h-3 w-3 shrink-0 text-stone-400 transition-transform ${diffExpanded ? 'rotate-90' : ''}`}
           />
           <span
-            className="min-w-0 truncate text-stone-700"
+            className="min-w-0 truncate text-[14px] text-stone-500"
             title={isMulti ? undefined : summaryLabel}
           >
             {isMulti ? summaryLabel : basename(summaryLabel)}
@@ -357,24 +359,23 @@ export function InlineTurnReview({
           ) : null}
         </button>
         {pendingCount > 0 ? (
-          <div className="flex shrink-0 items-center gap-1 border-l border-stone-200/80 pl-2">
-            <IconAction glyph="✕" title="Reject all" onClick={onUndoAll} loading={allActive} variant="reject" />
-            <IconAction glyph="✓" title="Keep all" onClick={onKeepAll} disabled={allActive} variant="accept" />
+          <div className="flex shrink-0 items-center gap-2.5 pl-1">
+            <ReviewAction word="Undo" title="Reject all" onClick={onUndoAll} loading={allActive} variant="reject" />
+            <ReviewAction word="Keep" title="Keep all" onClick={onKeepAll} disabled={allActive} variant="accept" />
           </div>
         ) : null}
         {assistantMessageId ? (
-          <div className="shrink-0 border-l border-stone-200/80 pl-2">
-            <CopyLinkButton
-              url={typeof window === 'undefined' ? '' : `${window.location.origin}/d/${assistantMessageId}`}
-              label="Copy diff link"
-            />
-          </div>
+          <CopyLinkButton
+            url={typeof window === 'undefined' ? '' : `${window.location.origin}/d/${assistantMessageId}`}
+            label="Copy diff link"
+            className="shrink-0"
+          />
         ) : null}
       </div>
 
       {diffExpanded ? (
-        <>
-          <div className="divide-y divide-stone-200/80 border-t border-stone-200/80 bg-white/50">
+        <div className="mt-1 max-w-full overflow-hidden rounded-lg border border-stone-200 bg-white">
+          <div className="divide-y divide-stone-200/80">
             {visibleFiles.map((file) => (
               <FileBlock
                 key={file.filePath}
@@ -410,7 +411,7 @@ export function InlineTurnReview({
             <X className="h-3 w-3" weight="bold" />
             Hide diff
           </button>
-        </>
+        </div>
       ) : null}
     </div>
   );

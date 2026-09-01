@@ -7,12 +7,16 @@
     "dev:webpack": "node scripts/dev/next-dev.mjs run --webpack",
     "dev:status": "node scripts/dev/next-dev.mjs status",
     "dev:prune": "node scripts/dev/next-dev.mjs prune",
-    "build": "next build",
+    "build": "node scripts/build-web.mjs",
+    "build:serve-bundle": "node tauri/scripts/prepare-sidecar.mjs --bundle-only --outfile public/serve.mjs",
     "start": "next start",
     "lint": "eslint",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "typecheck:tests": "tsc -p tests/tsconfig.json --noEmit",
+    "typecheck": "tsgo -p tsconfig.json --noEmit",
+    "typecheck:tsc": "tsc -p tsconfig.json --noEmit",
+    "typecheck:tests": "tsgo -p tests/tsconfig.json --noEmit",
+    "typecheck:tests:tsc": "tsc -p tests/tsconfig.json --noEmit",
     "test": "node scripts/dev/test-gate.mjs",
+    "test:full": "node scripts/dev/test-gate.mjs",
     "test:changed": "node scripts/dev/test-gate.mjs --changed=origin/dev",
     "test:unit:web": "vitest run",
     "test:unit:agent": "pnpm -C agent-ts test",
@@ -25,17 +29,25 @@
     "test:smoke": "pnpm browser:smoke",
     "test:e2e-modal": "pnpm e2e:modal",
     "test:runtime": "pnpm e2e:live",
-    "test:rls": "supabase db query --linked --file supabase/tests/rls_policies.sql > /dev/null && echo '✓ RLS policy tests passed'",
-    "test:security:posture": "supabase db query --linked --file supabase/tests/security_posture.sql > /dev/null && echo '✓ security posture snapshots passed'",
+    "test:rls": "supabase db query --linked --file supabase/tests/rls_policies.sql > /dev/null && echo '\u2713 RLS policy tests passed'",
+    "test:security:posture": "supabase db query --linked --file supabase/tests/security_posture.sql > /dev/null && echo '\u2713 security posture snapshots passed'",
     "test:security:advisor": "node scripts/dev/check-advisor.mjs",
     "test:security": "pnpm test:rls && pnpm test:security:posture && pnpm test:security:advisor",
     "test:all": "pnpm test && pnpm test:unit:agent && pnpm test:unit:python && pnpm browser:smoke && pnpm e2e:live && pnpm e2e:modal",
     "linq:route": "node scripts/dev/linq-route.mjs",
     "linq:unroute": "node scripts/dev/linq-route.mjs --remove",
     "brain:smoke": "node scripts/dev/brain-smoke.mjs",
+    "support:agent": "node scripts/support/agent.mjs",
+    "support:send": "node scripts/support/send-message.mjs",
     "pr-visuals:upload": "tsx scripts/dev/upload-pr-visuals.ts",
+    "templates:compile": "node scripts/dev/check_templates_compile.mjs",
+    "templates:local": "node scripts/dev/compile_template_local.mjs",
+    "templates:pdfs": "node scripts/dev/build_template_pdfs.mjs",
+    "templates:thumbs": "node scripts/dev/build_template_thumbs.mjs",
     "smoke:upload-large": "tsx scripts/dev/upload-smoke-large.ts",
-    "local:server": "node local-server/server.mjs"
+    "local:server": "node local-server/server.mjs",
+    "e2e:goal-loop": "playwright test tests/agentic/goal-loop-marathon.spec.ts",
+    "latex-corpus": "tsx --conditions=react-server scripts/latex-corpus/cli.ts"
   },
   "dependencies": {
     "@ai-sdk/gateway": "^3.0.120",
@@ -63,6 +75,8 @@
     "@tiptap/extension-image": "^3.27.1",
     "@tiptap/extension-link": "^3.27.1",
     "@tiptap/extension-placeholder": "^3.27.1",
+    "@tiptap/extension-subscript": "3.27.1",
+    "@tiptap/extension-superscript": "3.27.1",
     "@tiptap/extension-table": "^3.27.1",
     "@tiptap/extension-table-cell": "^3.27.1",
     "@tiptap/extension-table-header": "^3.27.1",
@@ -123,6 +137,7 @@
     "stripe": "^20.3.0",
     "tailwind-merge": "^3.6.0",
     "tus-js-client": "^4.3.1",
+    "undici": "^8.10.0",
     "use-stick-to-bottom": "^1.1.4",
     "ws": "^8.20.0",
     "y-monaco": "^0.1.6",
@@ -133,6 +148,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.185",
     "@next/env": "16.3.0-preview.5",
     "@playwright/test": "^1.58.2",
     "@tailwindcss/postcss": "^4",
@@ -143,11 +159,14 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/ws": "^8.18.1",
+    "@typescript/native-preview": "7.0.0-dev.20260707.2",
+    "esbuild": "^0.28.1",
     "eslint": "^9",
     "eslint-config-next": "16.3.0-preview.5",
     "playwright": "^1.58.2",
     "prosemirror-model": "^1.25.7",
     "prosemirror-state": "^1.4.4",
+    "server-only": "0.0.1",
     "supabase": "^2.98.0",
     "tailwindcss": "^4",
     "tsx": "^4.21.0",
@@ -156,15 +175,18 @@
   },
   "packageManager": "pnpm@10.32.0",
   "engines": {
-    "node": ">=22"
+    "node": ">=22 <25"
   },
   "pnpm": {
-    "comment": "Force ONE copy of each core prosemirror package across the whole tree. Tiptap v3's @tiptap/pm needs view ^1.41.8 / transform ^1.12.0, but transitive deps (prosemirror-inputrules/-keymap) pull an older prosemirror-model, so two Fragment classes coexist and instanceof fails — the 'Can not convert <> to a Fragment (looks like multiple versions of prosemirror-model were loaded)' crash. Deduping model/state here too keeps our bare prosemirror-* imports on the same copy as the editor.",
+    "comment": "Force ONE copy of each core prosemirror package across the whole tree. Tiptap v3's @tiptap/pm needs view ^1.41.8 / transform ^1.12.0, but transitive deps (prosemirror-inputrules/-keymap) pull an older prosemirror-model, so two Fragment classes coexist and instanceof fails \u2014 the 'Can not convert <> to a Fragment (looks like multiple versions of prosemirror-model were loaded)' crash. Deduping model/state here too keeps our bare prosemirror-* imports on the same copy as the editor.",
     "overrides": {
       "prosemirror-model": "^1.25.9",
       "prosemirror-state": "^1.4.4",
       "prosemirror-view": "^1.41.8",
       "prosemirror-transform": "^1.12.0"
+    },
+    "patchedDependencies": {
+      "@handlewithcare/prosemirror-suggest-changes": "patches/@handlewithcare__prosemirror-suggest-changes.patch"
     }
   }
 }

@@ -3,7 +3,6 @@ import { ThemeApplier } from "@/components/theme-applier";
 import { DesktopUpdateToast } from "@/components/desktop/update-toast";
 import { DesktopZoomHandler } from "@/components/desktop/zoom";
 import { StaticTicketPoller } from "@/components/desktop/static-ticket-poller";
-import { WEBKIT_ENGINE_INLINE_SCRIPT } from "@/lib/engine";
 import { THEME_INLINE_SCRIPT } from "@/lib/theme";
 import "katex/dist/katex.min.css";
 import "./desktop.css";
@@ -27,7 +26,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
         {/* Same pre-paint boot as the cloud layout: `js` class + theme. */}
         <script
           dangerouslySetInnerHTML={{
-            __html: `document.documentElement.classList.add('js');${WEBKIT_ENGINE_INLINE_SCRIPT}${THEME_INLINE_SCRIPT}`,
+            __html: `document.documentElement.classList.add('js');${THEME_INLINE_SCRIPT}`,
           }}
         />
         <ThemeApplier />

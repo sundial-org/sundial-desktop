@@ -1,11 +1,17 @@
 'use client';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { useAuth } from '@/lib/auth/optional-auth';
+import { useRequireSignIn } from '@/lib/auth/use-require-signin';
+import { openExternalOnDesktop } from '@/lib/desktop';
+import { SITE_URL } from '@/lib/seo';
 import { useCreditSummary } from '@/lib/credits/use-credit-summary';
 import {
   microsToUsd,
   microsToCredits,
+  FREE_GRANT_MICROS,
   PLAN_PLUS_MICROS,
   PLAN_PRO_MICROS,
+  SIGNUP_FREE_GRANT_MICROS,
 } from '@/lib/credits/constants';
 import { Spinner } from '@/components/ui/spinner';
 
@@ -14,14 +20,26 @@ type PaidPlan = 'plus20' | 'pro100';
 // Prices shown net of the always-applied 40% .edu discount (EDU40); `was` is the
 // list price. Credits/mo derive from the grant constants so they track the unit.
 const PLANS: { key: PaidPlan; name: string; price: string; was: string; credits: number; blurb: string }[] = [
-  { key: 'plus20', name: 'Plus', price: '$12', was: '$20', credits: microsToCredits(PLAN_PLUS_MICROS), blurb: 'steady drafting, analysis, and Sunny on call' },
-  { key: 'pro100', name: 'Max', price: '$60', was: '$100', credits: microsToCredits(PLAN_PRO_MICROS), blurb: 'for heavy seasons — top up anytime' },
+  { key: 'plus20', name: 'Plus', price: '$12', was: '$20', credits: microsToCredits(PLAN_PLUS_MICROS), blurb: 'steady drafting, analysis, and Sundial Agent on call' },
+  { key: 'pro100', name: 'Max', price: '$60', was: '$100', credits: microsToCredits(PLAN_PRO_MICROS), blurb: 'for heavy seasons, top up anytime' },
 ];
 
 const TOPUPS = [5, 20, 50];
 
 export function BillingSection() {
-  const { summary, loading, ready, refresh } = useCreditSummary();
+  const { summary, loading, ready, signedOut, refresh } = useCreditSummary();
+  // Purchases and portal access are session-only server-side (a leaked sd_
+  // token must not control payments), so an sd-only desktop session — summary
+  // loaded but no Clerk session — gets a browser handoff instead of buttons
+  // that would 403.
+  const { isSignedIn: clerkSignedIn } = useAuth();
+  const canPurchase = Boolean(clerkSignedIn);
+  const { signedIn, requireSignIn } = useRequireSignIn();
+  // Desktop sign-in returns via credentials event without a remount, so a
+  // 401'd summary must refetch once hybrid auth flips to signed in.
+  useEffect(() => {
+    if (signedIn && signedOut) refresh();
+  }, [signedIn, signedOut, refresh]);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState('');
 
@@ -73,7 +91,34 @@ export function BillingSection() {
     return <div className="p-4 text-[13px]"><Spinner label="Loading billing…" /></div>;
   }
   if (!summary) {
-    return <div className="p-4 text-[13px] text-stone-500">Sign in to manage billing.</div>;
+    // Only a 401 means "sign in" — a 5xx/network blip must not tell a
+    // signed-in user they're logged out. AI credits are per signed-in account
+    // (the run gate blocks anon senders), so say what signing in unlocks
+    // instead of a bare "manage billing" that reads as payments-only.
+    return signedOut ? (
+      <div data-testid="billing-signed-out" className="rounded-2xl border border-stone-200 bg-stone-50 p-4 text-[13px]">
+        <div className="font-medium text-stone-700">Sign in to get free AI credits</div>
+        <div className="mt-1 text-stone-500">
+          New accounts start with {microsToCredits(SIGNUP_FREE_GRANT_MICROS)} credits and are topped
+          up to {microsToCredits(FREE_GRANT_MICROS)} free credits every month. Your balance shows
+          here once you’re signed in.
+        </div>
+        <button
+          type="button"
+          onClick={() => requireSignIn()}
+          className="mt-3 rounded-lg bg-orange px-3 py-1.5 text-[12px] font-medium text-white transition-colors hover:bg-orange-deep"
+        >
+          Sign in
+        </button>
+      </div>
+    ) : (
+      <div className="p-4 text-[13px] text-stone-500">
+        Couldn’t load billing.{' '}
+        <button type="button" onClick={refresh} className="underline underline-offset-2">
+          Retry
+        </button>
+      </div>
+    );
   }
 
   const plan = summary.plan;
@@ -103,6 +148,25 @@ export function BillingSection() {
       {!summary.stripeConfigured && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-700">
           Billing isn’t configured in this environment yet. Your free credits still work.
+        </div>
+      )}
+
+      {!canPurchase && (
+        <div
+          data-testid="billing-browser-handoff"
+          className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-[12px] text-stone-600"
+        >
+          Purchases and billing management happen in your signed-in browser:{' '}
+          <a
+            href={SITE_URL}
+            target="_blank"
+            rel="noreferrer"
+            onClick={openExternalOnDesktop}
+            className="font-medium underline underline-offset-2"
+          >
+            open sundial.md
+          </a>
+          .
         </div>
       )}
 
@@ -139,7 +203,11 @@ export function BillingSection() {
                 <button
                   type="button"
                   disabled={
-                    current || !summary.stripeConfigured || busy === `sub:${p.key}` || busy === 'portal'
+                    current ||
+                    !canPurchase ||
+                    !summary.stripeConfigured ||
+                    busy === `sub:${p.key}` ||
+                    busy === 'portal'
                   }
                   // Already subscribed → switch plans via the billing portal
                   // (Stripe prorates there); avoids creating a 2nd subscription.
@@ -168,7 +236,7 @@ export function BillingSection() {
             <button
               key={amt}
               type="button"
-              disabled={!summary.stripeConfigured || busy === `topup:${amt}`}
+              disabled={!canPurchase || !summary.stripeConfigured || busy === `topup:${amt}`}
               onClick={() => topUp(amt)}
               className="flex-1 rounded-lg border border-stone-200 px-3 py-1.5 text-[12px] font-medium text-stone-700 transition-colors hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-40"
             >
@@ -178,7 +246,7 @@ export function BillingSection() {
         </div>
       </div>
 
-      {onPaidPlan && summary.stripeConfigured && (
+      {onPaidPlan && summary.stripeConfigured && canPurchase && (
         <button
           type="button"
           onClick={manage}

@@ -21,6 +21,10 @@ import { CollabCodeEditor } from '@/components/workspace/collab-code-editor';
 import { MarkdownToolbar } from '@/components/workspace/markdown-toolbar';
 import type { TurnEditFile, TurnEditsResponse } from '@/lib/workspace/turn-edits';
 import type { DiffChunk } from '@/components/workspace/diff-review/types';
+import { withPathShareToken } from '@/lib/workspace/path-share-token-client';
+
+// Review actions must carry the sticky ?pshare= token for path-share editors.
+const pshareFetch = withPathShareToken((input, init) => fetch(input, init));
 
 const ANON_USER = { name: 'Anonymous', color: '#a8a29e' };
 
@@ -130,7 +134,7 @@ export function DiffReviewFlow({
     if (!current || busy) return;
     setBusy(true);
     try {
-      const res = await fetch('/api/workspace/turn-edits/keep-chunk', {
+      const res = await pshareFetch('/api/workspace/turn-edits/keep-chunk', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -154,7 +158,7 @@ export function DiffReviewFlow({
     if (!current || busy) return;
     setBusy(true);
     try {
-      const res = await fetch('/api/workspace/turn-edits/undo-chunk', {
+      const res = await pshareFetch('/api/workspace/turn-edits/undo-chunk', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -194,7 +198,7 @@ export function DiffReviewFlow({
           All edits reviewed
         </div>
         <div className="mt-1 text-[13px] text-stone-500">
-          Nothing left to review — every change in this turn has already been kept or undone.
+          Nothing left to review. Every change in this turn has already been kept or undone.
         </div>
         {workspaceHref ? (
           <a
@@ -527,7 +531,7 @@ function WalkthroughScreen({
       const targetFile = payload.files.find((f) => f.chunks.some((c) => c.id === chunkId));
       if (!targetFile) return;
       try {
-        const res = await fetch('/api/workspace/turn-edits/keep-chunk', {
+        const res = await pshareFetch('/api/workspace/turn-edits/keep-chunk', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -551,7 +555,7 @@ function WalkthroughScreen({
       const targetFile = payload.files.find((f) => f.chunks.some((c) => c.id === chunkId));
       if (!targetFile) return;
       try {
-        const res = await fetch('/api/workspace/turn-edits/undo-chunk', {
+        const res = await pshareFetch('/api/workspace/turn-edits/undo-chunk', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

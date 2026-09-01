@@ -37,8 +37,14 @@ export function buildTurnEditsMessageFingerprint(
 export function buildPendingEditsInvalidationToken(args: {
   docEditsRealtimeKey: number;
   messages: TurnEditsFingerprintMessage[];
+  /** Local (sidecar) workspaces only: bumps on the sidecar's files-changed
+   *  SSE. `doc_edits` Realtime never fires there and the message fingerprint
+   *  only covers the OPEN chat, so without this an edit from another chat or
+   *  an outside process leaves per-file review data stale. 0 in the cloud. */
+  localFileEventsKey?: number;
 }): string {
   const parts: string[] = [String(args.docEditsRealtimeKey)];
+  if (args.localFileEventsKey) parts.push(`l${args.localFileEventsKey}`);
   const fingerprint = buildTurnEditsMessageFingerprint(args.messages);
   if (fingerprint) parts.push(fingerprint);
   return parts.join('|');

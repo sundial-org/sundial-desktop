@@ -291,8 +291,10 @@ export function useWorkspaceChatSidebarEffects<TThread extends { chat: { id: str
 // `useWorkspaceChatStatusRealtime` below stays for cross-chat presence.
 
 type RealtimeMessageRow = {
+  id?: string | null;
   chat_id?: string | null;
   role?: string | null;
+  sequence?: number | null;
   metadata?: Record<string, unknown> | null;
 };
 
@@ -308,7 +310,11 @@ export function deriveChatStatusFromMessageEvent(
   if (!row?.chat_id || !row.role) return null;
   const metadata = row.metadata && typeof row.metadata === 'object' ? row.metadata : null;
   const streaming = metadata?.streaming === true;
-  if (row.role === 'assistant') return streaming ? 'working' : 'idle';
+  if (row.role === 'assistant') {
+    // A deploy-checkpointed row (`resume_pending`) has `streaming` cleared but
+    // its run lives on under a fresh stream — still working, not settled.
+    return streaming || metadata?.resume_pending === true ? 'working' : 'idle';
+  }
   if (row.role === 'user' && eventType === 'INSERT') return 'starting';
   return null;
 }
@@ -326,14 +332,24 @@ export function useWorkspaceChatStatusRealtime({
   projectId,
   chatIds,
   setChatStatusById,
+  onAssistantSettled,
 }: {
   supabaseClient: ReturnType<typeof createBrowserClient>;
   projectId: string;
   chatIds: string[];
   setChatStatusById: Dispatch<SetStateAction<Record<string, ChatStatus>>>;
+  /** An assistant row UPDATE landed with `streaming` cleared (and no
+   *  `resume_pending`) — the run's persisted state is terminal. The active
+   *  chat uses this to settle a live view whose SSE reader never delivered
+   *  the finish (half-open socket): without it, the persisted terminal state
+   *  has no path to useChat's `streaming` status until a manual reload. */
+  onAssistantSettled?: (chatId: string, assistantRowId: string | null, rowSequence: number | null) => void;
 }) {
   // Sort + join so re-renders with the same set don't churn the subscription.
   const filterKey = chatIds.slice().sort().join(',');
+  // Read through a ref so the subscription doesn't churn on callback identity.
+  const onSettledRef = useRef(onAssistantSettled);
+  onSettledRef.current = onAssistantSettled;
 
   useEffect(() => {
     if (!supabaseClient || !projectId || !filterKey) return;
@@ -358,6 +374,13 @@ export function useWorkspaceChatStatusRealtime({
           if (prev[chatId] === nextStatus) return prev;
           return { ...prev, [chatId]: nextStatus };
         });
+        if (payload.eventType === 'UPDATE' && row.role === 'assistant' && nextStatus === 'idle') {
+          onSettledRef.current?.(
+            chatId,
+            typeof row.id === 'string' ? row.id : null,
+            typeof row.sequence === 'number' ? row.sequence : null,
+          );
+        }
       },
     );
     channel.subscribe();
@@ -407,7 +430,7 @@ export function useActiveChatForeignUserMessages({
   currentChatId: string | null;
   isDraftChatId: (chatId: string | null | undefined) => boolean;
   currentUserId: string | null;
-  appendForeignUserMessage: (row: ChatMessage) => void;
+  appendForeignUserMessage: (row: ChatMessage, opts?: { replace?: boolean; remove?: boolean }) => void;
   resumeStream: () => void;
 }) {
   // Stable callback refs so the effect doesn't tear down on every render
@@ -420,6 +443,7 @@ export function useActiveChatForeignUserMessages({
   useEffect(() => {
     if (!supabaseClient || !currentChatId || isDraftChatId(currentChatId)) return;
     const chatId = currentChatId;
+    const retryTimers: ReturnType<typeof setTimeout>[] = [];
     const channel = supabaseClient.channel(`active-chat-foreign-${chatId}`);
     channel.on(
       'postgres_changes',
@@ -431,12 +455,26 @@ export function useActiveChatForeignUserMessages({
       },
       (payload) => {
         const row = (payload.new ?? null) as ForeignUserMessageRow | null;
-        if (!row || row.role !== 'user' || !row.id) return;
+        if (!row || !row.id) return;
+        if (row.role === 'assistant') {
+          // A turn just started — possibly a QUEUED comment run whose stream
+          // didn't exist yet when the delivery's retries fired. (Re)attach;
+          // resuming an already-attached stream is a safe reconnect.
+          resumeRef.current();
+          retryTimers.push(setTimeout(() => resumeRef.current(), 1500));
+          return;
+        }
+        if (row.role !== 'user') return;
         const authorId =
           typeof row.metadata?.author_user_id === 'string'
             ? (row.metadata.author_user_id as string)
             : null;
-        if (currentUserId && authorId && authorId === currentUserId) return;
+        // Own sends are already in useChat state — but an own-authored COMMENT
+        // delivery isn't (it was ingested server-side, not sent from this
+        // window), and skipping it would leave the open listening chat blind
+        // until a chat switch.
+        const isCommentDelivery = row.metadata?.source === 'comment';
+        if (currentUserId && authorId && authorId === currentUserId && !isCommentDelivery) return;
         // Foreign user message. Append to useChat's state, then tickle the
         // resumable stream — the harness has already kicked /agent/run for
         // this row, the active_stream_id is in Redis, our useChat just
@@ -450,10 +488,66 @@ export function useActiveChatForeignUserMessages({
           sequence: typeof row.sequence === 'number' ? row.sequence : null,
         });
         resumeRef.current();
+        // Comment deliveries invert the usual order: the row is INSERTed
+        // BEFORE /agent/run registers the stream, so the first resume can hit
+        // a cursorless 404 and give up. Re-tickle shortly after; resuming an
+        // already-attached stream is a no-op-safe reconnect.
+        if (isCommentDelivery) {
+          for (const delay of [1500, 4000]) {
+            retryTimers.push(setTimeout(() => resumeRef.current(), delay));
+          }
+        }
+      },
+    );
+    // Comment deliveries can be ANNOTATED after insert (a blocked run stamps
+    // metadata.comment.blocked so the card explains itself) — refresh the
+    // rendered row in place. Scoped to comment-sourced user rows only;
+    // assistant UPDATEs stay excluded (they were the original pain source).
+    channel.on(
+      'postgres_changes',
+      {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'messages',
+        filter: `chat_id=eq.${chatId}`,
+      },
+      (payload) => {
+        const row = (payload.new ?? null) as ForeignUserMessageRow | null;
+        if (!row || !row.id || row.role !== 'user' || row.metadata?.source !== 'comment') return;
+        appendRef.current(
+          {
+            id: row.id,
+            role: 'user',
+            content: typeof row.content === 'string' ? row.content : '',
+            metadata: (row.metadata ?? null) as Record<string, unknown> | null,
+            ...(row.created_at ? { created_at: row.created_at } : {}),
+            sequence: typeof row.sequence === 'number' ? row.sequence : null,
+          },
+          { replace: true },
+        );
+      },
+    );
+    // A retracted delivery (blocked-gate compensation deletes the row after
+    // insert) must leave the live transcript too. NO column filter here:
+    // Postgres Changes can't filter DELETE events (the old record carries only
+    // the replica-identity key, so a filtered listener never fires). Removal
+    // by globally-unique id is a no-op for other chats' rows.
+    channel.on(
+      'postgres_changes',
+      {
+        event: 'DELETE',
+        schema: 'public',
+        table: 'messages',
+      },
+      (payload) => {
+        const oldRow = (payload.old ?? null) as { id?: string } | null;
+        if (!oldRow?.id) return;
+        appendRef.current({ id: oldRow.id, role: 'user', content: '', metadata: null, sequence: null }, { remove: true });
       },
     );
     channel.subscribe();
     return () => {
+      retryTimers.forEach(clearTimeout);
       supabaseClient.removeChannel(channel);
     };
   }, [supabaseClient, currentChatId, isDraftChatId, currentUserId]);

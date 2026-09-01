@@ -2,9 +2,15 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject } from 'react';
 import { createBrowserClient } from '@/lib/supabase/browser';
-import { MOBILE_MEDIA_QUERY } from '@/lib/workspace/layout';
+import { isInFloatingActionMenu } from '@/components/workspace/anchored-dropdown';
+import { MOBILE_MEDIA_QUERY, latchPanelView } from '@/lib/workspace/layout';
 
-type WorkspaceRouteId = string | { id: string; public_id: string | null };
+import type { WorkspaceRouteInput } from '@/lib/workspace/public-ids';
+
+// The page's own route id, `local` flag included — these hooks forward it
+// straight to buildWorkspacePath, which is what keeps a local project's
+// links and redirects off the cloud `/w/` route.
+type WorkspaceRouteId = WorkspaceRouteInput;
 type SearchParamsLike = {
   get(name: string): string | null;
   toString(): string;
@@ -84,12 +90,15 @@ export type SettingsTab =
   | 'changes'
   | 'secrets'
   | 'workspace'
+  | 'appearance'
   | 'preferences'
+  | 'shortcuts'
   | 'billing'
   | 'github'
   | 'overleaf'
   | 'chatApps'
-  | 'apikeys';
+  | 'apikeys'
+  | 'gettingStarted';
 
 export type WorkspacePresencePayload = {
   /** Composite key used in the bubble row: `user:<clerkId>`, `anon:<id>`, or `agent:<agentId>`. */
@@ -109,6 +118,9 @@ export type WorkspacePresencePayload = {
   imageUrl: string | null;
   /** Bubble color (pre-computed so the cursor + bubble use the same hue). */
   color?: string | null;
+  /** Workspace path of the file this peer currently has focused — the
+   *  click-a-bubble jump target. Null when no file is open. */
+  openFilePath?: string | null;
 };
 
 export function useToolbarRowWidth() {
@@ -246,8 +258,7 @@ export function useWorkspaceDropdownDismissal({
     if (!openChatMenuId && !showModelPicker && !showAppsPicker) return;
     const handleClick = (event: MouseEvent) => {
       const target = event.target as Node;
-      const targetElement = target instanceof Element ? target : null;
-      const isInFloatingMenu = Boolean(targetElement?.closest('[data-floating-action-menu]'));
+      const isInFloatingMenu = isInFloatingActionMenu(event.target);
       if (
         openChatMenuId &&
         chatMenuRef.current &&
@@ -319,6 +330,7 @@ export function useWorkspacePresence({
   anonId,
   anonDisplayName: anonNameValue,
   anonColor,
+  openFilePath,
 }: {
   supabaseClient: ReturnType<typeof createBrowserClient>;
   projectId: string;
@@ -337,8 +349,16 @@ export function useWorkspacePresence({
   anonDisplayName?: string | null;
   /** Pre-computed bubble color so the cursor + bubble match. */
   anonColor?: string | null;
+  /** Path of the file this browser currently has focused; broadcast so other
+   *  clients can jump to this peer. Changes re-track without rejoining. */
+  openFilePath?: string | null;
 }) {
   const [workspacePresenceState, setWorkspacePresenceState] = useState<Record<string, WorkspacePresencePayload[]>>({});
+  // Read at track() time (never an effect dep): a file switch must not tear
+  // down and rejoin the presence channel, just re-announce on it.
+  const openFilePathRef = useRef<string | null>(openFilePath ?? null);
+  openFilePathRef.current = openFilePath ?? null;
+  const retrackRef = useRef<(() => void) | null>(null);
 
   // Gate: only join the channel when this browser has a stable identity to
   // broadcast. Page-level access is already enforced by the layout — if the
@@ -387,9 +407,13 @@ export function useWorkspacePresence({
     let rejoin: ReturnType<typeof setTimeout> | null = null;
     let attempts = 0;
     let cancelled = false;
+    // True only while the CURRENT channel is SUBSCRIBED — a re-track on a
+    // joining/dead channel would just error into the void.
+    let ready = false;
 
     const connect = () => {
       if (cancelled) return;
+      ready = false;
       const ch = supabaseClient.channel(`workspace-presence-${projectId}`, {
         config: { presence: { key: presenceKey } },
       });
@@ -414,7 +438,8 @@ export function useWorkspacePresence({
           // nulls it) so the `online`/visibility kick below treats this as
           // healthy and stays a no-op instead of churning a working channel.
           rejoin = null;
-          void ch.track(payload);
+          ready = true;
+          void ch.track({ ...payload, openFilePath: openFilePathRef.current });
           return;
         }
         // CHANNEL_ERROR/TIMED_OUT leaves the channel dead and Supabase does not
@@ -438,6 +463,11 @@ export function useWorkspacePresence({
     };
 
     connect();
+
+    retrackRef.current = () => {
+      if (cancelled || !ready || !channel) return;
+      void channel.track({ ...payload, openFilePath: openFilePathRef.current });
+    };
 
     // After a prolonged drop (offline, laptop sleep, frozen tab) the backoff
     // above climbs to PRESENCE_REJOIN_MAX_MS, so a reconnecting collaborator
@@ -475,6 +505,7 @@ export function useWorkspacePresence({
 
     return () => {
       cancelled = true;
+      retrackRef.current = null;
       window.removeEventListener('online', onOnline);
       window.removeEventListener('focus', onOnline);
       document.removeEventListener('visibilitychange', onVisible);
@@ -496,6 +527,18 @@ export function useWorkspacePresence({
     anonNameValue,
     anonColor,
   ]);
+
+  // File switches re-announce on the live channel instead of rejoining it.
+  // First render is skipped: the subscribe handshake's own track() already
+  // carries the initial path (a second mount-time track would double-announce).
+  const skippedInitialTrackRef = useRef(false);
+  useEffect(() => {
+    if (!skippedInitialTrackRef.current) {
+      skippedInitialTrackRef.current = true;
+      return;
+    }
+    retrackRef.current?.();
+  }, [openFilePath]);
 
   return workspacePresenceState;
 }
@@ -745,10 +788,13 @@ export function useWorkspaceRouteIntents({
       'changes',
       'secrets',
       'workspace',
+      'appearance',
       'preferences',
+      'shortcuts',
       'github',
       'overleaf',
       'apikeys',
+      'gettingStarted',
     ];
     if (!validTabs.includes(panelParam as SettingsTab)) return;
     const hash = typeof window !== 'undefined' ? window.location.hash : '';
@@ -805,7 +851,7 @@ export function useWorkspaceLayoutEffects({
   setIsMobile: (value: boolean) => void;
   setOpenLeftRail: (value: LeftRail) => void;
   setShowSettingsModal: (value: boolean) => void;
-  setMobilePanel: (value: 'chats' | 'files' | null) => void;
+  setMobilePanel: (value: 'files' | null) => void;
   setLayoutConfigReady: (value: boolean) => void;
   readStoredLayoutConfig: () => Partial<WorkspaceLayoutConfig> | null;
   applyFreshDesktopLayout: (config: Partial<WorkspaceLayoutConfig> | null) => void;
@@ -847,11 +893,16 @@ export function useWorkspaceLayoutEffects({
       setShowSettingsModal(false);
       setMobilePanel(null);
     } else {
-      const storedLayout = readStoredLayoutConfig();
-      if (freshDesktopLayoutPendingRef.current) {
-        applyFreshDesktopLayout(storedLayout);
-      } else {
-        applyStoredDesktopLayout(storedLayout);
+      // Panel sessions keep their current layout across a widen past the
+      // mobile breakpoint — restoring the stored desktop layout would pop
+      // rails/panels the embed deliberately never opened.
+      if (!latchPanelView()) {
+        const storedLayout = readStoredLayoutConfig();
+        if (freshDesktopLayoutPendingRef.current) {
+          applyFreshDesktopLayout(storedLayout);
+        } else {
+          applyStoredDesktopLayout(storedLayout);
+        }
       }
       setMobilePanel(null);
     }
@@ -877,6 +928,19 @@ export function useWorkspaceLayoutEffects({
     const freshLayout = hasFreshWorkspaceLayoutQuery();
     freshDesktopLayoutPendingRef.current = freshLayout;
     blockFreshLayoutPersistenceRef.current = freshLayout;
+    // Embedded panel (?view=panel — ChatGPT/Claude side views): the
+    // URL-decided single-panel arrival stands on every width. Nothing
+    // restored — a stored desktop layout would reopen rails and panels sized
+    // for a full window — and nothing persisted for the whole session
+    // (persistLayoutConfig stays gated on the latch, unlike the fresh-layout
+    // block above, which lifts on first interaction).
+    if (latchPanelView()) {
+      setOpenLeftRail(null);
+      setShowSettingsModal(false);
+      if (freshLayout) clearFreshWorkspaceLayoutQuery();
+      setLayoutConfigReady(true);
+      return;
+    }
     const mobileNow = window.matchMedia(MOBILE_MEDIA_QUERY).matches;
     if (mobileNow) {
       setOpenLeftRail(null);

@@ -1,5 +1,7 @@
 'use client';
 
+import { stripMarkdownSyntax } from '@/lib/workspace/derive-chat-title';
+
 export type ChatStatus = 'idle' | 'working' | 'done' | 'error' | 'starting' | 'stopped';
 
 // Not-yet-persisted chats get a local `draft-<uuid>` id until the first send
@@ -7,6 +9,19 @@ export type ChatStatus = 'idle' | 'working' | 'done' | 'error' | 'starting' | 's
 export const DRAFT_CHAT_PREFIX = 'draft-';
 export const isDraftChatId = (id: string | null | undefined): boolean =>
   Boolean(id && id.startsWith(DRAFT_CHAT_PREFIX));
+
+/** Rename / archive / delete: WRITE-scoped and identity-free. Both data planes
+ *  gate them on write access alone, so an anon cloud visitor and a signed-out
+ *  desktop-local user manage their own chats. Menu items AND their handlers
+ *  must share this — gating the handler on a user id is what silently broke
+ *  "Archive chat" on the desktop app's local projects. */
+export const canManageChat = (canWrite: boolean, chatId: string | null | undefined): boolean =>
+  Boolean(canWrite && chatId && !isDraftChatId(chatId));
+
+/** Pinning is the exception: `chat_pins` rows are keyed by a Clerk user id, so
+ *  there is nothing to write without one. */
+export const canPinChat = (userId: string | null | undefined, chatId: string | null | undefined): boolean =>
+  Boolean(userId && chatId && !isDraftChatId(chatId));
 
 export type ChatMessage = {
   id: string;
@@ -132,11 +147,13 @@ export function formatSessionDurationSeconds(totalSeconds?: number | null) {
 
 export function toChatPreviewText(value?: string | null) {
   if (typeof value !== 'string') return null;
-  const firstLine = value
-    .split(/\r?\n/u)
-    .map((part) => part.trim())
-    .find(Boolean);
-  return firstLine ?? null;
+  // First line with visible prose: markdown syntax strips out of the preview,
+  // and a line that was ONLY syntax (a ``` fence, a bare "---") is skipped.
+  for (const line of value.split(/\r?\n/u)) {
+    const stripped = stripMarkdownSyntax(line).replace(/\s+/g, ' ').trim();
+    if (stripped) return stripped;
+  }
+  return null;
 }
 
 export function toChatPreviewTextFromMessage(message: Pick<ChatMessage, 'role' | 'content'>) {

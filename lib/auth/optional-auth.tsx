@@ -38,6 +38,10 @@ export type OptionalClerkMethods = {
   openSignIn: (opts?: SignInOptions) => void;
   openSignUp: (opts?: SignInOptions) => void;
   openUserProfile: () => void;
+  /** Absent without a Clerk session to end (the packaged desktop shell,
+   *  whose sd_ credentials live in the sidecar) — callers hide their
+   *  sign-out affordance when undefined. */
+  signOut?: (opts?: { redirectUrl?: string }) => Promise<void> | void;
 };
 
 export type CloudAuthValue = {

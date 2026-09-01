@@ -9,17 +9,25 @@ import {
   MAX_ZIP_ENTRY_BYTES,
   MAX_ZIP_ENTRY_COUNT,
   MAX_ZIP_UNCOMPRESSED_BYTES,
+  describeUploadError,
   ensureUniquePath,
   formatBytes,
   isTextLikeFile,
-  sanitizeFilename,
+  sanitizeUploadPath,
 } from '@/lib/workspace/uploads';
 import { directUploadFile } from '@/lib/workspace/direct-upload';
 import { convertHeicToJpeg, heicJpegName, isHeicUpload } from '@/lib/workspace/heic';
+import { decodeTextBlob } from '@/lib/sync/decode-text';
 import { isCrdtFile, normalizeWorkspacePath } from '@/lib/sync/policy';
 import { isIgnoredWorkspacePath } from '@/lib/workspace/ignored-paths';
+import { track } from '@/lib/analytics/track';
+import { latexEmitter, latexImportProps } from '@/lib/analytics/latex-events';
 
 export type UploadTarget = 'chat' | 'files';
+
+/** A queued upload: a bare `File` (lands at `<target>/<name>`) or a file
+ *  carrying its path relative to the drop, so folder drops keep their tree. */
+export type UploadInput = File | { file: File; relativePath: string };
 
 export type PendingUpload = {
   id: string;
@@ -92,6 +100,7 @@ async function uploadZipEntryAsText(args: {
       mime: args.mime,
       size: args.text.length,
       textContent: args.text,
+      actor: 'import_zip',
     }),
   });
   if (!res.ok) {
@@ -155,7 +164,7 @@ async function uploadZipEntry(
       projectId,
       path: finalPath,
       mime: null,
-      text: await blob.text(),
+      text: await decodeTextBlob(blob),
       fetchImpl,
     });
   }
@@ -235,7 +244,35 @@ async function importZipClientSide(args: {
   );
   await Promise.all(workers);
 
+  void trackZipLatexImport(args.projectId, plan);
   return created;
+}
+
+// LaTeX import outcome (lib/analytics/latex-events.ts). Only zips that carry
+// .tex. The bib/engine sniff re-decompresses entries, so it is bounded by a
+// cumulative byte budget (real LaTeX sources are tiny; a zip can legally
+// expand to 500 MB) as well as an entry cap — counts stay exact regardless.
+const ZIP_SNIFF_BUDGET_BYTES = 2 * 1024 * 1024;
+const emitLatex = latexEmitter(track);
+async function trackZipLatexImport(projectId: string, plan: ZipPlanEntry[]) {
+  try {
+    const tex = plan.filter((item) => /\.tex$/i.test(item.finalPath));
+    if (tex.length === 0) return;
+    const sample: ZipPlanEntry[] = [];
+    let budget = ZIP_SNIFF_BUDGET_BYTES;
+    for (const item of tex.slice(0, 50)) {
+      if (item.uncompressedSize > budget) continue;
+      budget -= item.uncompressedSize;
+      sample.push(item);
+    }
+    const sources = new Map(
+      await Promise.all(sample.map(async (item) => [item.finalPath, await item.entry.async('string')] as const)),
+    );
+    const files = plan.map((item) => ({ path: item.finalPath, text: sources.get(item.finalPath) }));
+    emitLatex('latex_import_completed', { projectId, source: 'zip', ...latexImportProps(files) });
+  } catch {
+    // Analytics only.
+  }
 }
 
 function isZipArchive(file: File) {
@@ -321,7 +358,7 @@ export function useWorkspaceUploads({
         if (isSmallText) {
           // Text files: read content and send as JSON (no storage needed)
           updateUpload(upload.id, { status: 'processing', progress: 1 });
-          const text = await file.text();
+          const text = await decodeTextBlob(file);
           const res = await fetchImpl('/api/workspace/uploads', {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
@@ -356,35 +393,39 @@ export function useWorkspaceUploads({
         onFilesChanged?.();
         removeUpload(upload.id);
       } catch (error) {
-        updateUpload(upload.id, {
-          status: 'error',
-          error: error instanceof Error ? error.message : 'Upload failed.',
-        });
+        updateUpload(upload.id, { status: 'error', error: describeUploadError(error) });
       }
     },
     [existingPaths, fetchImpl, onFilesChanged, onUploadComplete, projectId, removeUpload, updateUpload, uploadBinary]
   );
 
   const queueUploads = useCallback(
-    (files: File[], target: UploadTarget, targetFolder: string | null, chatId?: string | null) => {
+    (files: UploadInput[], target: UploadTarget, targetFolder: string | null, chatId?: string | null) => {
       if (!canWrite || !projectId) return;
       if (target === 'chat' && !chatId) return;
       const taken = new Set(existingPaths);
-      const reserve = (name: string) => {
-        const safeName = sanitizeFilename(name.trim()) || 'upload';
-        const rawPath = targetFolder ? `${targetFolder}/${safeName}` : safeName;
+      const reserve = (relativePath: string) => {
+        const relative = sanitizeUploadPath(relativePath) || 'upload';
+        const rawPath = targetFolder ? `${targetFolder}/${relative}` : relative;
         const path = ensureUniquePath(rawPath, taken);
         taken.add(path);
-        return { safeName, path };
+        return { safeName: path.slice(path.lastIndexOf('/') + 1), path };
       };
-      files.forEach((original) => {
+      files.forEach((input) => {
+        // Structural check, not `instanceof File`: a File can come from
+        // another realm (iframe / worker) where instanceof is false.
+        const descriptor = 'file' in input ? input : null;
+        const original = descriptor ? descriptor.file : (input as File);
+        // Folder drops keep their tree: reserve under the dropped relative dir.
+        const relative = descriptor ? descriptor.relativePath : original.name;
+        const dir = relative.slice(0, relative.lastIndexOf('/') + 1);
         const isHeic = isHeicUpload(original.name, original.type);
         // Reserve the path from the PREDICTED post-conversion name (heicJpegName
         // is pure) and register the pending entry SYNCHRONOUSLY. A HEIC decode
         // takes seconds; chatUploadsInFlight must flip true immediately so a chat
         // send can't race ahead of its attachment. Then convert per-file (not a
         // batched Promise.all) so a slow decode never blocks its siblings.
-        const { safeName, path } = reserve(isHeic ? heicJpegName(original.name) : original.name);
+        const { safeName, path } = reserve(`${dir}${isHeic ? heicJpegName(original.name) : original.name}`);
         const id = `upload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         setUploads((prev) => [
           ...prev,
@@ -394,7 +435,7 @@ export function useWorkspaceUploads({
           // Conversion never throws; on failure it returns the original bytes, so
           // re-reserve under the real extension to keep the path/mime honest.
           const failed = isHeic && file.type !== 'image/jpeg';
-          const final = failed ? reserve(original.name) : { safeName, path };
+          const final = failed ? reserve(`${dir}${original.name}`) : { safeName, path };
           const upload: PendingUpload = {
             id,
             file,

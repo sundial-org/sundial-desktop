@@ -5,6 +5,10 @@ import { readJsonResponse } from '@/lib/http/read-json-response';
 import type { ChatTurnEditSummary } from '@/lib/workspace/chat-turn-edits';
 import type { FilePendingEditsResponse } from '@/lib/workspace/api-shared-types';
 import type { TurnEditsResponse } from '@/lib/workspace/turn-edits';
+import { withPathShareToken } from '@/lib/workspace/path-share-token-client';
+
+// Keep/Undo must carry the sticky ?pshare= token for path-share editors.
+const pshareFetch = withPathShareToken((input, init) => fetch(input, init));
 import {
   getCachedTurnEdits,
   setCachedTurnEdits,
@@ -21,6 +25,9 @@ import {
 export type FilePendingTurn = {
   assistantMessageId: string;
   chatId: string | null;
+  /** Transcript message id for the author chip's jump, when it differs from
+   *  `assistantMessageId` (local sessions). Absent → the id itself. */
+  jumpMessageId?: string | null;
   authorId: string | null;
   createdAt: string | null;
   messagePreview: string;
@@ -30,6 +37,8 @@ export type FilePendingTurn = {
 
 export type UseFilePendingTurns = {
   turns: FilePendingTurn[];
+  /** Y.Doc suggestion mark id → the turn that wrote it. Agent marks only. */
+  suggestionTurns: Record<string, string>;
   loading: boolean;
   error: string | null;
   activeUndoKey: string | null;
@@ -136,6 +145,9 @@ export function useFilePendingTurns(
   workspaceId: string | null,
   filePath: string | null,
   invalidationToken: string = '',
+  // Local (sidecar) workspaces pass the page's shimmed apiFetch; cloud callers
+  // omit it and keep the pshare-token fetch. Must be referentially stable.
+  fetcher: typeof fetch = pshareFetch,
 ): UseFilePendingTurns {
   const [summaries, setSummaries] = useState<ChatTurnEditSummary[]>([]);
   const [payloadsByTurn, setPayloadsByTurn] = useState<Record<string, TurnEditsResponse>>({});
@@ -143,6 +155,7 @@ export function useFilePendingTurns(
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [activeUndoKey, setActiveUndoKey] = useState<string | null>(null);
+  const [suggestionTurns, setSuggestionTurns] = useState<Record<string, string>>({});
   // Tracks the (workspace, path) pair we last fetched for, so we can drop
   // stale state synchronously when the user navigates between files.
   const lastFetchKeyRef = useRef<string | null>(null);
@@ -153,6 +166,7 @@ export function useFilePendingTurns(
       setSummaries([]);
       setPayloadsByTurn({});
       setErrorsByTurn({});
+      setSuggestionTurns({});
       return;
     }
     const fetchKey = `${workspaceId}:${filePath}`;
@@ -165,13 +179,14 @@ export function useFilePendingTurns(
       setSummaries([]);
       setPayloadsByTurn({});
       setErrorsByTurn({});
+      setSuggestionTurns({});
     }
     let cancelled = false;
     setSummaryLoading(true);
     setSummaryError(null);
     void (async () => {
       try {
-        const response = await fetch(
+        const response = await fetcher(
           `/api/workspace/file-pending-edits?workspaceId=${encodeURIComponent(workspaceId)}&filePath=${encodeURIComponent(filePath)}`,
           { cache: 'no-store' },
         );
@@ -197,6 +212,13 @@ export function useFilePendingTurns(
         setSummaries((prev) =>
           JSON.stringify(prev) === JSON.stringify(next.turns) ? prev : next.turns,
         );
+        // Same identity-preserving compare: this map feeds a ProseMirror
+        // decoration rebuild, so a fresh object per poll would repaint the
+        // gutter controls on every 1s realtime nudge.
+        setSuggestionTurns((prev) => {
+          const incoming = next.suggestionTurns ?? {};
+          return JSON.stringify(prev) === JSON.stringify(incoming) ? prev : incoming;
+        });
       } catch (err) {
         if (cancelled) return;
         setSummaryError(err instanceof Error ? err.message : 'Failed to load pending edits');
@@ -207,7 +229,7 @@ export function useFilePendingTurns(
     return () => {
       cancelled = true;
     };
-  }, [workspaceId, filePath, invalidationToken]);
+  }, [workspaceId, filePath, invalidationToken, fetcher]);
 
   // Chat-side TurnEditsCard loads `/api/workspace/turn-edits` and writes the
   // full payload to the shared cache before `file-pending-edits` returns.
@@ -259,7 +281,7 @@ export function useFilePendingTurns(
       }
       void (async () => {
         try {
-          const response = await fetch('/api/workspace/turn-edits/keep-chunk', {
+          const response = await fetcher('/api/workspace/turn-edits/keep-chunk', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -299,7 +321,7 @@ export function useFilePendingTurns(
         }
       })();
     },
-    [payloadsByTurn, workspaceId],
+    [payloadsByTurn, workspaceId, fetcher],
   );
 
   const undoChunk = useCallback(
@@ -307,7 +329,7 @@ export function useFilePendingTurns(
       if (activeUndoKey) return;
       setActiveUndoKey(`${assistantMessageId}:${fp}:${chunkId}`);
       try {
-        const response = await fetch('/api/workspace/turn-edits/undo-chunk', {
+        const response = await fetcher('/api/workspace/turn-edits/undo-chunk', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ assistantMessageId, filePath: fp, chunkId, workspaceId }),
@@ -332,13 +354,14 @@ export function useFilePendingTurns(
         setActiveUndoKey(null);
       }
     },
-    [activeUndoKey, workspaceId],
+    [activeUndoKey, workspaceId, fetcher],
   );
 
   const turns = useMemo<FilePendingTurn[]>(
     () =>
       summaries.map((summary) => ({
         assistantMessageId: summary.assistantMessageId,
+        jumpMessageId: summary.jumpMessageId ?? null,
         chatId: summary.chatId ?? null,
         authorId: summary.authorId ?? null,
         createdAt: summary.createdAt ?? null,
@@ -351,6 +374,7 @@ export function useFilePendingTurns(
 
   return {
     turns,
+    suggestionTurns,
     loading: summaryLoading,
     error: summaryError,
     activeUndoKey,

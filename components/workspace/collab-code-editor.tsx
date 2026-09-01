@@ -1,32 +1,61 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { LockSimpleIcon } from '@phosphor-icons/react';
+import { createPortal } from 'react-dom';
+import { ChatTeardropTextIcon, LockSimpleIcon, SparkleIcon } from '@phosphor-icons/react';
 import { HocuspocusProvider } from '@hocuspocus/provider';
 import * as Y from 'yjs';
 import type { editor as MonacoEditorType } from 'monaco-editor';
 import { ensureCodeText } from '@/lib/collab/code-text';
-import { MonacoEditor, getCodeEditorOptions, getCodeLanguage } from '@/components/workspace/code-viewer';
+import { MonacoEditor, getCodeEditorOptions, getCodeLanguage, defineMonacoThemes, preloadMonaco, useMonacoTheme } from '@/components/workspace/code-viewer';
+import {
+  BUBBLE_LABEL_ACCENT,
+  BUBBLE_LABEL_BUTTON,
+  BUBBLE_SURFACE,
+  SELECTION_SAMPLE_LIMIT,
+} from '@/components/workspace/editor-bubble-menu';
 import { EditorSkeleton } from '@/components/workspace/editor-skeleton';
 import {
   registerLatexCompletions,
   setLatexProjectContext,
 } from '@/lib/latex/register-latex-completions';
 import { fetchLatexProjectContext } from '@/lib/latex/fetch-latex-project-context';
+import {
+  clearAutocompleteContext,
+  isAutocompleteSupportedLanguage,
+  registerAutocompleteProvider,
+  registerAutocompleteToggleAction,
+  setAutocompleteContext,
+} from '@/lib/workspace/autocomplete/monaco-inline-completions';
+import { isAutocompleteEnabled } from '@/lib/workspace/autocomplete/flag';
+import { attachSyncTexBindings } from '@/lib/latex/synctex-editor';
 import { fetchWorkspaceHost, resolveCollabUrl, type ConnectionStatus } from '@/lib/workspace/collab-url';
 import { DIFF_CHECK_ICON_SVG, DIFF_X_ICON_SVG } from '@/lib/workspace/diff-action-icons';
+import { authorButton } from '@/lib/workspace/suggestion-marks';
+import { AutocompleteStatusChip } from '@/components/workspace/autocomplete-status-chip';
+import { SuggestionReviewBar } from '@/components/workspace/suggestion-review-bar';
+import { pickColor } from '@/components/collab-bubbles';
 import { isEditorImageFile } from '@/lib/workspace/heic';
 import {
   acquireProvider,
   releaseProvider,
   useWorkspaceCollabSocket,
+  useWorkspaceCollabSocketPending,
 } from '@/lib/workspace/collab-socket-context';
 import { useCollabSyncWatchdog } from '@/lib/workspace/use-collab-sync-watchdog';
 import { trackYDocUserEdits } from '@/lib/analytics/document-edit-tracker';
+import { track } from '@/lib/analytics/track';
 import { LATEX_IMAGE_EXT_RE, relativeToTexDir, texHasGraphicx } from '@/lib/workspace/latex-image';
 import { formatLatexSnippet, type LatexSnippet } from '@/lib/workspace/latex-snippets';
+import type { LatexMarker } from '@/lib/workspace/latex-log-navigation';
 import { matchPendingHunks, type PendingHunkInput } from '@/lib/workspace/pending-hunks-match';
 import { setFreezeContext, fileTypeFromPath } from '@/lib/perf/freeze-monitor';
+import {
+  afterNextPaint,
+  finishFileSync,
+  finishFileVisible,
+  startFileOpen,
+} from '@/lib/perf/file-open-timing';
 import { codeSuggestionRender } from '@/lib/workspace/code-suggestion-render';
 import { CODE_SUGGESTIONS_ROOT, CODE_RESOLVED_ROOT, acceptCodeSuggestion, rejectCodeSuggestion } from '@/lib/crdt-js/code_suggestions.mjs';
 import { installCodeSuggestStaging, ledgerResolveId, type CodeSuggestMeta } from '@/lib/workspace/code-suggest-staging';
@@ -46,9 +75,10 @@ import {
 } from '@/lib/workspace/inline-word-diff';
 import { normalizeForDiff } from '@/lib/workspace/pending-additions-match';
 import { isHumanReviewId } from '@/lib/workspace/human-suggestions';
+import { ledgerUnbackedAdditions } from '@/lib/workspace/pending-additions';
 import { isMarkdownFile } from '@/lib/sync/policy';
 import type { TurnEditLine } from '@/lib/workspace/turn-edits';
-import { pickCommentAtPos, type DocCommentThread, type DraftDocCommentSelection } from '@/lib/workspace/doc-comments';
+import { pickCommentAtPos, retryUntilDone, type DocCommentThread, type DraftDocCommentSelection } from '@/lib/workspace/doc-comments';
 import {
   buildCodeCommentSelection,
   resolveCodeCommentAnchorRange,
@@ -58,6 +88,9 @@ import {
 type CollabUser = {
   name: string;
   color: string;
+  /** Presence-channel key (`user:<id>` / `anon:<id>`) broadcast into awareness
+   *  so a clicked presence bubble can find this client's caret. */
+  presenceKey?: string;
 };
 
 // Translate a character offset within freshly-inserted snippet text into a
@@ -81,6 +114,11 @@ function snippetOffsetToPosition(
 export type CodeEditorHandle = {
   getText: () => string;
   revealLine?: (line: number) => void;
+  /** 1-based cursor line (SyncTeX forward search); null before Monaco mounts. */
+  getCursorLine?: () => number | null;
+  /** Anchor a comment on a character range of THIS file's Y.Text (the PDF
+   *  selection path — Monaco's own path goes through its Comment action). */
+  buildCommentSelectionFromOffsets?: (from: number, to: number) => DraftDocCommentSelection | null;
   /** Insert/wrap a LaTeX snippet at the current selection (toolbar actions). */
   insertLatexSnippet?: (snippet: LatexSnippet) => void;
   /** Insert raw text at the cursor, replacing any selection (e.g. a symbol). */
@@ -133,6 +171,13 @@ export interface CodePendingAddition {
   deletedText?: string;
   /** Optional short author label (e.g. `Sunny #354`, `turboblitz`). */
   authorLabel?: string;
+  /** Avatar imagery for the author chip (Sunny face / brand mark / overrides). */
+  authorVisual?: {
+    imageUrl?: string | null;
+    imageRound?: boolean;
+    chipLabel?: string;
+    chipColor?: string;
+  };
   /** Assistant message id this addition came from. */
   assistantMessageId?: string;
   /** Chat id that owns the assistant message — required to switch chats on jump. */
@@ -149,9 +194,16 @@ interface CollabCodeEditorProps {
   /** Workspace project id. When set the editor connects to the
    *  per-workspace warm host instead of the global Hocuspocus. */
   workspaceId?: string;
+  /** The page's workspace fetch — the sidecar shim on local workspaces, so
+   *  the LaTeX completion context resolves there instead of 404ing on the
+   *  real Next API. Defaults to global fetch. */
+  apiFetch?: typeof fetch;
   user: CollabUser;
   onReady?: (payload: ReadyPayload) => void;
   onContentChange?: (text: string) => void;
+  /** Fires on every LOCAL Y.Text transaction (this tab's own typing) — remote
+   *  and agent edits don't. The LaTeX auto-compile authorship gate (§1.2). */
+  onLocalEdit?: () => void;
   onConnectionStatusChange?: (status: ConnectionStatus) => void;
   className?: string;
   hidden?: boolean;
@@ -199,7 +251,38 @@ interface CollabCodeEditorProps {
   /** "Comment" action / Cmd-Opt-M built a selection to comment on. */
   onStartCommentDraft?: (selection: DraftDocCommentSelection) => void;
   /** Reports each thread's (and the draft's) vertical center for lane layout. */
-  onReportCommentAnchors?: (data: { offsets: Record<string, number>; draftOffset: number | null }) => void;
+  /** `attempted: false` = anchors could not be measured this pass (no lane row
+   *  yet) — the lane must not treat the empty offsets as authoritative. */
+  onReportCommentAnchors?: (data: {
+    offsets: Record<string, number>;
+    draftOffset: number | null;
+    attempted?: boolean;
+    /** 1-based source start line per thread — the PDF comment markers map
+     *  these through SyncTeX forward search. Reported even when the lane row
+     *  is missing (`attempted: false`): line resolution doesn't need it. */
+    lines?: Record<string, number>;
+  }) => void;
+  /** Scroll to a remote collaborator's caret in this doc (bubble click).
+   *  Same contract as CollabEditor's prop — y-monaco publishes the caret
+   *  under awareness `selection` rather than `cursor`. */
+  revealPeer?: {
+    seq: number;
+    presenceKey?: string | null;
+    name?: string | null;
+    color?: string | null;
+  } | null;
+  /** Reveal delivered (scrolled) or given up — the owner clears the request
+   *  so a later remount of this file can't replay it. */
+  onRevealPeerDone?: (seq: number) => void;
+  /** Editor gained focus — presence uses this to broadcast which file the
+   *  user is actually editing (split panes make "the selected file" wrong). */
+  onFocused?: () => void;
+  /** LaTeX compile problems for THIS file — rendered as Monaco markers +
+   *  gutter bars (spec §1.9). Omit / empty clears them. */
+  compileMarkers?: LatexMarker[];
+  /** Forward SyncTeX (.tex only): the "Show in PDF" context-menu action and
+   *  its Ctrl/Cmd+Alt+J chord jump the PDF to the cursor line. */
+  onShowInPdf?: () => void;
 }
 
 export function CollabCodeEditor({
@@ -207,9 +290,11 @@ export function CollabCodeEditor({
   filePath,
   collabPath,
   workspaceId,
+  apiFetch,
   user,
   onReady,
   onContentChange,
+  onLocalEdit,
   onConnectionStatusChange,
   className,
   hidden = false,
@@ -231,6 +316,11 @@ export function CollabCodeEditor({
   onSelectComment,
   onStartCommentDraft,
   onReportCommentAnchors,
+  revealPeer,
+  onRevealPeerDone,
+  onFocused,
+  compileMarkers,
+  onShowInPdf,
 }: CollabCodeEditorProps) {
   // Attribution stamped onto suggestions the local user stages in suggest mode.
   // Read through a ref so it doesn't churn the y-monaco binding when `user` changes.
@@ -254,6 +344,10 @@ export function CollabCodeEditor({
   onSelectCommentRef.current = onSelectComment;
   const onStartCommentDraftRef = useRef(onStartCommentDraft);
   onStartCommentDraftRef.current = onStartCommentDraft;
+  // A rename keeps the editor mounted (keyed by fileId) — onMount closures
+  // must read the path through this ref or they'd pin the pre-rename path.
+  const filePathRef = useRef(filePath);
+  filePathRef.current = filePath;
   const onReportCommentAnchorsRef = useRef(onReportCommentAnchors);
   onReportCommentAnchorsRef.current = onReportCommentAnchors;
   // Live resolved comment ranges (`[from, to)` char offsets) for click hit-testing.
@@ -275,6 +369,9 @@ export function CollabCodeEditor({
     /** Buffer line just BELOW which to place the pill (i.e. the line whose
      *  top sits at the bottom of the chunk). */
     placeAtLineTop: number;
+    /** The chunk's own line span — the hover range that reveals this pill. */
+    fromLine: number;
+    toLine: number;
   };
   const actionsOverlaysRef = useRef<Map<string, ActionsOverlayEntry>>(new Map());
   // Live per-apply lookups the (possibly-reused) overlay click handler reads, so
@@ -308,11 +405,19 @@ export function CollabCodeEditor({
 
   const fallbackCollabUrl = resolveCollabUrl();
   const sharedSocket = useWorkspaceCollabSocket(workspaceId);
+  const sharedSocketPending = useWorkspaceCollabSocketPending();
+  // Start the Monaco download now, in parallel with the Y.Doc sync that gates
+  // the editor mount below.
+  useEffect(() => {
+    preloadMonaco();
+  }, []);
   const [hostCollabUrl, setHostCollabUrl] = useState<string | undefined>(undefined);
   const [hostToken, setHostToken] = useState<string | undefined>(undefined);
   const [hostDocNamePrefix, setHostDocNamePrefix] = useState<string | null>(null);
   useEffect(() => {
-    if (!workspaceId || sharedSocket) {
+    // A shared socket that is still opening makes this fallback redundant
+    // (and it would otherwise fire one throwaway /host request per mount).
+    if (!workspaceId || sharedSocket || sharedSocketPending) {
       setHostCollabUrl(undefined);
       setHostToken(undefined);
       return;
@@ -332,7 +437,7 @@ export function CollabCodeEditor({
       cancelled = true;
       controller.abort();
     };
-  }, [workspaceId, sharedSocket]);
+  }, [workspaceId, sharedSocket, sharedSocketPending]);
 
   // Feed the shared LaTeX completion provider this project's labels / `.bib`
   // keys / file paths. Best-effort and `.tex`-only; the provider is registered
@@ -340,13 +445,13 @@ export function CollabCodeEditor({
   useEffect(() => {
     if (!workspaceId || getCodeLanguage(filePath) !== 'latex') return;
     let cancelled = false;
-    void fetchLatexProjectContext(workspaceId).then((context) => {
+    void fetchLatexProjectContext(workspaceId, apiFetch).then((context) => {
       if (!cancelled) setLatexProjectContext(context);
     });
     return () => {
       cancelled = true;
     };
-  }, [workspaceId, filePath]);
+  }, [workspaceId, filePath, apiFetch]);
 
   const effectiveHostCollabUrl = sharedSocket?.collabUrl ?? hostCollabUrl;
   const effectiveDocNamePrefix = sharedSocket?.docNamePrefix ?? hostDocNamePrefix;
@@ -356,8 +461,15 @@ export function CollabCodeEditor({
   const [provider, setProvider] = useState<HocuspocusProvider | null>(null);
   const [ydoc, setYdoc] = useState<Y.Doc | null>(null);
   const [initialSyncReady, setInitialSyncReady] = useState(!collabUrl);
+  const [syncVerified, setSyncVerified] = useState(!collabUrl);
+  const [openedFromBootstrap, setOpenedFromBootstrap] = useState(false);
+  const effectiveReadOnly = readOnly || (!!collabUrl && !syncVerified);
+  const openTimingRef = useRef<ReturnType<typeof startFileOpen> | null>(null);
+  if (!openTimingRef.current || openTimingRef.current.fileId !== fileId) {
+    openTimingRef.current = startFileOpen(fileId, undefined, !hidden);
+  }
   const [editorHeight, setEditorHeight] = useState(500);
-  const [lineCount, setLineCount] = useState(1);
+  const monacoTheme = useMonacoTheme();
   const [editorMounted, setEditorMounted] = useState(false);
   const [bindingReady, setBindingReady] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -373,12 +485,36 @@ export function CollabCodeEditor({
   const monacoNsRef = useRef<typeof import('monaco-editor') | null>(null);
   const modelRef = useRef<MonacoEditorType.ITextModel | null>(null);
   const revealFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Decoration ids of the live line flash, so a repeat jump replaces it.
+  const revealFlashIdsRef = useRef<string[]>([]);
   const contentSubscriptionRef = useRef<Disposable | null>(null);
+  // Trailing-debounce handle for large-document onContentChange propagation.
+  const contentNotifyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const currentTextRef = useRef('');
   const ydocRef = useRef<Y.Doc | null>(null);
   ydocRef.current = ydoc;
   const canResolveSuggestionsRef = useRef(canResolveSuggestions);
-  canResolveSuggestionsRef.current = canResolveSuggestions;
+  canResolveSuggestionsRef.current = canResolveSuggestions && !effectiveReadOnly;
+  // Drives the whole-file Accept all / Reject all bar (shared with markdown —
+  // see SuggestionReviewBar). Same-value sets are React no-ops, so updating it
+  // from the decoration apply pass costs nothing on quiet passes.
+  const [pendingReviewCount, setPendingReviewCount] = useState(0);
+
+  // Ghost-text autocomplete context, keyed by THIS editor's model — split
+  // panes mount two editors on two files, and the register-once provider
+  // resolves which one it is answering for from the model it is handed.
+  useEffect(() => {
+    const model = monacoEditorRef.current?.getModel();
+    if (!editorMounted || !model || !workspaceId) return;
+    setAutocompleteContext(model, {
+      projectId: workspaceId,
+      filePath,
+      language: getCodeLanguage(filePath),
+      readOnly,
+      fetchImpl: apiFetch,
+    });
+    return () => clearAutocompleteContext(model);
+  }, [editorMounted, workspaceId, filePath, readOnly, apiFetch]);
 
   // Resolve a Keep/Undo by its pending-addition key — ledger-backed suggestions
   // (local user edits, agent turns the poll already staged) resolve straight in
@@ -464,6 +600,17 @@ export function CollabCodeEditor({
   const editorHandle = useMemo<CodeEditorHandle>(
     () => ({
       getText: () => modelRef.current?.getValue() ?? currentTextRef.current,
+      getCursorLine: () => monacoEditorRef.current?.getPosition()?.lineNumber ?? null,
+      buildCommentSelectionFromOffsets: (from: number, to: number) => {
+        const ydoc = ydocRef.current;
+        const model = modelRef.current;
+        if (!ydoc || !model) return null;
+        const text = model.getValue();
+        const lo = Math.max(0, Math.min(from, to));
+        const hi = Math.min(text.length, Math.max(from, to));
+        if (lo >= hi) return null;
+        return buildCodeCommentSelection(ydoc, lo, hi, text.slice(lo, hi));
+      },
       revealLine: (line: number) => {
         const editor = monacoEditorRef.current;
         const monaco = monacoNsRef.current;
@@ -475,12 +622,17 @@ export function CollabCodeEditor({
         editor.focus();
         // Flash the line so a SyncTeX inverse / search jump is visible even when
         // the target is already on screen (short docs don't scroll).
-        const ids = editor.deltaDecorations([], [
+        // Replace (not add): a second jump within the 1.5s window resets the
+        // shared timer, so an added decoration would never be removed — and
+        // under reduced motion the flash is a static highlight that would then
+        // stay lit forever.
+        revealFlashIdsRef.current = editor.deltaDecorations(revealFlashIdsRef.current, [
           { range: new monaco.Range(lineNumber, 1, lineNumber, 1), options: { isWholeLine: true, className: 'stx-line-flash' } },
         ]);
         if (revealFlashTimerRef.current) clearTimeout(revealFlashTimerRef.current);
         revealFlashTimerRef.current = setTimeout(() => {
-          monacoEditorRef.current?.deltaDecorations(ids, []);
+          monacoEditorRef.current?.deltaDecorations(revealFlashIdsRef.current, []);
+          revealFlashIdsRef.current = [];
         }, 1500);
       },
       insertLatexSnippet: (snippet: LatexSnippet) => {
@@ -563,6 +715,7 @@ export function CollabCodeEditor({
   useEffect(() => {
     setConnectionStatus(collabUrl ? 'connecting' : 'local');
     setInitialSyncReady(!collabUrl);
+    setSyncVerified(!collabUrl);
     setBindingReady(false);
     setProvider(null);
     if (!sharedSocket) {
@@ -577,16 +730,18 @@ export function CollabCodeEditor({
   useEffect(() => {
     setConnectionStatus(collabUrl ? 'connecting' : 'local');
     setInitialSyncReady(!collabUrl);
+    setSyncVerified(!collabUrl);
     setBindingReady(false);
     setProvider(null);
     if (!sharedSocket) {
       setYdoc(localYdoc);
     }
-    setLineCount(1);
     setEditorMounted(false);
     currentTextRef.current = '';
     contentSubscriptionRef.current?.dispose();
     contentSubscriptionRef.current = null;
+    if (contentNotifyTimerRef.current) clearTimeout(contentNotifyTimerRef.current);
+    contentNotifyTimerRef.current = null;
     bindingRef.current?.destroy();
     bindingRef.current = null;
     monacoEditorRef.current = null;
@@ -608,6 +763,9 @@ export function CollabCodeEditor({
     entry.provider.awareness?.setLocalStateField('user', user);
     setProvider(entry.provider);
     setYdoc(entry.ydoc);
+    setOpenedFromBootstrap(entry.bootstrapped);
+    setInitialSyncReady(entry.bootstrapped || entry.provider.synced);
+    setSyncVerified(entry.provider.synced);
 
     return () => {
       releaseProvider(sharedSocket.socket, docName, fileId);
@@ -649,7 +807,7 @@ export function CollabCodeEditor({
   // native undo. Remote edits carry the provider's origin and stay untracked, so
   // Cmd+Z only ever reverts the local user's own changes (Google-Docs semantics).
   useEffect(() => {
-    if (!ydoc || readOnly) {
+    if (!ydoc || effectiveReadOnly) {
       undoManagerRef.current?.destroy();
       undoManagerRef.current = null;
       return;
@@ -663,7 +821,20 @@ export function CollabCodeEditor({
       um.destroy();
       if (undoManagerRef.current === um) undoManagerRef.current = null;
     };
-  }, [ydoc, readOnly]);
+  }, [ydoc, effectiveReadOnly]);
+
+  // Local-authorship signal: `txn.local` is true only for THIS tab's own
+  // transactions (typing, undo), never for remote/agent updates applied by
+  // the provider. Ref-based side effect, O(1) per transaction.
+  useEffect(() => {
+    if (!ydoc || !onLocalEdit) return;
+    const ytext = ensureCodeText(ydoc);
+    const handler = (_event: Y.YTextEvent, txn: Y.Transaction) => {
+      if (txn.local) onLocalEdit();
+    };
+    ytext.observe(handler);
+    return () => ytext.unobserve(handler);
+  }, [ydoc, onLocalEdit]);
 
   useEffect(() => {
     const model = modelRef.current;
@@ -704,7 +875,7 @@ export function CollabCodeEditor({
       // as plain text — the code analog of the markdown marks model. The binding
       // origin tags each staged burst so it shares the undo stack above. Falls
       // back to the server-poll path if the staging install can't take (null).
-      if (editMode === 'suggest' && !readOnly) {
+      if (editMode === 'suggest' && !effectiveReadOnly) {
         stagingSub = installCodeSuggestStaging(binding, model, ydoc, () => stagingMetaRef.current, binding);
       }
       setBindingReady(true);
@@ -720,7 +891,7 @@ export function CollabCodeEditor({
       }
       binding?.destroy();
     };
-  }, [editorMounted, onContentChange, provider, ydoc, editMode, readOnly]);
+  }, [editorMounted, onContentChange, provider, ydoc, editMode, effectiveReadOnly]);
 
   useEffect(() => {
     const awareness = provider?.awareness;
@@ -751,6 +922,82 @@ export function CollabCodeEditor({
       styleEl.remove();
     };
   }, [provider]);
+
+  // Report focus upward for presence: the file whose editor was last focused
+  // is what this user is "in", regardless of which split pane holds it.
+  const onFocusedRef = useRef(onFocused);
+  onFocusedRef.current = onFocused;
+  useEffect(() => {
+    const editor = monacoEditorRef.current;
+    if (!editorMounted || !editor) return;
+    const sub = editor.onDidFocusEditorText(() => onFocusedRef.current?.());
+    return () => sub.dispose();
+  }, [editorMounted]);
+
+  // Jump-to-peer (bubble click): find the peer's caret in this doc's awareness
+  // (y-monaco publishes it as `selection`, relative positions on the ytext)
+  // and center it. Awareness/binding may still be syncing right after the file
+  // opens — retry across frames (~10s), then give up silently.
+  const revealPeerSeqRef = useRef(0);
+  const onRevealPeerDoneRef = useRef(onRevealPeerDone);
+  onRevealPeerDoneRef.current = onRevealPeerDone;
+  useEffect(() => {
+    const req = revealPeer;
+    if (!req || req.seq === revealPeerSeqRef.current) return;
+    const awareness = provider?.awareness;
+    if (!awareness || !ydoc) return;
+    revealPeerSeqRef.current = req.seq;
+    let attempts = 0;
+    return retryUntilDone(
+      () => {
+        // Give-up must run BEFORE retryUntilDone's own frame cap (700 below)
+        // exhausts, or the request would survive unreported and replay later.
+        if (++attempts >= 600) {
+          onRevealPeerDoneRef.current?.(req.seq);
+          return true;
+        }
+        const editor = monacoEditorRef.current;
+        const model = modelRef.current;
+        if (!editor || !model || model.isDisposed()) return false;
+        for (const [clientId, state] of awareness.getStates()) {
+          if (clientId === awareness.clientID) continue;
+          const peer = (state as { user?: { name?: string; color?: string; presenceKey?: string } })
+            .user;
+          if (!peer) continue;
+          const matched =
+            req.presenceKey && peer.presenceKey
+              ? peer.presenceKey === req.presenceKey
+              : Boolean(req.name) &&
+                peer.name === req.name &&
+                (!req.color || peer.color === req.color);
+          if (!matched) continue;
+          const selection = (state as { selection?: { anchor?: unknown; head?: unknown } | null })
+            .selection;
+          const rel = selection?.head ?? selection?.anchor;
+          if (!rel) continue; // no caret published — keep retrying until timeout
+          let index: number | null = null;
+          try {
+            const abs = Y.createAbsolutePositionFromRelativePosition(
+              Y.createRelativePositionFromJSON(rel),
+              ydoc,
+            );
+            index = abs ? abs.index : null;
+          } catch {
+            index = null;
+          }
+          if (index === null) return false; // ytext still syncing
+          const position = model.getPositionAt(Math.min(index, model.getValueLength()));
+          editor.revealPositionInCenter(position, 0 /* ScrollType.Smooth */);
+          onRevealPeerDoneRef.current?.(req.seq);
+          return true;
+        }
+        return false; // peer not in this room's awareness yet — retry
+      },
+      requestAnimationFrame,
+      cancelAnimationFrame,
+      700,
+    );
+  }, [revealPeer, provider, ydoc]);
 
   useEffect(() => {
     if (!collabUrl) {
@@ -786,38 +1033,77 @@ export function CollabCodeEditor({
   }, [connectionStatus, onConnectionStatusChange]);
 
   useEffect(() => {
+    const timing = openTimingRef.current;
+    if (!timing || hidden || !bindingReady || !editorMounted || !ydoc || timing.fileId !== fileId || timing.visible) return;
+    return afterNextPaint(() => {
+      if (openTimingRef.current !== timing || hidden) return;
+      const measurement = finishFileVisible(timing);
+      if (!measurement) return;
+      track('file_open_performance', {
+        projectId: workspaceId,
+        fileId,
+        path: filePath,
+        editor: 'code',
+        phase: 'visible',
+        bootstrap: openedFromBootstrap,
+        elapsedMs: measurement.elapsedMs,
+        openKind: measurement.openKind,
+        ...(measurement.navigationElapsedMs !== undefined
+          ? { navigationToVisibleMs: measurement.navigationElapsedMs }
+          : {}),
+      });
+    });
+  }, [bindingReady, editorMounted, fileId, filePath, hidden, openedFromBootstrap, workspaceId, ydoc]);
+
+  useEffect(() => {
+    const timing = openTimingRef.current;
+    if (!timing || !syncVerified || !provider || timing.fileId !== fileId || timing.synced) return;
+    const measurement = finishFileSync(timing);
+    if (!measurement) return;
+    track('file_open_performance', {
+      projectId: workspaceId,
+      fileId,
+      path: filePath,
+      editor: 'code',
+      phase: 'sync_verified',
+      bootstrap: openedFromBootstrap,
+      elapsedMs: measurement.elapsedMs,
+      openKind: measurement.openKind,
+      ...(measurement.navigationElapsedMs !== undefined
+        ? { navigationToSyncMs: measurement.navigationElapsedMs }
+        : {}),
+    });
+  }, [fileId, filePath, openedFromBootstrap, provider, syncVerified, workspaceId]);
+
+  useEffect(() => {
     if (!collabUrl) {
       setInitialSyncReady(true);
+      setSyncVerified(true);
       return;
     }
     if (!provider) {
       setInitialSyncReady(false);
+      setSyncVerified(false);
       return;
     }
     if (provider.synced) {
       setInitialSyncReady(true);
+      setSyncVerified(true);
       return;
     }
-    setInitialSyncReady(false);
+    setSyncVerified(false);
     const markReady = () => {
       setInitialSyncReady(true);
+      setSyncVerified(true);
     };
     const handleSync = (synced: boolean) => {
       if (synced) markReady();
     };
-    const handleStatus = (event: { status: string }) => {
-      if (event.status === 'connected') markReady();
-    };
-    const seedStatus =
-      (provider.configuration.websocketProvider as { status?: string } | undefined)?.status;
-    if (seedStatus === 'connected') markReady();
     provider.on?.('synced', markReady);
     provider.on?.('sync', handleSync);
-    provider.on?.('status', handleStatus);
     return () => {
       provider.off?.('synced', markReady);
       provider.off?.('sync', handleSync);
-      provider.off?.('status', handleStatus);
     };
   }, [collabUrl, docName, fileId, filePath, provider]);
 
@@ -827,7 +1113,7 @@ export function CollabCodeEditor({
     enabled: !!collabUrl,
     provider,
     reconnect: sharedSocket?.reconnect,
-    syncSignal: initialSyncReady,
+    syncSignal: syncVerified,
   });
 
   useEffect(() => {
@@ -844,10 +1130,10 @@ export function CollabCodeEditor({
       fileId,
       filePath,
       mode: 'code',
-      readOnly,
+      readOnly: effectiveReadOnly,
       provider,
     });
-  }, [ydoc, provider, workspaceId, fileId, filePath, readOnly, sharedSocket?.isLocal]);
+  }, [ydoc, provider, workspaceId, fileId, filePath, effectiveReadOnly, sharedSocket?.isLocal]);
 
 
   // Apply / refresh inline diff decorations + overlays when pendingAdditions
@@ -976,6 +1262,13 @@ export function CollabCodeEditor({
     };
 
     const repositionActionOverlays = () => {
+      if (actionsOverlaysRef.current.size === 0) return;
+      const layout = editor.getLayoutInfo();
+      const contentLeft = layout?.contentLeft ?? 64;
+      const contentWidth = layout?.contentWidth ?? layout?.width ?? 800;
+      // Read phase, then write phase: interleaving offsetWidth reads with
+      // style writes forces a reflow per pill on every scroll tick.
+      const placements: Array<{ dom: HTMLElement; top: number; left: number }> = [];
       for (const entry of actionsOverlaysRef.current.values()) {
         const pos = editor.getScrolledVisiblePosition({
           lineNumber: entry.placeAtLineTop,
@@ -985,15 +1278,15 @@ export function CollabCodeEditor({
         // Place the pill so its TOP sits exactly one line height above the
         // anchor line's top — i.e. inside the 1-row spacer view zone we
         // reserved between the chunk and the next buffer line.
-        const layout = editor.getLayoutInfo();
-        const contentLeft = layout?.contentLeft ?? 64;
-        const contentWidth = layout?.contentWidth ?? layout?.width ?? 800;
-        const rightAlignedLeft = Math.max(
-          contentLeft,
-          contentLeft + contentWidth - entry.dom.offsetWidth - 8,
-        );
-        entry.dom.style.top = `${pos.top - lineHeightPx}px`;
-        entry.dom.style.left = `${rightAlignedLeft}px`;
+        placements.push({
+          dom: entry.dom,
+          top: pos.top - lineHeightPx,
+          left: Math.max(contentLeft, contentLeft + contentWidth - entry.dom.offsetWidth - 8),
+        });
+      }
+      for (const p of placements) {
+        p.dom.style.top = `${p.top}px`;
+        p.dom.style.left = `${p.left}px`;
       }
     };
 
@@ -1022,8 +1315,11 @@ export function CollabCodeEditor({
       // staged yet (matched by `matchPendingHunks`). A turn the ledger DID stage is
       // dropped from the prop so a just-resolved suggestion can't be re-shown as
       // pending from the (not-yet-updated) prop — a real editor↔prop divergence.
+      // One full-text snapshot per pass — getValue() rebuilds the whole
+      // document string, which is real cost on large files.
+      const bufferText = model.getValue();
       const ledger = ydoc
-        ? codeSuggestionRender(ydoc, model.getValue(), { canMutate: !readOnly })
+        ? codeSuggestionRender(ydoc, bufferText, { canMutate: !effectiveReadOnly })
         : { matches: [], chunks: [] };
       // The main editor shows every live ledger suggestion in the file; a
       // read-only REVIEW mount (diff-review-flow) passes `pendingAdditions` scoped
@@ -1061,18 +1357,10 @@ export function CollabCodeEditor({
       // ledger-backed turns across applies so a turn that resolved to an empty
       // ledger isn't re-shown from the prop.
       for (const c of ledgerChunks) if (c.assistantMessageId) ledgerBackedTurnsRef.current.add(c.assistantMessageId);
-      const propOnly = (pendingAdditionsRef.current ?? []).filter(
-        (a) =>
-          // HUMAN suggest runs are ALWAYS ledger-backed now — client-staged here,
-          // server-staged via the poll, persisted in ydoc_state — so the server's
-          // `human-<rowId>` copy is a DUPLICATE: showing it would repaint a
-          // just-accepted suggestion as pending and flicker the overlay whenever
-          // the ledger is transiently empty. (Codex P1 — ledger↔prop divergence.)
-          !(a.groupKey && isHumanReviewId(a.groupKey)) &&
-          // …and drop any agent turn the ledger already staged (resolved included).
-          (!a.assistantMessageId || !ledgerBackedTurnsRef.current.has(a.assistantMessageId)),
-      );
-      const additions: CodePendingAddition[] = [...ledgerChunks, ...propOnly];
+      const additions: CodePendingAddition[] = [
+        ...ledgerChunks,
+        ...ledgerUnbackedAdditions(pendingAdditionsRef.current ?? [], ledgerBackedTurnsRef.current),
+      ];
       // Freeze-detector context: cheap metrics so a stall report can tell whether
       // this surface's cost is doc-size- or pending-suggestion-driven. Report the
       // FULL editor field set (nulling what this surface doesn't track) so a
@@ -1117,7 +1405,14 @@ export function CollabCodeEditor({
       let hasUnlinkedAuthor = false;
       for (const a of additions) {
         if (a.authorLabel) distinctAuthors.add(a.authorLabel);
-        if (a.authorLabel === 'Sunny' || a.authorLabel?.startsWith('Sunny #')) hasSunnyAuthor = true;
+        // Matches the current "Agent #N" / "Sundial Agent" labels plus legacy
+        // "Sunny"/"Sunny #N" rows.
+        if (
+          a.authorLabel === 'Sunny' ||
+          a.authorLabel === 'Sundial Agent' ||
+          a.authorLabel?.startsWith('Sunny #') ||
+          a.authorLabel?.startsWith('Agent #')
+        ) hasSunnyAuthor = true;
         if (a.authorLabel && !a.assistantMessageId) hasUnlinkedAuthor = true;
       }
       const showAuthorChip = hasSunnyAuthor || hasUnlinkedAuthor || distinctAuthors.size >= 2;
@@ -1125,10 +1420,11 @@ export function CollabCodeEditor({
       // Build hunk inputs. Skip additions that lack the structured `lines`
       // payload — those legacy callers fall through to the trimmed-line
       // fallback below.
-      const bufferLines = model.getValue().split('\n');
+      const bufferLines = bufferText.split('\n');
       const hunkInputs: PendingHunkInput[] = [];
       const chunkByKey = new Map<string, CodePendingAddition>();
       chunkByKeyRef.current = chunkByKey;
+      setPendingReviewCount(additions.length);
       const legacyOnly: CodePendingAddition[] = [];
       for (const a of additions) {
         chunkByKey.set(a.key, a);
@@ -1147,9 +1443,11 @@ export function CollabCodeEditor({
       type DeletionZone = { afterLine: number; lines: string[]; htmlLines: string[]; chunkKey: string };
       type ActionsAnchor = {
         afterLine: number;
+        startLine: number;
         chunkKey: string;
         grouped: boolean;
         authorLabel: string | null;
+        authorVisual: CodePendingAddition['authorVisual'] | null;
         assistantMessageId: string | null;
         chatId: string | null;
       };
@@ -1263,9 +1561,11 @@ export function CollabCodeEditor({
             if (group) actionsRenderedForGroup.add(group);
             actionsAnchors.push({
               afterLine: Math.max(0, anchor),
+              startLine: Math.max(1, m.addStartLine),
               chunkKey: group ? `${group}:*` : m.key,
               grouped: Boolean(group),
               authorLabel: showAuthorChip ? chunk.authorLabel ?? null : null,
+              authorVisual: showAuthorChip ? chunk.authorVisual ?? null : null,
               assistantMessageId: chunk.assistantMessageId ?? null,
               chatId: chunk.chatId ?? null,
             });
@@ -1316,9 +1616,13 @@ export function CollabCodeEditor({
             // reach here — keep this per-chunk (ungrouped).
             actionsAnchors.push({
               afterLine: m.line,
+              // Legacy path matches line by line, so the run's own start isn't
+              // tracked — the hovered line IS the chunk.
+              startLine: m.line,
               chunkKey: m.chunk.key,
               grouped: false,
               authorLabel: showAuthorChip ? m.chunk.authorLabel ?? null : null,
+              authorVisual: showAuthorChip ? m.chunk.authorVisual ?? null : null,
               assistantMessageId: m.chunk.assistantMessageId ?? null,
               chatId: m.chunk.chatId ?? null,
             });
@@ -1416,7 +1720,7 @@ export function CollabCodeEditor({
       const totalLineCount = model.getLineCount();
       const overlayMap = actionsOverlaysRef.current;
       const overlaySig = (a: ActionsAnchor) =>
-        `${a.afterLine}|${a.authorLabel ?? ''}|${a.grouped}|${a.assistantMessageId ?? ''}|${a.chatId ?? ''}|${a.chunkKey}|${canResolveSuggestionsRef.current}`;
+        `${a.startLine}|${a.afterLine}|${a.authorLabel ?? ''}|${a.authorVisual?.imageUrl ?? a.authorVisual?.chipLabel ?? ''}|${a.grouped}|${a.assistantMessageId ?? ''}|${a.chatId ?? ''}|${a.chunkKey}|${canResolveSuggestionsRef.current}`;
       const desiredOverlayByKey = new Map(actionsAnchors.map((a) => [a.chunkKey, a]));
       for (const [key, entry] of overlayMap) {
         const anchor = desiredOverlayByKey.get(key);
@@ -1433,31 +1737,43 @@ export function CollabCodeEditor({
         dom.className = 'monaco-diff-pending-actions';
         dom.style.position = 'absolute';
         dom.style.zIndex = '5';
-        const authorBit = anchor.authorLabel
-          ? anchor.assistantMessageId
-            ? `<button type="button" class="diff-pending-author" data-message-id="${escapeHtml(anchor.assistantMessageId)}" data-chat-id="${escapeHtml(anchor.chatId ?? '')}" title="Jump to the chat turn that made this change">${escapeHtml(anchor.authorLabel)}</button>`
-            : `<span class="diff-pending-author" title="Suggested by ${escapeHtml(anchor.authorLabel)}">${escapeHtml(anchor.authorLabel)}</span>`
-          : '';
-        const keepTitle = anchor.grouped ? 'Accept all changes in this suggestion' : 'Keep suggestion';
-        const undoTitle = anchor.grouped ? 'Reject all changes in this suggestion' : 'Undo suggestion';
+        // The author's avatar, not their spelled-out name: Sunny's face / the
+        // agent's brand mark / an initials bubble — the same imagery as the
+        // chat list, one glyph of width beside the ✓/✕, full label in the
+        // tooltip. Same affordance as the markdown gutter's author icon.
+        const visual = anchor.authorVisual;
+        const keepTitle = anchor.grouped ? 'Accept all changes in this suggestion' : 'Accept suggestion';
+        const undoTitle = anchor.grouped ? 'Reject all changes in this suggestion' : 'Reject suggestion';
         dom.innerHTML = `
-          ${authorBit}
           ${canResolveSuggestions ? `<button type="button" class="diff-pending-undo" data-key="${escapeHtml(anchor.chunkKey)}" aria-label="${undoTitle}" title="${undoTitle}">${DIFF_X_ICON_SVG}</button>
           <button type="button" class="diff-pending-keep" data-key="${escapeHtml(anchor.chunkKey)}" aria-label="${keepTitle}" title="${keepTitle}">${DIFF_CHECK_ICON_SVG}</button>` : ''}
         `;
+        if (anchor.authorLabel) {
+          // ONE author-chip implementation across surfaces (lib/workspace/
+          // suggestion-marks): button-that-jumps when a chat turn exists,
+          // static byline span otherwise. `diff-pending-author` keeps this
+          // overlay's sizing CSS on top of the shared behavior.
+          const mid = anchor.assistantMessageId;
+          const anchorChatId = anchor.chatId;
+          const chip = authorButton({
+            label: anchor.authorLabel,
+            color: visual?.imageUrl ? undefined : pickColor(anchor.authorLabel),
+            imageUrl: visual?.imageUrl ?? null,
+            imageRound: visual?.imageRound,
+            chipLabel: visual?.chipLabel,
+            chipColor: visual?.chipColor,
+            ...(mid ? { onJump: () => onJumpToTurnRef.current?.(mid, anchorChatId) } : {}),
+          });
+          chip.classList.add('diff-pending-author');
+          dom.prepend(chip);
+        }
         const assistantMessageId = anchor.assistantMessageId;
         const chatId = anchor.chatId;
         const onPointerEvent = (event: MouseEvent) => {
           const target = event.target as HTMLElement;
-          const author = target.closest('.diff-pending-author') as HTMLElement | null;
-          if (author) {
-            event.preventDefault();
-            event.stopPropagation();
-            const messageId = author.dataset.messageId;
-            const chatIdAttr = author.dataset.chatId || null;
-            if (messageId) onJumpToTurnRef.current?.(messageId, chatIdAttr);
-            return;
-          }
+          // The shared author chip handles its own mousedown jump; swallow the
+          // paired click here so the pill's empty-space jump doesn't fire twice.
+          if (target.closest('.diff-pending-author')) return;
           const keep = target.closest('.diff-pending-keep') as HTMLElement | null;
           const undo = target.closest('.diff-pending-undo') as HTMLElement | null;
           if (!keep && !undo) {
@@ -1499,7 +1815,23 @@ export function CollabCodeEditor({
           anchor.afterLine + 1 <= totalLineCount
             ? anchor.afterLine + 1
             : Math.max(1, anchor.afterLine);
-        overlayMap.set(anchor.chunkKey, { widget, dom, placeAtLineTop, signature: overlaySig(anchor) });
+        // Clamp the hover range into the buffer. A pure-deletion chunk has an
+        // EMPTY add range (addEndLine < addStartLine), and a deletion at EOF
+        // starts past the last line — an unclamped range matches no hovered
+        // line, so the pill could never reveal and Keep/Undo became
+        // unreachable (Codex, PR #1104 round 8). Include the pill's own row so
+        // the deletion ghost + spacer count as part of the chunk.
+        const clamp = (line: number) => Math.min(Math.max(line, 1), totalLineCount);
+        const hoverFrom = clamp(Math.min(anchor.startLine, placeAtLineTop));
+        const hoverTo = clamp(Math.max(anchor.startLine, anchor.afterLine, placeAtLineTop));
+        overlayMap.set(anchor.chunkKey, {
+          widget,
+          dom,
+          placeAtLineTop,
+          fromLine: Math.min(hoverFrom, hoverTo),
+          toLine: Math.max(hoverFrom, hoverTo),
+          signature: overlaySig(anchor),
+        });
       }
       // Position all overlays (newly-added and reused).
       repositionActionOverlays();
@@ -1535,14 +1867,38 @@ export function CollabCodeEditor({
     // overlay layer (not the text layer), so a pure-CSS hover rule wouldn't
     // catch it — we drive it from the actual mouse position instead.
     const editorDom = editor.getDomNode();
+    // Reveal a suggestion's ✓/✕ pill only while the pointer is on its lines.
+    // A file that's mostly suggestions otherwise renders a pill on every chunk
+    // at once, which reads as chrome rather than as a decision to make. The
+    // pill's own row counts as part of the chunk (it sits one line below the
+    // last one) so the pointer can travel from the text onto the buttons.
+    let hoveredPillLine: number | null | undefined;
+    const setPillHover = (lineNumber: number | null) => {
+      // Same line — nothing to repaint. `null` always recomputes: it covers both
+      // "on the pill" and "off it onto empty space", which need opposite results.
+      if (lineNumber != null && lineNumber === hoveredPillLine) return;
+      hoveredPillLine = lineNumber;
+      for (const entry of actionsOverlaysRef.current.values()) {
+        // A pointer sitting ON the pill resolves to no buffer line (Monaco reports
+        // overlay-widget hits with `position: null`), so a line-only rule would
+        // hide the pill the instant you reached for ✓/✕ and drop the click. The
+        // element's own :hover keeps it up while the pointer is on it.
+        const on =
+          (lineNumber != null && lineNumber >= entry.fromLine && lineNumber <= entry.toLine + 1) ||
+          entry.dom.matches(':hover');
+        entry.dom.classList.toggle('is-hovered', on);
+      }
+    };
     const subMouseMove = editor.onMouseMove((e) => {
+      const lineNumber = e.target.position?.lineNumber ?? null;
+      setPillHover(lineNumber);
       if (!editorDom) return;
-      const lineNumber = e.target.position?.lineNumber;
       const hovering = lineNumber != null && lineJumpsRef.current.has(lineNumber);
       if (hovering) editorDom.setAttribute('data-diff-hover', '1');
       else editorDom.removeAttribute('data-diff-hover');
     });
     const subMouseLeave = editor.onMouseLeave(() => {
+      setPillHover(null);
       editorDom?.removeAttribute('data-diff-hover');
     });
     // Re-apply on editor resize so the deletion view zone's wrapped-row count
@@ -1556,11 +1912,15 @@ export function CollabCodeEditor({
         apply();
       });
     });
-    // Re-position the action pills on every scroll tick. This is cheap —
-    // it's a getBoundingClientRect-equivalent + a couple style writes per
-    // visible chunk, no DOM creation.
+    // Re-position the action pills on scroll, coalesced to one pass per frame
+    // — a wheel tick fires onDidScrollChange several times.
+    let scrollRaf = 0;
     const subScroll = editor.onDidScrollChange(() => {
-      repositionActionOverlays();
+      if (scrollRaf) return;
+      scrollRaf = window.requestAnimationFrame(() => {
+        scrollRaf = 0;
+        repositionActionOverlays();
+      });
     });
     return () => {
       subContent.dispose();
@@ -1579,7 +1939,7 @@ export function CollabCodeEditor({
       decorationCollectionRef.current?.clear();
       decorationCollectionRef.current = null;
     };
-  }, [editorMounted, ydoc, readOnly, canResolveSuggestions]);
+  }, [editorMounted, ydoc, readOnly, effectiveReadOnly, canResolveSuggestions]);
 
   // Re-apply (reconcile, don't rebuild) when the server-derived `pendingAdditions`
   // prop changes — e.g. after a Keep/Undo refetch. Driving this through a ref
@@ -1605,10 +1965,30 @@ export function CollabCodeEditor({
       | undefined;
     const lineHeightPx = fontInfo?.lineHeight ?? 20;
 
-    const compute = () => {
+    // No threads and no draft: clear any leftover decorations, report once so
+    // the lane resets, and skip the scroll/content subscriptions entirely —
+    // compute() below reads the FULL document text per scroll frame, which on
+    // large files is real per-frame cost for nothing.
+    if ((commentThreads ?? []).length === 0 && !draftCommentSelection) {
+      commentRangesRef.current = [];
+      commentDecorationsRef.current?.set([]);
+      onReportCommentAnchorsRef.current?.({ offsets: {}, draftOffset: null, lines: {} });
+      return;
+    }
+
+    // Anchor ranges move only with the CONTENT; a pure scroll frame must not
+    // re-read the full document text or re-resolve anchors (per-frame cost on
+    // large files). Cache them per model version; scroll frames fall through
+    // to the pixel measurement below.
+    let rangesVersion = -1;
+    let draft: { from: number; to: number } | null = null;
+    const resolveRanges = () => {
+      const version = model.getVersionId();
+      if (version === rangesVersion) return;
+      rangesVersion = version;
       const text = model.getValue();
       const ranges = resolveCodeCommentRanges(commentThreads ?? [], ydoc, text);
-      const draft = draftCommentSelection
+      draft = draftCommentSelection
         ? resolveCodeCommentAnchorRange(draftCommentSelection.anchor, draftCommentSelection.head, ydoc)
         : null;
       commentRangesRef.current = ranges;
@@ -1642,13 +2022,21 @@ export function CollabCodeEditor({
       } else {
         commentDecorationsRef.current = editor.createDecorationsCollection(decorations);
       }
+    };
 
+    const compute = () => {
+      resolveRanges();
+      const ranges = commentRangesRef.current;
       const report = onReportCommentAnchorsRef.current;
       if (!report) return;
+      // Source line per thread — resolvable even when pixel offsets are not
+      // (the PDF markers consume these with no lane row on screen).
+      const lines: Record<string, number> = {};
+      for (const range of ranges) lines[range.id] = model.getPositionAt(range.from).lineNumber;
       const laneRow = commentLaneRowRef?.current;
       const editorDom = editor.getDomNode();
       if (!laneRow || !editorDom) {
-        report({ offsets: {}, draftOffset: null });
+        report({ offsets: {}, draftOffset: null, attempted: false, lines });
         return;
       }
       const rowTop = laneRow.getBoundingClientRect().top;
@@ -1664,7 +2052,7 @@ export function CollabCodeEditor({
       };
       const offsets: Record<string, number> = {};
       for (const range of ranges) offsets[range.id] = centerOf(range.from, range.to);
-      report({ offsets, draftOffset: draft ? centerOf(draft.from, draft.to) : null });
+      report({ offsets, draftOffset: draft ? centerOf(draft.from, draft.to) : null, lines });
     };
 
     // Coalesce bursts (a scroll drag fires onDidScrollChange + onDidLayoutChange
@@ -1747,8 +2135,9 @@ export function CollabCodeEditor({
     const action = editor.addAction({
       id: 'sundial-comment',
       label: 'Comment',
+      // First item in the menu — comments are the emphasized action.
       contextMenuGroupId: 'navigation',
-      contextMenuOrder: 1.4,
+      contextMenuOrder: 1.1,
       keybindings: [
         monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.KeyM,
         monaco.KeyMod.WinCtrl | monaco.KeyMod.Alt | monaco.KeyCode.KeyM,
@@ -1769,6 +2158,7 @@ export function CollabCodeEditor({
   useEffect(() => {
     return () => {
       contentSubscriptionRef.current?.dispose();
+      if (contentNotifyTimerRef.current) clearTimeout(contentNotifyTimerRef.current);
       bindingRef.current?.destroy();
       providerRef.current?.destroy();
       monacoEditorRef.current = null;
@@ -1837,7 +2227,9 @@ export function CollabCodeEditor({
       for (const file of files) {
         const workspacePath = await upload(file);
         if (workspacePath && !editor.getModel()?.isDisposed()) {
-          insertReference(relativeToTexDir(filePath, workspacePath), pos);
+          // Through the ref: a cross-folder move while the upload is in
+          // flight must resolve relative to the file's CURRENT directory.
+          insertReference(relativeToTexDir(filePathRef.current, workspacePath), pos);
         }
       }
     };
@@ -1888,7 +2280,7 @@ export function CollabCodeEditor({
           event.preventDefault();
           event.stopPropagation();
           clearDndDecorations();
-          for (const p of imagePaths) insertReference(relativeToTexDir(filePath, p), pos);
+          for (const p of imagePaths) insertReference(relativeToTexDir(filePathRef.current, p), pos);
         }
       }
     };
@@ -1919,6 +2311,63 @@ export function CollabCodeEditor({
     };
   }, [editorMounted, isLatexFile, filePath]);
 
+  // Compile problems → Monaco markers (squiggle + hover) and a gutter bar per
+  // line. Re-applied on every compile result and on remount; cleared when the
+  // list empties (clean compile) or the editor unmounts. Gated on the binding
+  // (not just the mount) so the lines exist before the decorations anchor.
+  useEffect(() => {
+    const editor = monacoEditorRef.current;
+    const monaco = monacoNsRef.current;
+    const model = editor?.getModel();
+    if (!bindingReady || !editor || !monaco || !model || model.isDisposed()) return;
+    const markers = compileMarkers ?? [];
+    monaco.editor.setModelMarkers(
+      model,
+      'latex-compile',
+      markers.map((m) => ({
+        severity: m.severity === 'error' ? monaco.MarkerSeverity.Error : monaco.MarkerSeverity.Warning,
+        message: m.message,
+        startLineNumber: m.line,
+        startColumn: 1,
+        endLineNumber: m.line,
+        endColumn: model.getLineMaxColumn(Math.min(m.line, model.getLineCount())),
+      })),
+    );
+    const gutter = editor.createDecorationsCollection(
+      markers.map((m) => ({
+        range: new monaco.Range(m.line, 1, m.line, 1),
+        options: {
+          isWholeLine: true,
+          linesDecorationsClassName: `latex-compile-gutter latex-compile-gutter-${m.severity}`,
+          stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+        },
+      })),
+    );
+    return () => {
+      gutter.clear();
+      if (!model.isDisposed()) monaco.editor.setModelMarkers(model, 'latex-compile', []);
+    };
+  }, [bindingReady, compileMarkers]);
+
+  // Forward SyncTeX for .tex files (§4.2): "Show in PDF" in the right-click
+  // menu (Ctrl/Cmd+Alt+J).
+  const onShowInPdfRef = useRef(onShowInPdf);
+  onShowInPdfRef.current = onShowInPdf;
+  const canShowInPdf = isLatexFile && !!onShowInPdf;
+  useEffect(() => {
+    const editor = monacoEditorRef.current;
+    const monaco = monacoNsRef.current;
+    if (!editorMounted || !editor || !monaco || !canShowInPdf) return;
+    return attachSyncTexBindings({ editor, monaco, onShowInPdf: () => onShowInPdfRef.current?.() });
+  }, [editorMounted, canShowInPdf]);
+
+  // Stable identity: a fresh object per render makes @monaco-editor/react call
+  // editor.updateOptions() on EVERY re-render of this component.
+  const editorOptions = useMemo(
+    () => getCodeEditorOptions(effectiveReadOnly || !bindingReady),
+    [effectiveReadOnly, bindingReady],
+  );
+
   return (
     <div
       ref={containerRef}
@@ -1931,8 +2380,31 @@ export function CollabCodeEditor({
           <span>Read-only</span>
         </div>
       )}
+      {/* Comment-only visitors have readOnly=true but must still get the
+          bubble — right-click Comment and ⌘⌥M work for them, so the
+          emphasized affordance has to as well. */}
+      {editorMounted && !hidden && isLatexFile && (!readOnly || canComment) &&
+        monacoEditorRef.current && (
+          <CodeSelectionBubble
+            editor={monacoEditorRef.current}
+            filePath={filePath}
+            ydoc={ydoc}
+            canComment={canComment}
+            onStartCommentDraftRef={onStartCommentDraftRef}
+          />
+        )}
       {/* Flat: code renders directly on the white panel, like markdown (no card border). */}
-      <div className={`overflow-hidden ${bare ? 'h-full' : ''} ${className ?? ''}`}>
+      <div className={`relative overflow-hidden ${bare ? 'h-full' : ''} ${className ?? ''}`}>
+        {isAutocompleteEnabled() && !readOnly ? (
+          <AutocompleteStatusChip supported={isAutocompleteSupportedLanguage(getCodeLanguage(filePath))} />
+        ) : null}
+        {pendingReviewCount > 0 && !readOnly && canResolveSuggestions && (
+          <SuggestionReviewBar
+            className="absolute bottom-4 right-4 z-30"
+            onAcceptAll={() => { for (const key of chunkByKeyRef.current.keys()) resolveByKey(key, true); }}
+            onRejectAll={() => { for (const key of chunkByKeyRef.current.keys()) resolveByKey(key, false); }}
+          />
+        )}
         {!initialSyncReady ? (
           <EditorSkeleton
             variant="code"
@@ -1944,12 +2416,19 @@ export function CollabCodeEditor({
             key={fileId}
             height={bare ? '100%' : editorHeight}
             language={getCodeLanguage(filePath)}
-            theme="vs"
-            options={getCodeEditorOptions(readOnly || !bindingReady, lineCount)}
+            theme={monacoTheme}
+            beforeMount={defineMonacoThemes}
+            options={editorOptions}
             onMount={(editor, monaco) => {
             monacoEditorRef.current = editor;
             monacoNsRef.current = monaco;
             registerLatexCompletions(monaco);
+            // Ghost text rides a different Monaco channel than the LaTeX
+            // suggest widget above; both register once, per page.
+            registerAutocompleteProvider(monaco);
+            // Pilot-flagged surface: with the flag off the feature stays fully
+            // hidden — no context-menu entry to discover it by.
+            if (isAutocompleteEnabled()) registerAutocompleteToggleAction(editor);
             modelRef.current = editor.getModel();
             // The first .tex model is created before `latex` is registered, so
             // it lands as `plaintext`; re-apply the language so completions fire.
@@ -1960,15 +2439,26 @@ export function CollabCodeEditor({
             contentSubscriptionRef.current = editor.onDidChangeModelContent(() => {
               const text = editor.getModel()?.getValue() ?? '';
               currentTextRef.current = text;
-              setLineCount(Math.max(text.split('\n').length, 1));
-              onContentChange?.(text);
+              // Propagating every keystroke re-renders the host page with the
+              // full text; on very large documents that's a per-keystroke
+              // stall, so trail the burst. Point-in-time readers (save,
+              // compile) pull fresh text via getText/getSource, not this.
+              if (text.length < 100_000) {
+                if (contentNotifyTimerRef.current) clearTimeout(contentNotifyTimerRef.current);
+                contentNotifyTimerRef.current = null;
+                onContentChange?.(text);
+              } else if (!contentNotifyTimerRef.current) {
+                contentNotifyTimerRef.current = setTimeout(() => {
+                  contentNotifyTimerRef.current = null;
+                  onContentChange?.(currentTextRef.current);
+                }, 250);
+              }
             });
             currentTextRef.current = editor.getModel()?.getValue() ?? '';
-            setLineCount(Math.max(currentTextRef.current.split('\n').length, 1));
             // Chat shortcuts (mirror collab-editor's ChatContextShortcut):
             //   Cmd/Ctrl-J                    → open current chat (+ selection)
             //   +Shift                        → open fresh chat
-            const dispatchChatContext = (forceNew: boolean) => {
+            const dispatchChatContext = (forceNew: boolean, allowToggle = true) => {
               const sel = editor.getSelection();
               const model = editor.getModel();
               const hasSel = sel && model && !sel.isEmpty();
@@ -1977,8 +2467,14 @@ export function CollabCodeEditor({
                 new CustomEvent('sundial:add-chat-context', {
                   // Cmd-J with no selection toggles the chat closed when
                   // it's already visible; with a selection it pins the
-                  // selection instead. Shift variants always open fresh.
-                  detail: { text, path: filePath, forceNew, toggle: !forceNew && !text },
+                  // selection instead. Shift variants always open fresh;
+                  // menu picks (allowToggle=false) always open, never close.
+                  detail: {
+                    text,
+                    path: filePathRef.current,
+                    forceNew,
+                    toggle: allowToggle && !forceNew && !text,
+                  },
                 }),
               );
             };
@@ -2003,6 +2499,18 @@ export function CollabCodeEditor({
             editor.addCommand(KeyMod.CtrlCmd | KeyCode.KeyZ, runUndo);
             editor.addCommand(KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.KeyZ, runRedo);
             editor.addCommand(KeyMod.CtrlCmd | KeyCode.KeyY, runRedo);
+            // Right after Comment in the context menu; unlike ⌘J it never
+            // toggles the chat closed — a menu pick always opens it. Greyed
+            // out with no selection (an empty dispatch would still open, and
+            // could even create, a chat).
+            editor.addAction({
+              id: 'sundial-add-to-chat',
+              label: 'Reference in chat',
+              contextMenuGroupId: 'navigation',
+              contextMenuOrder: 1.2,
+              precondition: 'editorHasSelection',
+              run: () => dispatchChatContext(false, false),
+            });
             editor.addAction({
               id: 'sundial-copy-line-link',
               label: 'Copy link to this line',
@@ -2053,5 +2561,214 @@ export function CollabCodeEditor({
         )}
       </div>
     </div>
+  );
+}
+
+/* ── Code selection bubble (LaTeX prototype) ──────────────────────────
+ *  Comment + Reference in chat floating above the selection, mirroring the
+ *  markdown editor's format bubble (shared class constants keep the two
+ *  pixel-identical). A separate component so per-frame placement state
+ *  re-renders this small portal, not the whole editor host. Body portal
+ *  with fixed coords so pane transforms and the editor's overflow
+ *  clipping can't swallow it.
+ * ─────────────────────────────────────────────────────────────────── */
+function CodeSelectionBubble({
+  editor,
+  filePath,
+  ydoc,
+  canComment,
+  onStartCommentDraftRef,
+}: {
+  editor: MonacoEditorType.IStandaloneCodeEditor;
+  filePath: string;
+  ydoc: Y.Doc | null;
+  canComment: boolean;
+  onStartCommentDraftRef: { current: ((selection: DraftDocCommentSelection) => void) | undefined };
+}) {
+  const [bubble, setBubble] = useState<{ top: number; left: number; below: boolean } | null>(null);
+  const elRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let raf: number | undefined;
+    const place = () => {
+      const sel = editor.getSelection();
+      const model = editor.getModel();
+      const dom = editor.getDomNode();
+      if (!sel || !model || !dom || sel.isEmpty() || !editor.hasTextFocus()) {
+        setBubble(null);
+        return;
+      }
+      // Whitespace-only drags have nothing to act on. Bounded scan: a full
+      // getValueInRange would materialize the ENTIRE selection (megabytes on
+      // select-all) on every recompute — same rule as the markdown bubble.
+      const start = sel.getStartPosition();
+      const end = sel.getEndPosition();
+      const boundedEnd = model.getPositionAt(
+        Math.min(model.getOffsetAt(end), model.getOffsetAt(start) + SELECTION_SAMPLE_LIMIT),
+      );
+      const sample = model.getValueInRange({
+        startLineNumber: start.lineNumber,
+        startColumn: start.column,
+        endLineNumber: boundedEnd.lineNumber,
+        endColumn: boundedEnd.column,
+      });
+      if (!sample.trim()) {
+        setBubble(null);
+        return;
+      }
+      const rect = dom.getBoundingClientRect();
+      // Anchor above the selection start; on a long downward drag the start
+      // scrolls out of view, so fall back to the (visible) active end.
+      const visible = (pos: typeof start) => {
+        const p = editor.getScrolledVisiblePosition(pos);
+        return p && p.top >= 0 && p.top <= dom.clientHeight ? p : null;
+      };
+      let spanning = false;
+      let anchor = visible(start) ?? visible(end);
+      if (!anchor) {
+        // Neither endpoint on screen. If the selection SPANS the viewport
+        // (select-all, multi-screen drag) keep the bubble reachable at the
+        // top of the visible slice; otherwise the selection is off-screen.
+        const s = editor.getScrolledVisiblePosition(start);
+        const e = editor.getScrolledVisiblePosition(end);
+        if (!s || !e || s.top > 0 || e.top < dom.clientHeight) {
+          setBubble(null);
+          return;
+        }
+        spanning = true;
+        anchor = { top: 8, left: Math.max(12, dom.clientWidth / 2 - 110), height: 0 };
+      }
+      // Flip below when the bubble would crowd EITHER top edge: the editor's
+      // (anchor.top, so a first-line bubble doesn't sit over the toolbar) or
+      // the browser viewport's (y — an outer scroller can move the editor
+      // partly above the window, where only a screen-space check saves it).
+      const y = rect.top + anchor.top;
+      const below = spanning || y < 48 || anchor.top < 48;
+      const width = elRef.current?.offsetWidth ?? 230;
+      const next = {
+        top: y + (below ? anchor.height + 8 : -8),
+        left: Math.max(12, Math.min(rect.left + anchor.left, window.innerWidth - 12 - width)),
+        below,
+      };
+      // Identity-stable when nothing moved so scroll ticks don't re-render.
+      setBubble((prev) =>
+        prev && prev.top === next.top && prev.left === next.left && prev.below === next.below
+          ? prev
+          : next,
+      );
+    };
+    // Per-frame sources (Monaco scroll, outer scrolls) coalesce to one rAF;
+    // selection/layout changes debounce so the bubble doesn't chase a drag.
+    const placeSoon = () => {
+      if (raf !== undefined) return;
+      raf = requestAnimationFrame(() => {
+        raf = undefined;
+        place();
+      });
+    };
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(place, 150);
+    };
+    const subs = [
+      editor.onDidChangeCursorSelection(schedule),
+      editor.onDidScrollChange(placeSoon),
+      // Pane/window resizes move the editor without a scroll.
+      editor.onDidLayoutChange(schedule),
+      editor.onDidBlurEditorText(() => setBubble(null)),
+    ];
+    // An OUTER scroller moves the editor without any Monaco event; scroll
+    // doesn't bubble but does capture (same trick as useFollowEditorScroll).
+    const onOuterScroll = (event: Event) => {
+      const dom = editor.getDomNode();
+      if (!dom || !(event.target instanceof Node) || !event.target.contains(dom)) return;
+      placeSoon();
+    };
+    window.addEventListener('scroll', onOuterScroll, { capture: true, passive: true });
+    // The mount gate may flip while a selection is live (permissions
+    // resolving, a rename toggling .tex) — place now, don't wait for an event.
+    schedule();
+    return () => {
+      if (timer) clearTimeout(timer);
+      if (raf !== undefined) cancelAnimationFrame(raf);
+      for (const sub of subs) sub.dispose();
+      window.removeEventListener('scroll', onOuterScroll, { capture: true });
+      setBubble(null);
+    };
+  }, [editor]);
+
+  // Both actions collapse the selection to its end first — that hides the
+  // bubble immediately (and the draft/chat UI takes focus anyway).
+  const collapseSelection = () => {
+    const sel = editor.getSelection();
+    const model = editor.getModel();
+    if (!sel || !model || sel.isEmpty()) return null;
+    const text = model.getValueInRange(sel);
+    const end = sel.getEndPosition();
+    const from = model.getOffsetAt(sel.getStartPosition());
+    const to = model.getOffsetAt(end);
+    editor.setSelection({
+      startLineNumber: end.lineNumber,
+      startColumn: end.column,
+      endLineNumber: end.lineNumber,
+      endColumn: end.column,
+    });
+    setBubble(null);
+    return { text, from, to };
+  };
+  const addToChat = () => {
+    const captured = collapseSelection();
+    const text = captured?.text.trim();
+    if (!text) return;
+    window.dispatchEvent(
+      new CustomEvent('sundial:add-chat-context', { detail: { text, path: filePath } }),
+    );
+  };
+  const comment = () => {
+    if (!ydoc) return;
+    const captured = collapseSelection();
+    if (!captured) return;
+    const selection = buildCodeCommentSelection(ydoc, captured.from, captured.to, captured.text);
+    if (selection) onStartCommentDraftRef.current?.(selection);
+  };
+
+  if (!bubble) return null;
+  return createPortal(
+    <div
+      ref={elRef}
+      data-testid="code-selection-bubble"
+      className={`fixed z-[70] ${BUBBLE_SURFACE}`}
+      style={{
+        top: bubble.top,
+        left: bubble.left,
+        transform: bubble.below ? undefined : 'translateY(-100%)',
+      }}
+      // Keep the editor's selection/focus alive for every control in here.
+      onMouseDown={(event) => event.preventDefault()}
+    >
+      <button
+        type="button"
+        aria-label="Reference selection in chat ⌘J"
+        onClick={addToChat}
+        className={BUBBLE_LABEL_BUTTON}
+      >
+        <SparkleIcon className="h-4 w-4" weight="fill" />
+        Reference in chat
+      </button>
+      {canComment && ydoc && (
+        <button
+          type="button"
+          aria-label="Comment on selection ⌘⌥M"
+          data-tour-id="bubble-comment"
+          onClick={comment}
+          className={BUBBLE_LABEL_ACCENT}
+        >
+          <ChatTeardropTextIcon className="h-4 w-4" weight="fill" />
+          Comment
+        </button>
+      )}
+    </div>,
+    document.body,
   );
 }

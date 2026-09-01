@@ -1,15 +1,16 @@
 'use client';
 
 import { memo, useCallback, useEffect, useRef, useState, type Dispatch, type DragEvent, type MutableRefObject, type ReactNode, type SetStateAction } from 'react';
-import { CaretLeftIcon, CaretRightIcon, ChatTeardropIcon, CopyIcon, DownloadSimpleIcon, EyeIcon, EyeSlashIcon, FilePlusIcon, FileTextIcon, FolderMinusIcon, FolderPlusIcon, GithubLogoIcon, LightningIcon, LinkIcon, LockSimpleIcon, LockSimpleOpenIcon, PencilSimpleIcon, PlusIcon, PlusSquareIcon, PushPinIcon, ShareNetworkIcon, SquareSplitHorizontalIcon, TrashSimpleIcon } from '@phosphor-icons/react';
+import { ArrowsInSimpleIcon, CaretLeftIcon, CaretRightIcon, ChatTeardropIcon, CopyIcon, DotsThreeVerticalIcon, DownloadSimpleIcon, EyeIcon, EyeSlashIcon, FilePlusIcon, FolderMinusIcon, FolderPlusIcon, LightningIcon, LinkIcon, LockSimpleIcon, LockSimpleOpenIcon, PencilSimpleIcon, PlusIcon, PlusSquareIcon, PushPinIcon, ShareNetworkIcon, SparkleIcon, SquareSplitHorizontalIcon, TrashSimpleIcon, UploadSimpleIcon } from '@phosphor-icons/react';
 import { IconTooltip } from '@/components/collab-bubbles';
 import { SidebarSectionHeader } from '@/components/workspace/sidebar-section-header';
 import { AnchoredDropdown } from '@/components/workspace/anchored-dropdown';
 import { ensureUniquePath, sanitizeFilename } from '@/lib/workspace/uploads';
+import { pathShareCoverage } from '@/lib/workspace/path-grants';
 import type { PendingUpload } from '@/components/workspace/use-workspace-uploads';
+import { ROOT_ORDER_KEY, sortByManualOrder, type FileOrderMap } from '@/lib/workspace/file-order';
 import type { WorkspaceFileRow } from '@/lib/workspace/types';
 import { LinkedRepoBadge } from '@/components/workspace/linked-repo-badge';
-import { CopyLinkButton } from '@/components/workspace/copy-link-button';
 import type { LinkedRepoSummary } from '@/lib/workspace/use-linked-repos';
 import {
   formatFileName,
@@ -21,10 +22,13 @@ import {
   SIDEBAR_ENTRY_ROW_CLASSES,
   LocalRootGlyph,
   setSidebarDragGhost,
-  SharedLiveGlyph,
   WORKSPACE_ACTIONS_MENU_PATH,
   WorkspaceEntryIcon,
 } from './workspace-file-helpers';
+
+// Sentinel openMenuPath for the Files header's ＋ menu (like
+// WORKSPACE_ACTIONS_MENU_PATH for the ⋮ menu — only one menu open at a time).
+const NEW_ENTRY_MENU_PATH = '__files_new_menu__';
 
 type DraftEntry = {
   id: string;
@@ -52,14 +56,6 @@ function LockedBadge({ locked }: { locked?: boolean }) {
   );
 }
 
-function MoreVerticalIcon({ className }: { className: string }) {
-  return (
-    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M12 6h.01M12 12h.01M12 18h.01" />
-    </svg>
-  );
-}
-
 type FilesTabPanelProps = {
   canWrite: boolean;
   /** Section header title — the workspace/root identity (name + switcher)
@@ -69,13 +65,11 @@ type FilesTabPanelProps = {
   /** Accordion state: when collapsed, only the Files section header renders. */
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
-  /** Connect entry points, folded into the header's ⋮ actions menu. Each
-      renders only when its handler is supplied. */
-  onAddRepo?: () => void;
-  /** Warm the repo list before the add-repo modal opens (hover/focus). */
-  onAddRepoHover?: () => void;
-  onAddOverleaf?: () => void;
+  /** Connect entry point in the header's ⋮ actions menu; renders only when
+      supplied. (GitHub/Overleaf linking moved to the "Open with …" modal.) */
   onConnectLocalAgent?: () => void;
+  /** Opens the "Add skill" dialog (install a SKILL.md from a URL or upload). */
+  onAddSkill?: () => void;
   /** "+ Add folder…" under the tree: open an OUTSIDE folder as extra context
       (desktop local projects). Absent = the row renders disabled + tooltip. */
   onAddContextFolder?: () => void;
@@ -89,6 +83,9 @@ type FilesTabPanelProps = {
   /** Focus-mode notifications: the page filters the chat rail to the focused
       folder (wireframe chat↔folder placement). Null = focus cleared. */
   onFocusedFolderChange?: (folder: string | null) => void;
+  /** Outside-in focus request (doc-header breadcrumb click): scope the tree
+      to this folder. The nonce re-fires focus for a repeat click. */
+  focusFolderIntent?: { path: string; nonce: number } | null;
   showMetaFiles: boolean;
   setShowMetaFiles: Dispatch<SetStateAction<boolean>>;
   /** Eye toggle: whether agent metadata files (AGENTS.md, skills/, logs/) show in the tree. */
@@ -106,6 +103,12 @@ type FilesTabPanelProps = {
   fileUploadInputRef: MutableRefObject<HTMLInputElement | null>;
   onCreateFile: () => void;
   onCreateFolder: () => void;
+  /** Whether the create target (the active file's folder / the root) accepts
+   *  new entries — an exact-file grant must not surface a no-op ＋ menu. */
+  canCreateEntries?: boolean;
+  /** The header ＋ menu's target folder (the active file's folder), so its
+   *  Upload lands beside New file — not silently at the root. */
+  createParentPath?: string | null;
   onQueueFileUploads: (files: File[], targetFolder: string | null) => void;
   isFilesDropActive: boolean;
   setIsFilesDropActive: Dispatch<SetStateAction<boolean>>;
@@ -137,6 +140,8 @@ type FilesTabPanelProps = {
   lastClickedPathRef: MutableRefObject<string | null>;
   flatVisiblePaths: string[];
   onOpenFile: (file: WorkspaceFileRow) => void;
+  /** Starts the real collab-provider sync before a likely click. */
+  onPrefetchFile?: (file: WorkspaceFileRow) => void;
   /** Editor tabs/splits (desktop only — omitted on mobile hides the items). */
   onOpenInNewTab?: (file: WorkspaceFileRow) => void;
   onOpenToSide?: (file: WorkspaceFileRow) => void;
@@ -144,7 +149,6 @@ type FilesTabPanelProps = {
   setOpenMenuPath: Dispatch<SetStateAction<string | null>>;
   fileMenuRef: MutableRefObject<HTMLDivElement | null>;
   onCopyFileLink: (file: WorkspaceFileRow) => void | Promise<void>;
-  buildFileUrl: (file: WorkspaceFileRow) => string;
   onDownloadFile: (file: WorkspaceFileRow) => void;
   onDownloadFolder: (folderPath: string) => void;
   /** Whole-workspace zip export — cloud only (meaningless for a local folder). */
@@ -154,6 +158,8 @@ type FilesTabPanelProps = {
   onUndoDelete: () => Promise<void> | void;
   /** Whether there is a deletion to undo (gates the Cmd/Ctrl+Z handler). */
   canUndoDelete: boolean;
+  /** Count of processed delete batches — exposed as data-delete-seq for e2e. */
+  deleteSeq?: number;
   onDuplicatePath: (path: string) => Promise<void>;
   expandedFolders: Set<string>;
   onFileDragStart: (event: DragEvent<HTMLDivElement>, filePath: string) => void;
@@ -161,30 +167,48 @@ type FilesTabPanelProps = {
       dragging over the edge of a same-parent, same-kind row shows an insertion
       line and dropping reorders instead of moving. */
   onReorderEntries?: (draggedPaths: string[], targetPath: string, position: 'before' | 'after') => void;
+  /** Per-parent manual child order (basenames). Folders and files interleave
+      by it, so a file can sit above a folder; without it folders render first. */
+  childOrder?: FileOrderMap;
   findRepoForPath?: (path: string) => LinkedRepoSummary | null;
   /** Local projects: share this file/folder to a cloud workspace. The menu
       item renders only when supplied. */
   onShareEntry?: (path: string, kind: 'file' | 'folder') => void;
-  /** Exact scope paths currently live-synced — those rows get a shared badge. */
-  sharedScopePaths?: Set<string>;
+  /** Workspace-level share (the whole project) — lives in the ⋮ Workspace
+      actions menu; renders only when supplied. */
+  onShareWorkspace?: () => void;
+  /** Scope paths currently live-synced (with their recorded kind — a FILE
+      scope never covers a same-named directory) — those rows get a badge. */
+  sharedScopePaths?: ReadonlyMap<string, 'file' | 'folder'>;
   /** Namespace (project id) for the pinned-files localStorage key. */
   pinStorageKey?: string;
+  /** Badge tooltip/aria text; defaults to the local live-sync wording. */
+  sharedBadgeLabel?: string;
+  /** Per-row write capability (path-share grants can elevate a subtree past
+      the workspace-wide `canWrite` baseline). Defaults to `canWrite`. */
+  canWritePath?: (path: string) => boolean;
+  /** Whether any path grant actually confers write — keeps write affordances
+      (New, delete/undo keys) hidden for pure viewers even though the page
+      always passes `canWritePath`. Defaults to the callback's presence. */
+  hasWriteGrants?: boolean;
 };
 
 export const FilesTabPanel = memo(function FilesTabPanel({
   canWrite,
   title,
+  canWritePath,
+  hasWriteGrants,
+  sharedBadgeLabel,
   collapsed,
   onToggleCollapsed,
-  onAddRepo,
-  onAddRepoHover,
-  onAddOverleaf,
   onConnectLocalAgent,
+  onAddSkill,
   onAddContextFolder,
   localRoots,
   onRemoveRootFolder,
   onNewChatInFolder,
   onFocusedFolderChange,
+  focusFolderIntent = null,
   showMetaFiles,
   showAgentMetaFiles = true,
   onToggleAgentMetaFiles,
@@ -197,6 +221,8 @@ export const FilesTabPanel = memo(function FilesTabPanel({
   fileUploadInputRef,
   onCreateFile,
   onCreateFolder,
+  canCreateEntries,
+  createParentPath,
   onQueueFileUploads,
   isFilesDropActive,
   setIsFilesDropActive,
@@ -228,25 +254,28 @@ export const FilesTabPanel = memo(function FilesTabPanel({
   lastClickedPathRef,
   flatVisiblePaths,
   onOpenFile,
+  onPrefetchFile,
   onOpenInNewTab,
   onOpenToSide,
   openMenuPath,
   setOpenMenuPath,
   fileMenuRef,
   onCopyFileLink,
-  buildFileUrl,
   onDownloadFile,
   onDownloadFolder,
   onDownloadWorkspace,
   onDeletePaths,
   onUndoDelete,
   canUndoDelete,
+  deleteSeq,
   onDuplicatePath,
   expandedFolders,
   onFileDragStart,
   onReorderEntries,
+  childOrder,
   findRepoForPath,
   onShareEntry,
+  onShareWorkspace,
   sharedScopePaths,
   pinStorageKey,
 }: FilesTabPanelProps) {
@@ -266,6 +295,11 @@ export const FilesTabPanel = memo(function FilesTabPanel({
     onFocusedFolderChange?.(focusedFolder);
     return () => onFocusedFolderChange?.(null);
   }, [focusedFolder, onFocusedFolderChange]);
+  // Outside-in focus (doc-header breadcrumb): same scope as a double-clicked
+  // folder row; the nonce lets a repeat click on the same crumb re-focus.
+  useEffect(() => {
+    if (focusFolderIntent?.path) setFocusedFolder(focusFolderIntent.path);
+  }, [focusFolderIntent]);
   // Pinned files surface in a distinct area at the top of the tree (wireframe
   // pin behavior); persisted per-project in localStorage.
   const [pinnedPaths, setPinnedPaths] = useState<ReadonlySet<string>>(new Set());
@@ -297,19 +331,23 @@ export const FilesTabPanel = memo(function FilesTabPanel({
   );
   // In-tree drag being tracked for reorder. dataTransfer is unreadable during
   // dragover, so the payload is mirrored here at dragstart; null for OS drags.
-  const draggingRef = useRef<{ paths: string[]; kind: 'file' | 'folder' } | null>(null);
+  const draggingRef = useRef<{ paths: string[] } | null>(null);
   const [dropHint, setDropHint] = useState<{ path: string; position: 'before' | 'after' } | null>(null);
-  const parentKeyOf = (path: string) => getFolderPath(path) ?? '__root__';
+  const parentKeyOf = (path: string) => getFolderPath(path) ?? ROOT_ORDER_KEY;
   /** Insertion position when this dragover should reorder, else null (→ the
-      existing move-into-folder behavior). Same parent + same kind only; folder
-      rows reserve their middle band for "move into". */
+      existing move-into-folder behavior). Same parent only — files and folders
+      reorder freely past each other; folder rows reserve their middle band
+      for "move into". */
   const reorderPosition = (
     event: DragEvent<HTMLDivElement>,
     path: string,
     isFolder: boolean,
   ): 'before' | 'after' | null => {
     const dragging = draggingRef.current;
-    if (!onReorderEntries || !dragging || dragging.kind !== (isFolder ? 'folder' : 'file')) return null;
+    if (!onReorderEntries || !dragging) return null;
+    // OS drags (Finder files) always upload, never reorder — guards a stale
+    // draggingRef when a move remounted the source row before its dragend.
+    if (Array.from(event.dataTransfer?.types ?? []).includes('Files')) return null;
     if (dragging.paths.includes(path)) return null;
     if (!dragging.paths.every((dragged) => parentKeyOf(dragged) === parentKeyOf(path))) return null;
     const rect = event.currentTarget.getBoundingClientRect();
@@ -317,21 +355,26 @@ export const FilesTabPanel = memo(function FilesTabPanel({
     if (isFolder) return fraction < 0.3 ? 'before' : fraction > 0.7 ? 'after' : null;
     return fraction < 0.5 ? 'before' : 'after';
   };
-  const handleRowDragOver = (event: DragEvent<HTMLDivElement>, path: string, isFolder: boolean): void => {
+  // `reorderable: false` for rows whose order childOrder doesn't render
+  // (mounted extra roots follow localRoots) — edge drops fall through to move.
+  const handleRowDragOver = (event: DragEvent<HTMLDivElement>, path: string, isFolder: boolean, reorderable = true): void => {
     event.preventDefault();
-    const position = reorderPosition(event, path, isFolder);
+    const position = reorderable ? reorderPosition(event, path, isFolder) : null;
     setDropHint(position ? { path, position } : null);
     setDragOverPath(position ? null : isFolder ? path : getFolderPath(path));
   };
   /** True when the drop was consumed as a reorder. */
-  const handleRowDrop = (event: DragEvent<HTMLDivElement>, path: string, isFolder: boolean): boolean => {
-    const position = reorderPosition(event, path, isFolder);
-    setDropHint(null);
+  const handleRowDrop = (event: DragEvent<HTMLDivElement>, path: string, isFolder: boolean, reorderable = true): boolean => {
+    const position = reorderable ? reorderPosition(event, path, isFolder) : null;
+    const dragged = draggingRef.current?.paths ?? [];
+    // Any drop ends the tracked drag — a move-into can remount the source row
+    // before its dragend reaches React, which would leave the ref stale.
+    endRowDrag();
     if (!position) return false;
     event.preventDefault();
     event.stopPropagation();
     setDragOverPath(null);
-    onReorderEntries?.(draggingRef.current?.paths ?? [], path, position);
+    onReorderEntries?.(dragged, path, position);
     return true;
   };
   const endRowDrag = () => {
@@ -342,6 +385,24 @@ export const FilesTabPanel = memo(function FilesTabPanel({
     dropHint?.path === path
       ? { boxShadow: `inset 0 ${dropHint.position === 'before' ? '2px' : '-2px'} 0 0 var(--color-orange)` }
       : undefined;
+  // Row hover is tracked in JS, not CSS :hover — Chromium strands :hover on
+  // the row under the pointer when the window loses focus (alt-tab behind
+  // another window) and never clears it, so a stale row stayed highlighted
+  // alongside the truly hovered one. One hover key ⇒ one lit row, cleared on
+  // window blur and on the pointer leaving the tree.
+  const [hoverKey, setHoverKey] = useState<string | null>(null);
+  const prefetchedHoverKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const clear = () => setHoverKey(null);
+    window.addEventListener('blur', clear);
+    return () => window.removeEventListener('blur', clear);
+  }, []);
+  /** Row spread props: identifies the row for the container's pointerover
+      delegation and flags it for the group-data-[hovered] icon reveals. */
+  const rowHover = (key: string) => ({
+    'data-hover-key': key,
+    'data-hovered': hoverKey === key ? '' : undefined,
+  });
   // Multi-root (local): every root — the primary included — renders as its
   // own top-level section on equal footing (wireframe: open contexts are
   // sibling rows under the Workspace title). Extra roots' prefix folders
@@ -376,24 +437,53 @@ export const FilesTabPanel = memo(function FilesTabPanel({
     };
   }, [emptyMenu]);
 
+  // Row/header menus and the empty-area menu are mutually exclusive. Their
+  // openers stopPropagation (right-click or the ⋮/＋ buttons), so the document
+  // click closer above never fires — mirror openCreateContextMenu's
+  // setOpenMenuPath(null) by closing this menu whenever one of them opens.
+  useEffect(() => {
+    if (openMenuPath !== null) setEmptyMenu(null);
+  }, [openMenuPath]);
+
   // Shared anchor for the row/folder/workspace action menus — only one is open
   // at a time, so the open trigger claims this ref and the fixed-positioned
   // AnchoredDropdown escapes the section's overflow clipping.
   const fileMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
+  // Target folder for the NEXT shared-input upload: the header ＋ uploads
+  // beside the active file, the empty-area menu at the root. Reset on change.
+  const uploadTargetRef = useRef<string | null>(null);
   // The scrollable tree container. Cmd+Z (undo delete) is scoped to focus inside
   // it, and a delete refocuses it so undo stays reachable after the row unmounts.
   const treeRef = useRef<HTMLDivElement | null>(null);
   const focusTree = useCallback(() => treeRef.current?.focus({ preventScroll: true }), []);
+  const rowCanWrite = useCallback(
+    (path: string) => (canWritePath ? canWritePath(path) : canWrite),
+    [canWritePath, canWrite],
+  );
+  // Affordances stay live for path-share EDITORS (per-path checks and the
+  // page-level handlers decide what actually runs) — but not for pure
+  // viewers, who would otherwise see an enabled New button that no-ops.
+  const hasAnyWrite = canWrite || (hasWriteGrants ?? Boolean(canWritePath));
 
+  // Empty-area right-click: actions are ROOT-scoped, so the menu needs the
+  // workspace-wide write — except in folder-focus mode, where actions target
+  // the focused folder, so a path-share editor's grant on it suffices.
+  const canUseEmptyMenu = focusedFolder ? rowCanWrite(focusedFolder) : canWrite;
   const openCreateContextMenu = useCallback(
     (event: React.MouseEvent) => {
-      if (!canWrite) return;
+      if (!canUseEmptyMenu) return;
+      // Draft/rename inputs keep the native menu (right-click → Paste).
+      if ((event.target as HTMLElement).closest('input, textarea')) return;
       event.preventDefault();
       event.stopPropagation();
       setOpenMenuPath(null);
-      setEmptyMenu({ x: event.clientX, y: event.clientY });
+      // Clamp so a click near the viewport edge keeps all three items visible.
+      setEmptyMenu({
+        x: Math.min(event.clientX, window.innerWidth - 184),
+        y: Math.min(event.clientY, window.innerHeight - 128),
+      });
     },
-    [canWrite, setOpenMenuPath],
+    [canUseEmptyMenu, setOpenMenuPath],
   );
 
   const requestDelete = useCallback(
@@ -410,7 +500,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
   );
 
   useEffect(() => {
-    if (!canWrite || collapsed) return;
+    if (!hasAnyWrite || collapsed) return;
     const handler = (event: KeyboardEvent) => {
       if (event.key !== 'Delete' && event.key !== 'Backspace') return;
       const target = event.target as HTMLElement | null;
@@ -419,6 +509,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
         if (tag === 'INPUT' || tag === 'TEXTAREA' || target.isContentEditable) return;
       }
       if (selectedPaths.size > 0) {
+        if (![...selectedPaths].every((path) => rowCanWrite(path))) return;
         event.preventDefault();
         void onDeletePaths(Array.from(selectedPaths));
         focusTree();
@@ -429,21 +520,21 @@ export const FilesTabPanel = memo(function FilesTabPanel({
       const focusedPath = (document.activeElement as HTMLElement | null)
         ?.closest?.('[data-files-entry]')
         ?.getAttribute('data-files-entry');
-      if (!focusedPath) return;
+      if (!focusedPath || !rowCanWrite(focusedPath)) return;
       event.preventDefault();
       void onDeletePaths([focusedPath]);
       focusTree(); // the row is about to unmount — keep focus in the tree for Cmd+Z
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [canWrite, collapsed, focusTree, onDeletePaths, selectedPaths]);
+  }, [hasAnyWrite, collapsed, focusTree, onDeletePaths, selectedPaths, rowCanWrite]);
 
   // Cmd/Ctrl+Z restores the last file(s) deleted from the tree. Gated on having
   // something to undo, scoped to focus inside the files tree (a delete refocuses
   // it), and skipped inside inputs/the editor — so it never steals the shortcut
   // from the editor, chat, or a focused control elsewhere on the page.
   useEffect(() => {
-    if (!canWrite || !canUndoDelete) return;
+    if (!hasAnyWrite || !canUndoDelete) return;
     const handler = (event: KeyboardEvent) => {
       if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey) return;
       if (event.key.toLowerCase() !== 'z') return;
@@ -458,7 +549,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [canWrite, canUndoDelete, onUndoDelete]);
+  }, [hasAnyWrite, canUndoDelete, onUndoDelete]);
 
   // Cmd/Ctrl-C then Cmd/Ctrl-V duplicates the selected file(s) in place, like a
   // file manager. Scoped to the tree — a focused row or an active multi-select —
@@ -499,8 +590,10 @@ export const FilesTabPanel = memo(function FilesTabPanel({
   }, [canWrite, collapsed, onDuplicatePath, selectedPaths]);
 
   const commitListRename = useCallback(async () => {
-    if (!canWrite) return;
     if (!renameEntry) return;
+    // Per-path: a path-share editor commits renames inside the granted
+    // subtree (the same capability that opened the rename control).
+    if (!(canWritePath ? canWritePath(renameEntry.path) : canWrite)) return;
     const sourcePath = renameEntry.path;
     const sourceFile = workspaceFileByPath.get(sourcePath);
     const hasChildren = workspaceFiles.some((file) => file.path.startsWith(`${sourcePath}/`));
@@ -524,7 +617,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
     const targetPath = ensureUniquePath(rawTargetPath, existingPaths);
     await onMovePath(sourcePath, targetPath);
     setRenameEntry(null);
-  }, [canWrite, existingPaths, onMovePath, renameEntry, setRenameEntry, workspaceFileByPath, workspaceFiles]);
+  }, [canWrite, canWritePath, existingPaths, onMovePath, renameEntry, setRenameEntry, workspaceFileByPath, workspaceFiles]);
 
   const cancelListRename = useCallback(() => {
     setRenameEntry(null);
@@ -600,7 +693,23 @@ export const FilesTabPanel = memo(function FilesTabPanel({
     lastClickedPathRef.current = file.path;
   }, [clearSelection, flatVisiblePaths, isRowOnScreen, lastClickedPathRef, onOpenFile, selectedFilePath, setSelectedPaths, toggleSelection]);
 
+  // Root-level draft (parentPath null) — shared by the primary-root section
+  // row and the empty-area context menu; the effect above reveals it.
+  // Both starters carry the page's beginDraft pending-guard: an open draft may
+  // be mid-commit (blur fires the async commit, which clears the entry when it
+  // resolves) — replacing it now would get wiped by that resolution.
+  const beginRootDraft = useCallback((type: DraftEntry['type']) => {
+    if (draftEntry) return;
+    setDraftEntry({
+      id: `draft-${draftIdRef.current++}`,
+      type,
+      parentPath: null,
+      name: buildDraftName(type, null),
+    });
+  }, [buildDraftName, draftEntry, draftIdRef, setDraftEntry]);
+
   const beginFolderDraft = useCallback((parentPath: string, type: DraftEntry['type']) => {
+    if (draftEntry) return;
     setDraftEntry({
       id: `draft-${draftIdRef.current++}`,
       type,
@@ -608,13 +717,14 @@ export const FilesTabPanel = memo(function FilesTabPanel({
       name: buildDraftName(type, parentPath),
     });
     setExpandedFolders((prev) => new Set(prev).add(parentPath));
-  }, [buildDraftName, draftIdRef, setDraftEntry, setExpandedFolders]);
+  }, [buildDraftName, draftEntry, draftIdRef, setDraftEntry, setExpandedFolders]);
 
   function renderDraftRow(parentPath: string | null) {
     if (!draftEntry || draftEntry.parentPath !== parentPath) return null;
 
     return (
       <div className={SIDEBAR_DRAFT_ROW_CLASSES}>
+        <span className="w-3.5 flex-shrink-0" aria-hidden />
         <WorkspaceEntryIcon
           path={draftEntry.name}
           isFolder={draftEntry.type === 'folder'}
@@ -622,6 +732,10 @@ export const FilesTabPanel = memo(function FilesTabPanel({
         />
         <input
           ref={draftInputRef}
+          data-testid="files-draft-input"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
           value={draftEntry.name}
           onChange={(event) => setDraftEntry({ ...draftEntry, name: event.target.value })}
           onKeyDown={(event) => {
@@ -641,41 +755,53 @@ export const FilesTabPanel = memo(function FilesTabPanel({
     );
   }
 
-  // A path is live-syncing when any enabled scope COVERS it — its own row, an
-  // ancestor folder scope, or the whole-project scope (''). Exact-equality
-  // badges would show nothing for a project-wide share, which is exactly when
-  // the "this is uploading" signal matters most.
-  const isSharedPath = (path: string) => {
-    if (!sharedScopePaths || sharedScopePaths.size === 0) return false;
+  // 'covered' rows only ride an ancestor scope, most often the whole-project
+  // share, where marking every single row says nothing about any one of them.
+  const shareCoverage = (path: string): 'scope' | 'covered' | null => {
+    if (!sharedScopePaths) return null;
     // Extra-root mounts never sync (the sidecar excludes them from bridges and
     // ledger uploads) — a project-wide scope ('') must not badge them.
-    if (extraRootByPrefix.has(path.split('/', 1)[0])) return false;
-    if (sharedScopePaths.has('') || sharedScopePaths.has(path)) return true;
-    for (let idx = path.lastIndexOf('/'); idx > 0; idx = path.lastIndexOf('/', idx - 1)) {
-      if (sharedScopePaths.has(path.slice(0, idx))) return true;
-    }
-    return false;
+    if (extraRootByPrefix.has(path.split('/', 1)[0])) return null;
+    return pathShareCoverage(sharedScopePaths, path);
   };
-  // Always-visible share glyph (wireframe icon language: person + filled dot
-  // = live-synced). Clicking opens the share surface for that entry.
-  const sharedBadge = (path: string, kind: 'file' | 'folder') =>
-    isSharedPath(path) ? (
-      <button
-        type="button"
-        onClick={(event) => {
-          event.stopPropagation();
-          onShareEntry?.(path, kind);
-        }}
-        aria-label="Shared — manage access"
+  // Share status rides the entry's OWN icon as a muted corner dot, costing no
+  // row width. Persistent on what was actually shared; hover-only on rows
+  // merely covered by an ancestor scope, so a project-wide share doesn't
+  // stamp the whole tree. Managing the share stays in the ⋮ menu.
+  const shareDot = (path: string) => {
+    const coverage = shareCoverage(path);
+    if (!coverage) return null;
+    return (
+      <span
+        aria-label={sharedBadgeLabel ?? 'Shared'}
         data-testid="shared-entry-badge"
-        className="relative group/tip shrink-0 leading-none text-stone-500 hover:text-stone-700"
-      >
-        <SharedLiveGlyph className="h-3.5 w-3.5" />
-        <IconTooltip label="Shared — manage access" />
-      </button>
-    ) : null;
-  // Hover pin on file rows; pinned files show the pin always, filled
-  // (wireframe: `.ricon.onpin`), and surface in the pinned area up top.
+        data-share-coverage={coverage}
+        className={`absolute -bottom-px -right-px h-1.5 w-1.5 rounded-full bg-indigo-300 ring-1 ring-white transition-opacity ${
+          coverage === 'scope' ? '' : 'opacity-0 group-data-[hovered]:opacity-100 group-focus-within:opacity-100'
+        }`}
+      />
+    );
+  };
+  // Wraps a row's icon so the share dot can anchor to its corner, and so
+  // hovering the icon names what it means (origin and/or share status).
+  const entryIcon = (path: string, icon: ReactNode, originLabel?: string) => {
+    const coverage = shareCoverage(path);
+    const shareLabel = coverage
+      ? coverage === 'scope'
+        ? (sharedBadgeLabel ?? 'Shared')
+        : 'Shared via parent folder'
+      : null;
+    const label = [originLabel, shareLabel].filter(Boolean).join(' · ');
+    return (
+      <span className="relative flex flex-shrink-0 items-center">
+        {icon}
+        {shareDot(path)}
+        {label ? <IconTooltip label={label} align="left" /> : null}
+      </span>
+    );
+  };
+  // Unpin affordance on the pinned-area rows (pinning a tree row moved into
+  // the row's ⋮ menu — data-testid="pin-file" there).
   const pinButton = (path: string) => {
     const isPinned = pinnedPaths.has(path);
     return (
@@ -687,11 +813,11 @@ export const FilesTabPanel = memo(function FilesTabPanel({
         }}
         aria-label={isPinned ? 'Unpin' : 'Pin to top'}
         aria-pressed={isPinned}
-        data-testid="pin-file"
+        data-testid="unpin-file"
         className={`relative group/tip leading-none transition-opacity ${
           isPinned
             ? 'text-stone-500 hover:text-stone-700'
-            : 'text-stone-400 opacity-0 hover:text-stone-600 group-hover:opacity-100 group-focus-within:opacity-100'
+            : 'text-stone-400 opacity-0 hover:text-stone-600 group-data-[hovered]:opacity-100 group-focus-within:opacity-100'
         }`}
       >
         <PushPinIcon className="h-3.5 w-3.5" weight={isPinned ? 'fill' : 'regular'} aria-hidden />
@@ -713,20 +839,29 @@ export const FilesTabPanel = memo(function FilesTabPanel({
         className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-700"
       >
         <ShareNetworkIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
-        <span>{isSharedPath(path) ? 'Sharing…' : 'Share…'}</span>
+        {/* The menu answers "is this shared?" too — the row glyph is hover-only
+            for anything covered by a folder-wide or project-wide share. */}
+        <span>{shareCoverage(path) ? 'Manage sharing' : 'Share'}</span>
       </button>
     ) : null;
 
   function renderFileActionMenu(file: WorkspaceFileRow) {
-    const fileUrl = buildFileUrl(file);
     return (
       <div className="relative ml-auto flex items-center gap-0.5" ref={openMenuPath === file.path ? fileMenuRef : null}>
-        {pinButton(file.path)}
-        {fileUrl ? (
-          <span className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity">
-            <CopyLinkButton url={fileUrl} label="Copy file link" tooltip="Copy file link" className="h-5 w-5" iconClassName="h-3 w-3" />
-          </span>
-        ) : null}
+        {/* Hover affordance is copy-link (pin lives in the ⋮ menu now). */}
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            void onCopyFileLink(file);
+          }}
+          aria-label="Copy link"
+          data-testid="copy-entry-link"
+          className="relative group/tip leading-none text-stone-400 opacity-0 transition-opacity hover:text-stone-600 group-data-[hovered]:opacity-100 group-focus-within:opacity-100"
+        >
+          <LinkIcon className="h-3.5 w-3.5" weight="regular" aria-hidden />
+          <IconTooltip label="Copy link" />
+        </button>
         <button
           type="button"
           ref={openMenuPath === file.path ? fileMenuTriggerRef : undefined}
@@ -735,9 +870,9 @@ export const FilesTabPanel = memo(function FilesTabPanel({
             setOpenMenuPath((prev) => (prev === file.path ? null : file.path));
           }}
           aria-label="File options"
-          className="relative group/tip opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 leading-none text-stone-400 hover:text-stone-600 transition-opacity"
+          className="relative group/tip opacity-0 group-data-[hovered]:opacity-100 group-focus-within:opacity-100 leading-none text-stone-400 hover:text-stone-600 transition-opacity"
         >
-          <MoreVerticalIcon className="h-4 w-4" />
+          <DotsThreeVerticalIcon className="h-4 w-4" weight="bold" aria-hidden />
           <IconTooltip label="File actions" open={openMenuPath === file.path} />
         </button>
         <AnchoredDropdown
@@ -793,6 +928,22 @@ export const FilesTabPanel = memo(function FilesTabPanel({
               <CopyIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
               <span>Copy path</span>
             </button>
+            <button
+              onClick={(event) => {
+                event.stopPropagation();
+                setOpenMenuPath(null);
+                togglePin(file.path);
+              }}
+              data-testid="pin-file"
+              className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-700"
+            >
+              <PushPinIcon
+                className="h-3.5 w-3.5 flex-shrink-0"
+                weight={pinnedPaths.has(file.path) ? 'fill' : 'regular'}
+                aria-hidden
+              />
+              <span>{pinnedPaths.has(file.path) ? 'Unpin' : 'Pin to top'}</span>
+            </button>
             {shareMenuItem(file.path, 'file')}
             <button
               onClick={(event) => {
@@ -834,7 +985,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
                 <span>{file.is_locked ? 'Unlock file' : 'Lock file'}</span>
               </button>
             )}
-            {canWrite && (() => {
+            {rowCanWrite(file.path) && (() => {
               const isMulti = selectedPaths.has(file.path) && selectedPaths.size > 1;
               return (
                 <button
@@ -854,6 +1005,19 @@ export const FilesTabPanel = memo(function FilesTabPanel({
     );
   }
 
+  /** One parent's folders + files interleaved per its manual order, so a file
+      can sit above a folder. Unordered names keep folders-first. */
+  function renderChildren(parentKey: string, folders: string[], files: WorkspaceFileRow[]): React.ReactNode[] {
+    return sortByManualOrder(
+      [
+        ...folders.map((path) => ({ name: getFileName(path), node: renderFolder(path) })),
+        ...files.map((file) => ({ name: getFileName(file.path), node: renderFileRow(file) })),
+      ],
+      (child) => child.name,
+      childOrder?.[parentKey],
+    ).map((child) => child.node);
+  }
+
   function renderFolder(folder: string): React.ReactNode {
     const folderFiles = filesByFolder[folder] ?? [];
     const childFolders = foldersByParent[folder] ?? [];
@@ -864,13 +1028,21 @@ export const FilesTabPanel = memo(function FilesTabPanel({
     const isExpanded = expandedFolders.has(folder);
     const folderLabel = rootEntry ? rootEntry.name : formatFileName(getFileName(folder));
     const folderRowClasses =
-      dragOverPath === folder ? 'bg-stone-200/80 text-stone-800' : getSidebarListItemStateClasses(false);
+      dragOverPath === folder
+        ? 'bg-stone-200/80 text-stone-800'
+        : getSidebarListItemStateClasses(false, hoverKey === folder);
 
     return (
       <div key={folder}>
         <div
-          onClick={() => {
+          onClick={(event) => {
             if (isRenaming) return;
+            // ⌥-click opens the folder as a focus scope (also in the ⋮ menu);
+            // plain click toggles expansion. Focus needs no write.
+            if (event.altKey) {
+              setFocusedFolder(folder);
+              return;
+            }
             setExpandedFolders((prev) => {
               const next = new Set(prev);
               if (next.has(folder)) next.delete(folder);
@@ -878,67 +1050,70 @@ export const FilesTabPanel = memo(function FilesTabPanel({
               return next;
             });
           }}
-          onDoubleClick={(event) => {
-            // Wireframe: double-click opens the folder as a focus scope
-            // (rename moved to Enter / the ⋮ menu).
-            if (isRenaming) return;
-            event.stopPropagation();
-            setFocusedFolder(folder);
-          }}
           onKeyDown={(event) => {
             if (event.key === 'Enter') {
               event.preventDefault();
-              if (!canWrite || rootEntry) return;
+              if (!rowCanWrite(folder) || rootEntry) return;
               onBeginRename(folder, 'list');
             }
           }}
           role="button"
           tabIndex={0}
           onDragOver={(event) => {
-            if (!canWrite) return;
-            handleRowDragOver(event, folder, true);
+            if (!rowCanWrite(folder)) return;
+            handleRowDragOver(event, folder, true, !rootEntry);
           }}
           onDragLeave={() => {
             setDragOverPath(null);
             setDropHint((prev) => (prev?.path === folder ? null : prev));
           }}
           onDrop={(event) => {
-            if (handleRowDrop(event, folder, true)) return;
+            if (handleRowDrop(event, folder, true, !rootEntry)) return;
             onDropToFolder(event, folder);
           }}
-          draggable={canWrite && !rootEntry}
+          draggable={rowCanWrite(folder) && !rootEntry}
           onDragStart={(event) => {
-            if (!canWrite || rootEntry) return;
+            if (!rowCanWrite(folder) || rootEntry) return;
             event.dataTransfer.setData('text/plain', folder);
             event.dataTransfer.effectAllowed = 'move';
             setSidebarDragGhost(event, getFileName(folder));
-            draggingRef.current = { paths: [folder], kind: 'folder' };
+            draggingRef.current = { paths: [folder] };
           }}
           onDragEnd={endRowDrag}
           style={dropHintStyle(folder)}
           onContextMenu={(event) => {
-            if (!canWrite) return;
+            if (!rowCanWrite(folder)) return;
             event.preventDefault();
             event.stopPropagation();
             setOpenMenuPath((prev) => (prev === folder ? null : folder));
           }}
           data-files-entry={folder}
+          {...rowHover(folder)}
           className={`${SIDEBAR_ENTRY_ROW_CLASSES} ${folderRowClasses}`}
         >
-          <CaretRightIcon
-            className={`h-3.5 w-3.5 flex-shrink-0 text-stone-400 transition-transform ${isExpanded ? 'rotate-90' : ''}`}
-            weight="bold"
-            aria-hidden
-          />
-          {rootEntry ? (
-            // Wireframe origin icon: a mounted local folder is "on this device".
-            <LocalRootGlyph className="h-[15px] w-[15px] flex-shrink-0 text-stone-400" />
-          ) : (
-            <WorkspaceEntryIcon path={folder} isFolder className="h-[18px] w-[18px] flex-shrink-0" />
+          <span className="flex flex-shrink-0 items-center">
+            <CaretRightIcon
+              className={`h-3.5 w-3.5 text-stone-400 transition-transform ${isExpanded ? 'rotate-90' : ''}`}
+              weight="bold"
+              aria-hidden
+            />
+          </span>
+          {entryIcon(
+            folder,
+            rootEntry ? (
+              // Wireframe origin icon: a mounted local folder is "on this device".
+              <LocalRootGlyph className="h-[15px] w-[15px] flex-shrink-0 text-stone-400" />
+            ) : (
+              <WorkspaceEntryIcon path={folder} isFolder className="h-[18px] w-[18px] flex-shrink-0" />
+            ),
+            rootEntry ? 'Local folder · on this device' : undefined,
           )}
           {isRenaming ? (
             <input
               ref={attachRenameInput}
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
               value={renameEntry?.name ?? ''}
               onChange={(event) => setRenameEntry({ path: folder, name: event.target.value, source: 'list' })}
               onKeyDown={(event) => {
@@ -958,7 +1133,6 @@ export const FilesTabPanel = memo(function FilesTabPanel({
           ) : (
             <span className="flex min-w-0 flex-1 items-center gap-1 truncate text-left" title={rootEntry?.root}>
               <span className="truncate">{folderLabel}</span>
-              {sharedBadge(folder, 'folder')}
               {(() => {
                 const repo = findRepoForPath?.(folder);
                 return repo && repo.importedPath.replace(/\/$/, '') === folder ? (
@@ -967,7 +1141,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
               })()}
             </span>
           )}
-          {canWrite && (
+          {rowCanWrite(folder) && (
             // Wireframe row-hover icons (no terminal): new file here + new
             // chat scoped to this folder.
             <div className="ml-auto flex items-center gap-1.5" onClick={(event) => event.stopPropagation()}>
@@ -979,7 +1153,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
                   beginFolderDraft(folder, 'text');
                 }}
                 aria-label="New file here"
-                className="relative group/tip opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 leading-none text-stone-400 transition-opacity hover:text-stone-600"
+                className="relative group/tip opacity-0 group-data-[hovered]:opacity-100 group-focus-within:opacity-100 leading-none text-stone-400 transition-opacity hover:text-stone-600"
               >
                 <FilePlusIcon className="h-3.5 w-3.5" weight="regular" aria-hidden />
                 <IconTooltip label="New file here" />
@@ -994,7 +1168,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
                   }}
                   aria-label="New chat here"
                   data-testid="folder-new-chat"
-                  className="relative group/tip opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 leading-none text-stone-400 transition-opacity hover:text-stone-600"
+                  className="relative group/tip opacity-0 group-data-[hovered]:opacity-100 group-focus-within:opacity-100 leading-none text-stone-400 transition-opacity hover:text-stone-600"
                 >
                   <ChatTeardropIcon className="h-3.5 w-3.5" weight="regular" aria-hidden />
                   <IconTooltip label="New chat here" />
@@ -1002,7 +1176,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
               ) : null}
             </div>
           )}
-          {canWrite && (
+          {rowCanWrite(folder) && (
             <div className="relative flex items-center" ref={openMenuPath === folder ? fileMenuRef : null}>
               <button
                 type="button"
@@ -1012,9 +1186,9 @@ export const FilesTabPanel = memo(function FilesTabPanel({
                   setOpenMenuPath((prev) => (prev === folder ? null : folder));
                 }}
                 aria-label="Folder options"
-                className="relative group/tip opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 leading-none text-stone-400 hover:text-stone-600 transition-opacity"
+                className="relative group/tip opacity-0 group-data-[hovered]:opacity-100 group-focus-within:opacity-100 leading-none text-stone-400 hover:text-stone-600 transition-opacity"
               >
-                <MoreVerticalIcon className="h-4 w-4" />
+                <DotsThreeVerticalIcon className="h-4 w-4" weight="bold" aria-hidden />
                 <IconTooltip label="Folder actions" open={openMenuPath === folder} />
               </button>
               <AnchoredDropdown
@@ -1023,6 +1197,20 @@ export const FilesTabPanel = memo(function FilesTabPanel({
                 align="right"
                 className={SIDEBAR_ACTION_MENU_CLASSES}
               >
+                  <button
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setOpenMenuPath(null);
+                      setFocusedFolder(folder);
+                    }}
+                    data-testid="focus-folder"
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-700"
+                  >
+                    <ArrowsInSimpleIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
+                    <span className="flex-1">Focus</span>
+                    <span className="text-[10px] text-stone-400">⌥ click</span>
+                  </button>
+                  <div className="my-1 border-t border-stone-100" />
                   {/* Create INSIDE this folder — the same menu serves the ⋮
                       button and the row's right-click. */}
                   <button
@@ -1099,7 +1287,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
                     <DownloadSimpleIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
                     <span>Download</span>
                   </button>
-                  {rootEntry ? null : (
+                  {rootEntry || !rowCanWrite(folder) ? null : (
                   <button
                     onClick={(event) => {
                       event.stopPropagation();
@@ -1149,10 +1337,9 @@ export const FilesTabPanel = memo(function FilesTabPanel({
         </div>
 
         {isExpanded && (
-          <div className="ml-3.5">
+          <div className="ml-5">
             {renderDraftRow(folder)}
-            {childFolders.map((child) => renderFolder(child))}
-            {folderFiles.map((file) => renderFileRow(file))}
+            {renderChildren(folder, childFolders, folderFiles)}
           </div>
         )}
       </div>
@@ -1165,15 +1352,6 @@ export const FilesTabPanel = memo(function FilesTabPanel({
       project keeps the bare tree. */
   function renderPrimaryRootSection(entry: { prefix: string; root: string; name: string }): React.ReactNode {
     const MENU_KEY = '__primary_root__';
-    // Root-level draft (parentPath null) — the effect above reveals it.
-    const beginRootDraft = (type: DraftEntry['type']) => {
-      setDraftEntry({
-        id: `draft-${draftIdRef.current++}`,
-        type,
-        parentPath: null,
-        name: buildDraftName(type, null),
-      });
-    };
     const isExpanded = !primaryRootCollapsed;
     return (
       <div key={MENU_KEY}>
@@ -1203,7 +1381,8 @@ export const FilesTabPanel = memo(function FilesTabPanel({
             setOpenMenuPath((prev) => (prev === MENU_KEY ? null : MENU_KEY));
           }}
           data-testid="primary-root-section"
-          className={`${SIDEBAR_ENTRY_ROW_CLASSES} ${getSidebarListItemStateClasses(false)}`}
+          {...rowHover(MENU_KEY)}
+          className={`${SIDEBAR_ENTRY_ROW_CLASSES} ${getSidebarListItemStateClasses(false, hoverKey === MENU_KEY)}`}
         >
           <CaretRightIcon
             className={`h-3.5 w-3.5 flex-shrink-0 text-stone-400 transition-transform ${isExpanded ? 'rotate-90' : ''}`}
@@ -1224,7 +1403,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
                   beginRootDraft('text');
                 }}
                 aria-label="New file here"
-                className="relative group/tip opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 leading-none text-stone-400 transition-opacity hover:text-stone-600"
+                className="relative group/tip opacity-0 group-data-[hovered]:opacity-100 group-focus-within:opacity-100 leading-none text-stone-400 transition-opacity hover:text-stone-600"
               >
                 <FilePlusIcon className="h-3.5 w-3.5" weight="regular" aria-hidden />
                 <IconTooltip label="New file here" />
@@ -1239,7 +1418,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
                   }}
                   aria-label="New chat here"
                   data-testid="folder-new-chat"
-                  className="relative group/tip opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 leading-none text-stone-400 transition-opacity hover:text-stone-600"
+                  className="relative group/tip opacity-0 group-data-[hovered]:opacity-100 group-focus-within:opacity-100 leading-none text-stone-400 transition-opacity hover:text-stone-600"
                 >
                   <ChatTeardropIcon className="h-3.5 w-3.5" weight="regular" aria-hidden />
                   <IconTooltip label="New chat here" />
@@ -1257,9 +1436,9 @@ export const FilesTabPanel = memo(function FilesTabPanel({
                   setOpenMenuPath((prev) => (prev === MENU_KEY ? null : MENU_KEY));
                 }}
                 aria-label="Folder options"
-                className="relative group/tip opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 leading-none text-stone-400 hover:text-stone-600 transition-opacity"
+                className="relative group/tip opacity-0 group-data-[hovered]:opacity-100 group-focus-within:opacity-100 leading-none text-stone-400 hover:text-stone-600 transition-opacity"
               >
-                <MoreVerticalIcon className="h-4 w-4" />
+                <DotsThreeVerticalIcon className="h-4 w-4" weight="bold" aria-hidden />
                 <IconTooltip label="Folder actions" open={openMenuPath === MENU_KEY} />
               </button>
               <AnchoredDropdown
@@ -1309,10 +1488,9 @@ export const FilesTabPanel = memo(function FilesTabPanel({
           )}
         </div>
         {isExpanded && (
-          <div className="ml-3.5">
+          <div className="ml-5">
             {renderDraftRow(null)}
-            {rootFolders.map((folder) => renderFolder(folder))}
-            {rootFiles.map((file) => renderFileRow(file))}
+            {renderChildren(ROOT_ORDER_KEY, rootFolders, rootFiles)}
           </div>
         )}
       </div>
@@ -1331,27 +1509,27 @@ export const FilesTabPanel = memo(function FilesTabPanel({
           handleFileSelect(file, event);
         }}
         onDoubleClick={(event) => {
-          if (!canWrite || isFileRenaming) return;
+          if (!rowCanWrite(file.path) || isFileRenaming) return;
           event.stopPropagation();
           onBeginRename(file.path, 'list');
         }}
         onKeyDown={(event) => {
           if (event.key === 'Enter') {
             event.preventDefault();
-            if (!canWrite) return;
+            if (!rowCanWrite(file.path)) return;
             onBeginRename(file.path, 'list');
           }
         }}
         role="button"
         tabIndex={0}
         onContextMenu={(event) => {
-          if (!canWrite) return;
+          if (!rowCanWrite(file.path)) return;
           event.preventDefault();
           event.stopPropagation();
           setOpenMenuPath((prev) => (prev === file.path ? null : file.path));
         }}
         onDragOver={(event) => {
-          if (!canWrite) return;
+          if (!rowCanWrite(file.path)) return;
           // Dropping mid-row on a file lands in its folder — the row
           // edges reorder among siblings instead.
           handleRowDragOver(event, file.path, false);
@@ -1364,28 +1542,36 @@ export const FilesTabPanel = memo(function FilesTabPanel({
           if (handleRowDrop(event, file.path, false)) return;
           onDropToFolder(event, getFolderPath(file.path));
         }}
-        draggable={canWrite}
+        draggable={rowCanWrite(file.path)}
         onDragStart={(event) => {
           onFileDragStart(event, file.path);
           draggingRef.current = {
             paths: selectedPaths.has(file.path) ? Array.from(selectedPaths) : [file.path],
-            kind: 'file',
           };
         }}
         onDragEnd={endRowDrag}
         style={dropHintStyle(file.path)}
         data-files-entry={file.path}
+        {...rowHover(file.path)}
         className={`${SIDEBAR_ENTRY_ROW_CLASSES} ${
-          isSelected ? 'bg-stone-200/80 text-stone-800' : getSidebarListItemStateClasses(isActiveFile)
+          isSelected
+            ? 'bg-stone-200/80 text-stone-800'
+            : getSidebarListItemStateClasses(isActiveFile, hoverKey === file.path)
         }`}
       >
-        <WorkspaceEntryIcon
-          path={file.path}
-          className="h-[18px] w-[18px] flex-shrink-0"
-        />
+        {/* Caret-width spacer: keeps file names on the same grid as folder
+            names, whose rows start with the expand caret. */}
+        <span className="w-3.5 flex-shrink-0" aria-hidden />
+        {entryIcon(
+          file.path,
+          <WorkspaceEntryIcon path={file.path} className="h-[18px] w-[18px] flex-shrink-0" />,
+        )}
         {isFileRenaming ? (
           <input
             ref={attachRenameInput}
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
             value={renameEntry?.name ?? ''}
             onChange={(event) =>
               setRenameEntry({ path: file.path, name: event.target.value, source: 'list' })
@@ -1407,7 +1593,6 @@ export const FilesTabPanel = memo(function FilesTabPanel({
         ) : (
           <span className="flex min-w-0 flex-1 items-center gap-1 truncate text-left">
             <span className="truncate">{formatFileName(getFileName(file.path))}</span>
-            {sharedBadge(file.path, 'file')}
           </span>
         )}
         <LockedBadge locked={file.is_locked} />
@@ -1418,8 +1603,46 @@ export const FilesTabPanel = memo(function FilesTabPanel({
 
   return (
     <>
+      {/* Sticky within the rail's files scroller: the workspace identity (or
+          focus breadcrumb) stays visible while a long tree scrolls under it.
+          bg matches the rail (bg-stone-50) so rows don't show through. */}
+      <div className="sticky top-0 z-10 bg-stone-50">
       <SidebarSectionHeader
-        label={title ?? 'Files'}
+        collapsed={collapsed}
+        onToggleCollapsed={onToggleCollapsed}
+        label={
+          focusedFolder ? (
+            // Focus scope swaps the workspace identity header for the folder
+            // itself: a back caret (one level up) + its name.
+            <span data-testid="focus-breadcrumb" className="flex min-w-0 flex-1 items-center gap-1">
+              <button
+                type="button"
+                onClick={(event) => {
+                  // Defensive: if a caller ever wires onToggleCollapsed into
+                  // this header, Back must not double as a section collapse.
+                  event.stopPropagation();
+                  const parent = focusedFolder.split('/').slice(0, -1).join('/');
+                  setFocusedFolder(parent || null);
+                }}
+                aria-label="Back"
+                className="relative group/tip flex h-5 w-5 flex-shrink-0 items-center justify-center rounded text-stone-400 hover:bg-stone-200/60 hover:text-stone-600"
+              >
+                <CaretLeftIcon className="h-3.5 w-3.5" weight="bold" aria-hidden />
+                <IconTooltip label="Back" />
+              </button>
+              <span
+                className="min-w-0 truncate text-[12px] font-semibold text-stone-600"
+                // The folder name is identity, not blank header area — a click
+                // on it must not collapse the section (matches the root title).
+                onClick={(event) => event.stopPropagation()}
+              >
+                {extraRootByPrefix.get(focusedFolder)?.name ?? getFileName(focusedFolder)}
+              </span>
+            </span>
+          ) : (
+            title ?? 'Files'
+          )
+        }
         actions={
         <div className="flex items-center gap-1">
           {onToggleAgentMetaFiles ? (
@@ -1450,10 +1673,93 @@ export const FilesTabPanel = memo(function FilesTabPanel({
               />
             </button>
           ) : null}
-          {/* The header "+ New" button is gone (PR: one entry point per
-              action) — creation lives in the tree's right-click menus, and
-              the connect entry points moved into this ⋮ actions menu. */}
-          {onDownloadWorkspace || (canWrite && (onAddRepo || onAddOverleaf || onConnectLocalAgent)) ? (
+          {/* The header ＋: the one always-visible create entry point. The
+              web shell has no tab-strip ＋ and right-click is undiscoverable,
+              so without this row-less workspaces can't create anything. */}
+          {canCreateEntries ?? hasAnyWrite ? (
+            <div className="relative flex items-center" ref={openMenuPath === NEW_ENTRY_MENU_PATH ? fileMenuRef : null}>
+              <button
+                type="button"
+                ref={openMenuPath === NEW_ENTRY_MENU_PATH ? fileMenuTriggerRef : undefined}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setOpenMenuPath((prev) => (prev === NEW_ENTRY_MENU_PATH ? null : NEW_ENTRY_MENU_PATH));
+                }}
+                aria-label="New file or folder"
+                aria-haspopup="menu"
+                aria-expanded={openMenuPath === NEW_ENTRY_MENU_PATH}
+                data-testid="files-new-button"
+                className="relative group/tip flex h-7 w-7 items-center justify-center rounded text-stone-400 transition-colors hover:bg-stone-200/50 hover:text-stone-600"
+              >
+                <PlusIcon className="h-4 w-4" weight="bold" aria-hidden />
+                <IconTooltip label="New file or folder" align="right" open={openMenuPath === NEW_ENTRY_MENU_PATH} />
+              </button>
+              <AnchoredDropdown
+                open={openMenuPath === NEW_ENTRY_MENU_PATH}
+                anchorRef={fileMenuTriggerRef}
+                align="right"
+                className={SIDEBAR_ACTION_MENU_CLASSES}
+              >
+                <button
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setOpenMenuPath(null);
+                    onCreateFile();
+                  }}
+                  data-testid="files-new-file"
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-700"
+                >
+                  <FilePlusIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
+                  New file
+                </button>
+                <button
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setOpenMenuPath(null);
+                    onCreateFolder();
+                  }}
+                  data-testid="files-new-folder"
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-700"
+                >
+                  <FolderPlusIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
+                  New folder
+                </button>
+                {/* Same gate as the menu: the upload now carries the same
+                    folder target as New file, so a folder-scoped editor is
+                    authorized for it even while workspace canWrite is false. */}
+                <button
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setOpenMenuPath(null);
+                      uploadTargetRef.current = createParentPath ?? null;
+                      fileUploadInputRef.current?.click();
+                    }}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-700"
+                  >
+                    <UploadSimpleIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
+                    Upload files
+                  </button>
+                {onAddSkill ? (
+                  <button
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setOpenMenuPath(null);
+                      // The new skill is revealed in the (gated) tree body, so
+                      // expand first or it lands somewhere the user can't see.
+                      if (collapsed) onToggleCollapsed?.();
+                      onAddSkill();
+                    }}
+                    data-testid="files-add-skill"
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-700"
+                  >
+                    <SparkleIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
+                    Add skill
+                  </button>
+                ) : null}
+              </AnchoredDropdown>
+            </div>
+          ) : null}
+          {onShareWorkspace || onDownloadWorkspace || (canWrite && onConnectLocalAgent) ? (
           <div className="relative flex items-center" ref={openMenuPath === WORKSPACE_ACTIONS_MENU_PATH ? fileMenuRef : null}>
             <button
               type="button"
@@ -1465,7 +1771,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
               aria-label="Workspace actions"
               className="relative group/tip flex h-7 w-7 items-center justify-center rounded text-stone-400 transition-colors hover:bg-stone-200/50 hover:text-stone-600"
             >
-              <MoreVerticalIcon className="h-4 w-4" />
+              <DotsThreeVerticalIcon className="h-4 w-4" weight="bold" aria-hidden />
               <IconTooltip
                 label="Workspace actions"
                 align="right"
@@ -1478,32 +1784,18 @@ export const FilesTabPanel = memo(function FilesTabPanel({
               align="right"
               className={SIDEBAR_ACTION_MENU_CLASSES}
             >
-              {canWrite && onAddRepo ? (
+              {onShareWorkspace ? (
                 <button
+                  data-testid="workspace-actions-share"
                   onClick={(event) => {
                     event.stopPropagation();
                     setOpenMenuPath(null);
-                    onAddRepo();
-                  }}
-                  onMouseEnter={onAddRepoHover}
-                  onFocus={onAddRepoHover}
-                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-700"
-                >
-                  <GithubLogoIcon className="h-3.5 w-3.5 flex-shrink-0" weight="fill" aria-hidden />
-                  Add GitHub repo
-                </button>
-              ) : null}
-              {canWrite && onAddOverleaf ? (
-                <button
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    setOpenMenuPath(null);
-                    onAddOverleaf();
+                    onShareWorkspace();
                   }}
                   className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-700"
                 >
-                  <FileTextIcon className="h-3.5 w-3.5 flex-shrink-0 text-emerald-700" weight="fill" aria-hidden />
-                  Add Overleaf project
+                  <ShareNetworkIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
+                  Share workspace
                 </button>
               ) : null}
               {canWrite && onConnectLocalAgent ? (
@@ -1542,13 +1834,15 @@ export const FilesTabPanel = memo(function FilesTabPanel({
             onChange={(event) => {
               const files = event.target.files;
               if (!files || files.length === 0) return;
-              onQueueFileUploads(Array.from(files), null);
+              onQueueFileUploads(Array.from(files), uploadTargetRef.current);
+              uploadTargetRef.current = null;
               event.target.value = '';
             }}
           />
         </div>
         }
       />
+      </div>
       {collapsed ? null : (
       <>
       {showMetaFiles && (
@@ -1562,8 +1856,36 @@ export const FilesTabPanel = memo(function FilesTabPanel({
       <div
         ref={treeRef}
         data-files-panel=""
+        // Observable undo state for e2e specs: whether Cmd+Z has a pending
+        // delete to restore, and how many delete batches have been processed
+        // (the tests otherwise race the DELETE response handling).
+        data-undo-ready={canUndoDelete ? '1' : '0'}
+        data-delete-seq={deleteSeq ?? 0}
         tabIndex={-1}
         className="flex-1 overflow-auto px-2 outline-none"
+        onPointerOver={(event) => {
+          const row = (event.target as HTMLElement).closest('[data-hover-key]') as HTMLElement | null;
+          const key = row?.dataset.hoverKey ?? null;
+          setHoverKey(key);
+          if (key && key !== prefetchedHoverKeyRef.current) {
+            prefetchedHoverKeyRef.current = key;
+            const path = key.startsWith('pin:') ? key.slice(4) : key;
+            const file = workspaceFileByPath.get(path);
+            if (file && file.type !== 'folder') onPrefetchFile?.(file);
+          }
+        }}
+        onPointerLeave={() => {
+          prefetchedHoverKeyRef.current = null;
+          setHoverKey(null);
+        }}
+        onPointerDown={(event) => {
+          if (event.pointerType === 'mouse') return;
+          const row = (event.target as HTMLElement).closest('[data-hover-key]') as HTMLElement | null;
+          const key = row?.dataset.hoverKey ?? '';
+          const path = key.startsWith('pin:') ? key.slice(4) : key;
+          const file = workspaceFileByPath.get(path);
+          if (file && file.type !== 'folder') onPrefetchFile?.(file);
+        }}
         onDragOver={(event) => {
           if (!canWrite) return;
           const types = Array.from(event.dataTransfer.types ?? []);
@@ -1585,7 +1907,10 @@ export const FilesTabPanel = memo(function FilesTabPanel({
           if (relatedTarget && currentTarget.contains(relatedTarget)) return;
           setIsFilesDropActive(false);
         }}
-        onDrop={(event) => onDropToFolder(event, null)}
+        onDrop={(event) => {
+          endRowDrag(); // root-area drops end the tracked drag too
+          onDropToFolder(event, null);
+        }}
         onContextMenu={openCreateContextMenu}
       >
         {fileUploads.length > 0 && (
@@ -1623,64 +1948,10 @@ export const FilesTabPanel = memo(function FilesTabPanel({
         )}
         {focusedFolder ? (
           <>
-            {/* Wireframe focus scope: breadcrumb + just this folder's rows. */}
-            <div
-              data-testid="focus-breadcrumb"
-              className="group flex items-center gap-0.5 px-1 pb-1.5 pt-0.5 text-xs text-stone-500"
-            >
-              <button
-                type="button"
-                onClick={() => setFocusedFolder(null)}
-                aria-label="Back to all files"
-                className="relative group/tip rounded p-0.5 text-stone-400 hover:bg-stone-200/60 hover:text-stone-600"
-              >
-                <CaretLeftIcon className="h-3.5 w-3.5" weight="bold" aria-hidden />
-                <IconTooltip label="Back to all files" />
-              </button>
-              {focusedFolder.split('/').map((segment, index, segments) => {
-                const prefix = segments.slice(0, index + 1).join('/');
-                const isLast = index === segments.length - 1;
-                const label = index === 0 ? (extraRootByPrefix.get(segment)?.name ?? segment) : segment;
-                return (
-                  <span key={prefix} className="flex min-w-0 items-center gap-0.5">
-                    {index > 0 ? <span className="text-stone-300">/</span> : null}
-                    <button
-                      type="button"
-                      onClick={() => setFocusedFolder(prefix)}
-                      className={`truncate rounded px-0.5 hover:bg-stone-200/60 ${isLast ? 'font-semibold text-stone-700' : ''}`}
-                    >
-                      {label}
-                    </button>
-                  </span>
-                );
-              })}
-              <span className="flex-1" />
-              {canWrite ? (
-                <button
-                  type="button"
-                  onClick={() => beginFolderDraft(focusedFolder, 'text')}
-                  aria-label="New file here"
-                  className="relative group/tip rounded p-0.5 text-stone-400 opacity-0 transition-opacity hover:text-stone-600 group-hover:opacity-100"
-                >
-                  <FilePlusIcon className="h-3.5 w-3.5" weight="regular" aria-hidden />
-                  <IconTooltip label="New file here" />
-                </button>
-              ) : null}
-              {canWrite && onNewChatInFolder ? (
-                <button
-                  type="button"
-                  onClick={() => onNewChatInFolder(focusedFolder)}
-                  aria-label="New chat here"
-                  className="relative group/tip rounded p-0.5 text-stone-400 opacity-0 transition-opacity hover:text-stone-600 group-hover:opacity-100"
-                >
-                  <ChatTeardropIcon className="h-3.5 w-3.5" weight="regular" aria-hidden />
-                  <IconTooltip label="New chat here" />
-                </button>
-              ) : null}
-            </div>
+            {/* Focus scope: the section header carries the folder identity +
+                back caret; the body is just this folder's rows. */}
             {renderDraftRow(focusedFolder)}
-            {(foldersByParent[focusedFolder] ?? []).map((child) => renderFolder(child))}
-            {(filesByFolder[focusedFolder] ?? []).map((file) => renderFileRow(file))}
+            {renderChildren(focusedFolder, foldersByParent[focusedFolder] ?? [], filesByFolder[focusedFolder] ?? [])}
             {(foldersByParent[focusedFolder] ?? []).length === 0 &&
               (filesByFolder[focusedFolder] ?? []).length === 0 && (
                 <div className="px-2 text-xs text-stone-400">Empty folder.</div>
@@ -1703,8 +1974,10 @@ export const FilesTabPanel = memo(function FilesTabPanel({
                     onOpenFile(file);
                   }
                 }}
-                className={`${SIDEBAR_ENTRY_ROW_CLASSES} ${getSidebarListItemStateClasses(selectedFilePath === file.path)}`}
+                {...rowHover(`pin:${file.path}`)}
+                className={`${SIDEBAR_ENTRY_ROW_CLASSES} ${getSidebarListItemStateClasses(selectedFilePath === file.path, hoverKey === `pin:${file.path}`)}`}
               >
+                <span className="w-3.5 flex-shrink-0" aria-hidden />
                 <WorkspaceEntryIcon path={file.path} className="h-[18px] w-[18px] flex-shrink-0" />
                 <span className="min-w-0 flex-1 truncate text-left">{formatFileName(getFileName(file.path))}</span>
                 <span className="ml-auto flex items-center">{pinButton(file.path)}</span>
@@ -1722,8 +1995,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
         ) : (
           <>
             {renderDraftRow(null)}
-            {rootFolders.map((folder) => renderFolder(folder))}
-            {rootFiles.map((file) => renderFileRow(file))}
+            {renderChildren(ROOT_ORDER_KEY, rootFolders, rootFiles)}
           </>
         )}
 
@@ -1732,11 +2004,12 @@ export const FilesTabPanel = memo(function FilesTabPanel({
         )}
           </>
         )}
-        {!focusedFolder && canWrite && (
+        {!focusedFolder && canWrite && (localRoots || onAddContextFolder) && (
           // "+ Add folder…" under the tree: open a folder from ANYWHERE on
-          // the computer as extra context (Cowork-style). Only the desktop
-          // shell's native picker can do this — elsewhere the row is
-          // disabled with a tooltip. Create/upload live in right-click menus.
+          // the computer as extra context (Cowork-style). Local projects only
+          // — cloud workspaces have no disk to mount, so no row at all; a
+          // local project in a plain browser shows it disabled with the
+          // desktop-app hint. Create/upload live in right-click menus.
           <button
             type="button"
             onClick={(event) => {
@@ -1753,21 +2026,25 @@ export const FilesTabPanel = memo(function FilesTabPanel({
             className="mt-0.5 flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-[13px] text-stone-400 enabled:hover:bg-stone-100 enabled:hover:text-stone-600 disabled:cursor-default disabled:opacity-50"
           >
             <PlusIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
-            <span className="truncate">Add folder…</span>
+            <span className="truncate">Add context…</span>
           </button>
         )}
       </div>
-      {emptyMenu && canWrite && (
+      {emptyMenu && canUseEmptyMenu && (
         <div
+          data-testid="files-empty-context-menu"
           className="fixed z-50 w-44 rounded-lg border border-stone-200 bg-white py-1 text-xs shadow-lg"
           style={{ top: emptyMenu.y, left: emptyMenu.x }}
           onClick={(event) => event.stopPropagation()}
           onContextMenu={(event) => event.preventDefault()}
         >
+          {/* Root scope — except in folder-focus mode, where the whole panel
+              IS that folder, so creates land inside it. */}
           <button
             onClick={() => {
               setEmptyMenu(null);
-              onCreateFile();
+              if (focusedFolder) beginFolderDraft(focusedFolder, 'text');
+              else beginRootDraft('text');
             }}
             className="w-full px-3 py-2 text-left text-stone-600 hover:bg-stone-50"
           >
@@ -1776,7 +2053,8 @@ export const FilesTabPanel = memo(function FilesTabPanel({
           <button
             onClick={() => {
               setEmptyMenu(null);
-              onCreateFolder();
+              if (focusedFolder) beginFolderDraft(focusedFolder, 'folder');
+              else beginRootDraft('folder');
             }}
             className="w-full px-3 py-2 text-left text-stone-600 hover:bg-stone-50"
           >
@@ -1785,6 +2063,9 @@ export const FilesTabPanel = memo(function FilesTabPanel({
           <button
             onClick={() => {
               setEmptyMenu(null);
+              // Same scope as the creates — and overwrites a stale target left
+              // by a cancelled header-＋ picker (cancel fires no change event).
+              uploadTargetRef.current = focusedFolder;
               fileUploadInputRef.current?.click();
             }}
             className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 hover:bg-stone-50"

@@ -9,7 +9,6 @@ import { LocalCollabSocketProvider } from '@/lib/workspace/collab-socket-context
 import { resolveSidecarConfig, sidecar, sidecarWsUrl, type SidecarConfig } from '@/lib/local/sidecar';
 import { LOCAL_SHELL_PARAM, localProjectIdFromLocation } from '@/lib/local/static-shell';
 import { setLocalImageSource } from '@/lib/workspace/image-src';
-import { GetSetUpCard } from '@/components/desktop/get-set-up-card';
 
 /** Local-project variant of the /w/[slug] layout: same providers, but the
  *  collab socket points at the desktop sidecar and the route context carries
@@ -68,16 +67,46 @@ export default function LocalWorkspaceLayout({ children }: { children: React.Rea
       </div>
     );
   }
-  if (!config) return null;
-
   return (
-    <WorkspaceRouteProvider value={routeValue}>
-      <DocumentEditModeProvider workspaceId={projectId}>
-        <LocalCollabSocketProvider projectId={projectId} wsUrl={sidecarWsUrl(config)} token={config.token}>
-          {children}
-          <GetSetUpCard config={config} projectId={projectId} />
-        </LocalCollabSocketProvider>
-      </DocumentEditModeProvider>
-    </WorkspaceRouteProvider>
+    <>
+      {/* Static chrome behind the workspace. The sidecar now serves the `_`
+          shell's flight payloads for every /local/<id>, so opening a project
+          is a soft navigation and this rarely shows — but a cold window still
+          boots the bundle against an EMPTY body (the white flash between the
+          launcher and the workspace), and this is plain markup that ships
+          inside /local/_.html and paints before any JS runs. It then sits
+          behind the workspace, which covers it as it fades in. */}
+      <div aria-hidden className="pointer-events-none fixed inset-0 -z-10 bg-white" data-testid="local-workspace-shell">
+        <div className="h-11 border-b border-stone-200" />
+        {/* The pulse stops once the workspace can mount — past that the shell
+            is only a backdrop for its fade-in, and an animation nothing can
+            see would burn a compositor frame for the life of the window. */}
+        <div className={`mx-auto mt-16 w-full max-w-2xl space-y-4 px-8 ${config ? '' : 'animate-pulse'}`}>
+          <div className="h-8 w-1/2 rounded bg-stone-100" />
+          <div className="h-4 w-full rounded bg-stone-100" />
+          <div className="h-4 w-4/5 rounded bg-stone-100" />
+        </div>
+      </div>
+      {config ? (
+        // key on the project: /local/<a> → /local/<b> is a SOFT navigation in
+        // the desktop shell (the sidecar serves the `_` shell's flight
+        // payloads for every id), so the subtree would otherwise keep the
+        // previous project's providers, sockets and editor state alive.
+        <WorkspaceRouteProvider key={projectId} value={routeValue}>
+          <DocumentEditModeProvider workspaceId={projectId}>
+            {/* The "Get set up" checklist mounts inside WorkspacePage's
+                sidebar (with this route context's sidecar config) — no
+                overlay mount here. */}
+            <LocalCollabSocketProvider projectId={projectId} wsUrl={sidecarWsUrl(config)} token={config.token}>
+              {children}
+            </LocalCollabSocketProvider>
+          </DocumentEditModeProvider>
+        </WorkspaceRouteProvider>
+      ) : (
+        <span role="status" className="sr-only">
+          Opening project…
+        </span>
+      )}
+    </>
   );
 }

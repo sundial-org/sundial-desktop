@@ -8,6 +8,7 @@
 
 import { contentHash } from './store.mjs';
 import { inExtraRoot } from './roots.mjs';
+import { scopeCoversPath } from './paths.mjs';
 
 const BATCH_ROWS = 200;
 const BATCH_BYTES = 800_000;
@@ -68,20 +69,24 @@ const KINDS = [
   {
     table: 'local_edits',
     kind: 'edit',
-    // Bridged CLOUD edits echo into local_edits as actor 'remote' — they
-    // already exist in cloud doc_edits; uploading them back would duplicate
-    // the trail. (Cursor still advances past them: deliberately unshared.)
-    skip: (row) => row.actor === 'remote',
     payload: (row) => capEditPayload({
       path: row.path,
       actor: row.actor,
       author_id: row.author_id,
       edit_mode: row.edit_mode,
       chat_id: row.chat_id,
+      // Turn linkage (PR #986): the sidecar assistant message this agent edit
+      // belongs to. The cloud turn-edits route joins it back through the
+      // mirrored message's client_id to serve the chat diff chip.
+      message_id: row.message_id ?? null,
       // Joins a later decision event back to the exact staged edit it resolved.
       suggestion_id: row.suggestion_id ?? null,
       content_text: row.content_text,
-      update_b64: row.update_b64,
+      // Bridged CLOUD edits (actor 'remote') upload as content-only baselines:
+      // the cloud turn diff reads its before-text from the ledger trail, so a
+      // local turn that follows a cloud edit needs that row in place — but its
+      // delta originated in the cloud and would be pure round-trip redundancy.
+      update_b64: row.actor === 'remote' ? null : row.update_b64,
     }),
     pathOf: (row) => row.path,
   },
@@ -116,8 +121,9 @@ const KINDS = [
 
 /** Chats as hash-versioned snapshots: each metadata change mints a new
  *  (chatId, hash) event — append-only in the cloud — and the per-share state
- *  map keeps unchanged chats from re-POSTing every poll. */
-async function syncChatSnapshots(engine, namespace) {
+ *  map keeps unchanged chats from re-POSTing every poll. `chatIds` limits the
+ *  pass to specific conversations (chat scopes); null = every project chat. */
+async function syncChatSnapshots(engine, namespace, chatIds) {
   const { share, store, project } = engine;
   // Keyed by (project, workspace) — NOT the transient share id: an unshare/
   // re-share to the same workspace must keep the version counter monotonic,
@@ -127,6 +133,7 @@ async function syncChatSnapshots(engine, namespace) {
   const uploadedState = JSON.parse(store.getSetting(stateKey) ?? '{}');
   const changed = [];
   for (const row of store.listChats(project.id)) {
+    if (chatIds && !chatIds.has(row.id)) continue;
     const payload = {
       title: row.title,
       model: row.model,
@@ -171,6 +178,43 @@ async function syncChatSnapshots(engine, namespace) {
   }
 }
 
+/** One-time (per unit) deploy-transition backfill of retained rows below the
+ *  current edit cursor, for the two contract upgrades the cursor already
+ *  advanced past: bridged CLOUD rows (actor 'remote') were skipped entirely —
+ *  a turn following an old cloud edit would diff against a stale baseline —
+ *  and agent rows uploaded without their message_id turn linkage. The cloud
+ *  upsert MERGES on (workspace, kind, local_id), so re-sent rows are enriched
+ *  in place and never duplicated. The flag is set only after the pass
+ *  survives, so a lost ack retries (idempotently) next sync. */
+async function backfillLedgerContract(engine, namespace, unit, spec) {
+  const { store, project } = engine;
+  const flagKey = `ledger_backfill_v1:${unit.cursorKey}`;
+  if (store.getSetting(flagKey)) return;
+  const editCursor = store.ledgerCursor(unit.cursorKey, 'edit');
+  let cursor = 0;
+  while (cursor < editCursor) {
+    const rows = store.listLedgerRowsSince(spec.table, project.id, cursor, BATCH_ROWS);
+    if (rows.length === 0) break;
+    const events = [];
+    let bytes = 0;
+    for (const row of rows) {
+      cursor = row.rid;
+      if (row.rid > editCursor) break;
+      if (row.actor !== 'remote' && !(row.actor === 'agent' && row.message_id)) continue;
+      const rel = spec.pathOf(row);
+      if (inExtraRoot(store, project.id, rel) || !unit.contains(rel)) continue;
+      const payload = spec.payload(row);
+      payload.path = unit.toCloud(rel);
+      bytes += Buffer.byteLength(JSON.stringify(payload), 'utf8');
+      events.push({ kind: spec.kind, localId: `${namespace}:${row.id}`, createdAt: row.created_at ?? null, payload });
+      if (bytes >= BATCH_BYTES) break;
+    }
+    if (events.length > 0) await ledgerPost(engine, events);
+    if (rows.length < BATCH_ROWS && cursor >= rows[rows.length - 1].rid) break;
+  }
+  store.setSetting(flagKey, '1');
+}
+
 /** Plain authenticated POST — deliberately NOT engine.cloudFetch: that parks
  *  the whole share (status 'error' + authError) on a 401/403, and a rejected
  *  side-channel upload (e.g. a token that can't write) must never take down
@@ -189,56 +233,106 @@ async function ledgerPost(engine, events) {
   if (!res.ok) throw new Error(`ledger upload failed status=${res.status}`);
 }
 
-/** One upload pass for one share engine. Path-scoped kinds respect the share
- *  scope; chats/messages upload only for whole-project shares (a subfolder
- *  share must not leak project-wide conversations). Rows outside scope still
- *  advance the cursor — they are deliberately not shared, not pending. */
+/** The independent upload lanes of one share engine. Legacy shares are one
+ *  unit keyed by the share id. A union (grants-model) share runs one unit PER
+ *  SCOPE, each with its own cursors (`scope:<id>`), so a scope added later
+ *  uploads its subtree's/chat's retained history from row zero — the cloud
+ *  upsert dedupes rows an overlapping scope already sent. */
+function ledgerUnits(engine) {
+  const { share } = engine;
+  const unitFor = (cursorKey, scopeKind, scopePath, contains, toCloud) =>
+    scopeKind === 'chat'
+      ? { cursorKey, kinds: ['message'], chatId: scopePath, chatIds: new Set([scopePath]) }
+      : {
+          cursorKey,
+          // Chats/messages ride whole-project scopes only — a subfolder share
+          // must not leak project-wide conversations.
+          kinds: scopeKind === 'project' ? ['edit', 'message', 'decision'] : ['edit', 'decision'],
+          chatId: null,
+          chatIds: scopeKind === 'project' ? null : undefined,
+          contains,
+          toCloud,
+        };
+  if (!engine.isUnion) {
+    return [
+      unitFor(
+        share.id,
+        share.scope_kind,
+        share.scope_path,
+        (rel) => engine.scopeContains(rel),
+        (rel) => engine.localToCloud(rel),
+      ),
+    ];
+  }
+  return engine.scopes.map((scope) =>
+    unitFor(
+      `scope:${scope.id}`,
+      scope.scope_kind,
+      scope.scope_path,
+      (rel) => scopeCoversPath(scope, rel),
+      (rel) => rel,
+    ),
+  );
+}
+
+/** One upload pass for one share engine. Path-scoped kinds respect each
+ *  unit's scope; chats/messages upload only for whole-project units. A CHAT
+ *  unit inverts that: only its one chat's snapshot + messages upload — no
+ *  edits, no decisions, no files. Rows outside scope still advance the
+ *  cursor — they are deliberately not shared, not pending. */
 export async function syncShareLedger(engine) {
-  const { share, store, project } = engine;
+  const { store, project } = engine;
   const namespace = store.installId();
-  if (share.scope_kind === 'project') await syncChatSnapshots(engine, namespace);
-  for (const spec of KINDS) {
-    if (!spec.pathOf && share.scope_kind !== 'project') continue;
-    for (;;) {
-      const cursor = store.ledgerCursor(share.id, spec.kind);
-      const rows = store.listLedgerRowsSince(spec.table, project.id, cursor, BATCH_ROWS);
-      if (rows.length === 0) break;
-      const events = [];
-      let bytes = 0;
-      let lastRid = cursor;
-      for (const row of rows) {
-        lastRid = row.rid;
-        if (spec.skip?.(row)) continue;
-        // Extra-root (multi-root mount) rows are local-only context — a
-        // project-scope share's scopeContains() is true for EVERY path, so
-        // without this their content would leak to the cloud ledger.
-        if (spec.pathOf && inExtraRoot(store, project.id, spec.pathOf(row))) continue;
-        if (spec.pathOf && !engine.scopeContains(spec.pathOf(row))) continue;
-        const payload = spec.payload(row);
-        // Scoped shares store files in the cloud under TRANSLATED paths
-        // (docs/a.md → a.md) — ledger rows must use the same mapping or they
-        // can't join back to the cloud files/doc_edits rows.
-        if (spec.pathOf) payload.path = engine.localToCloud(spec.pathOf(row));
-        bytes += Buffer.byteLength(JSON.stringify(payload), 'utf8');
-        events.push({
-          kind: spec.kind,
-          // Cloud idempotency key is (workspace, kind, local_id) and several
-          // sidecars can feed one workspace — their SQLite ids all start at 1,
-          // so a bare row id would make machine B's rows read as machine A's
-          // duplicates and get silently dropped. The INSTALL id namespaces
-          // them (share ids are transient: a re-share regenerates one and
-          // would re-upload retained rows as duplicates).
-          localId: `${namespace}:${row.id}`,
-          createdAt: row.created_at ?? null,
-          payload,
-        });
-        if (bytes >= BATCH_BYTES) break;
+  for (const unit of ledgerUnits(engine)) {
+    // chatIds: null = all project chats (project scope), a set = that chat
+    // (chat scope), undefined = no chat snapshots (folder/file scope).
+    if (unit.chatIds !== undefined) await syncChatSnapshots(engine, namespace, unit.chatIds);
+    if (unit.kinds.includes('edit')) await backfillLedgerContract(engine, namespace, unit, KINDS[0]);
+    for (const spec of KINDS) {
+      if (!unit.kinds.includes(spec.kind)) continue;
+      for (;;) {
+        const cursor = store.ledgerCursor(unit.cursorKey, spec.kind);
+        const rows = store.listLedgerRowsSince(spec.table, project.id, cursor, BATCH_ROWS);
+        if (rows.length === 0) break;
+        const events = [];
+        let bytes = 0;
+        let lastRid = cursor;
+        for (const row of rows) {
+          lastRid = row.rid;
+          // Chat unit: other conversations advance the cursor, never upload.
+          if (unit.chatId && row.chat_id !== unit.chatId) continue;
+          // Extra-root (multi-root mount) rows are local-only context — a
+          // project-scope share's contains() is true for EVERY path, so
+          // without this their content would leak to the cloud ledger.
+          if (spec.pathOf && inExtraRoot(store, project.id, spec.pathOf(row))) continue;
+          if (spec.pathOf && !unit.contains(spec.pathOf(row))) continue;
+          const payload = spec.payload(row);
+          // Legacy scoped shares store files in the cloud under TRANSLATED
+          // paths (docs/a.md → a.md) — ledger rows must use the same mapping
+          // or they can't join back to the cloud files/doc_edits rows.
+          // (Union scopes map identically.)
+          if (spec.pathOf) payload.path = unit.toCloud(spec.pathOf(row));
+          bytes += Buffer.byteLength(JSON.stringify(payload), 'utf8');
+          events.push({
+            kind: spec.kind,
+            // Cloud idempotency key is (workspace, kind, local_id) and several
+            // sidecars can feed one workspace — their SQLite ids all start at 1,
+            // so a bare row id would make machine B's rows read as machine A's
+            // duplicates and get silently dropped. The INSTALL id namespaces
+            // them (share ids are transient: a re-share regenerates one and
+            // would re-upload retained rows as duplicates).
+            localId: `${namespace}:${row.id}`,
+            createdAt: row.created_at ?? null,
+            payload,
+          });
+          if (bytes >= BATCH_BYTES) break;
+        }
+        if (events.length > 0) {
+          await ledgerPost(engine, events);
+        }
+        store.setLedgerCursor(unit.cursorKey, spec.kind, lastRid);
+        if (lastRid === rows[rows.length - 1].rid && rows.length < BATCH_ROWS) break;
       }
-      if (events.length > 0) {
-        await ledgerPost(engine, events);
-      }
-      store.setLedgerCursor(share.id, spec.kind, lastRid);
-      if (lastRid === rows[rows.length - 1].rid && rows.length < BATCH_ROWS) break;
     }
   }
 }

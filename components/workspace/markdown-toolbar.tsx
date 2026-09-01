@@ -3,13 +3,15 @@
 import type { Editor } from '@tiptap/react';
 import { forwardRef, useCallback, useEffect, useRef, useState } from 'react';
 import { IconTooltip } from '@/components/collab-bubbles';
+import { useDocStyle } from '@/lib/doc-style';
+import { setSpellcheckPreference } from '@/lib/spellcheck';
 import {
   ArrowClockwiseIcon,
   ArrowCounterClockwiseIcon,
   CaretDownIcon,
+  DotsThreeIcon,
   CaretUpIcon,
   CheckIcon,
-  DotsThreeVerticalIcon,
   EraserIcon,
   HighlighterIcon,
   ImageIcon,
@@ -17,13 +19,11 @@ import {
   ListBulletsIcon,
   ListChecksIcon,
   ListNumbersIcon,
-  MinusIcon,
-  PlusIcon,
   PrinterIcon,
   RowsIcon,
+  SignatureIcon,
   TextAaIcon,
   TextAlignCenterIcon,
-  TextAlignJustifyIcon,
   TextAlignLeftIcon,
   TextAlignRightIcon,
   TextBIcon,
@@ -49,6 +49,17 @@ interface MarkdownToolbarProps {
   menusHidden?: boolean;
   /** Called when the user clicks the chevron to show/hide the menus above the toolbar. */
   onToggleMenus?: () => void;
+  /** Authorship lens: band the whole document by who wrote each line, with
+   *  author · when in the margin. Rendered only when the host supplies the
+   *  handler (cloud workspaces with edit history). */
+  authorshipLens?: boolean;
+  onToggleAuthorshipLens?: () => void;
+  /** Docs style: the host folds the condensed tiers into the document ⋯ menu
+   *  (ToolbarOverflowItems) — suppress the bar's own overflow trigger so the
+   *  pill carries ONE dots menu, not two. */
+  hideOverflowMenu?: boolean;
+  /** Split panes: printing/@page target the primary document only. */
+  hidePrint?: boolean;
 }
 
 // Progressive reveal thresholds, in px of responsive width (container minus the
@@ -59,50 +70,84 @@ interface MarkdownToolbarProps {
 const SHOW_UNDO = 150; // undo / redo / print / spellcheck
 const SHOW_ZOOM = 270; // zoom / page setup
 const SHOW_PARAGRAPH = 400; // paragraph style
-const SHOW_FONT = 515; // font family
-const SHOW_FONT_SIZE = 650; // font-size stepper
-const SHOW_MARKS = 800; // bold / italic / underline / color / highlight
-const SHOW_LINK = 890; // link / image
-const SHOW_ALIGN = 990; // alignment + line spacing
-const SHOW_LISTS = 1080; // checklist / bullets / numbers
-const SHOW_INDENT = 1140; // indent / outdent
-const SHOW_CLEAR = 1225; // clear formatting (last group → everything fits)
-const SHOW_ALIGN_BUTTONS = 1300; // alignment as 4 inline buttons vs a dropdown
+const SHOW_MARKS = 520; // bold / italic / underline / highlight
+const SHOW_LINK = 610; // link / image
+const SHOW_ALIGN = 710; // alignment + line spacing
+const SHOW_LISTS = 800; // checklist / bullets / numbers
+const SHOW_INDENT = 860; // indent / outdent
+const SHOW_CLEAR = 945; // clear formatting (last group → everything fits)
+const SHOW_ALIGN_BUTTONS = 1020; // alignment as 3 inline buttons vs a dropdown
 
 type HeadingLevel = 1 | 2 | 3;
 
-const FONT_FAMILIES = [
-  'Arial',
-  'Georgia',
-  'Times New Roman',
-  'Courier New',
-  'Verdana',
-  'Roboto',
-];
+/** Which control groups fit at a given container width. One source of truth
+ *  for the bar's progressive reveal AND for hosts that render the hidden
+ *  tiers elsewhere (the Docs ⋯ menu) — the two must never disagree about
+ *  what's hidden. `reserve` = extra right-side chrome (the menus chevron). */
+export function toolbarTierFlags(containerWidth: number, reserve = 0) {
+  const responsiveWidth =
+    containerWidth === 0 || !Number.isFinite(containerWidth)
+      ? containerWidth
+      : Math.max(0, containerWidth - reserve - 36);
+  // width 0 = unmeasured (initial/SSR): show the full bar rather than collapse.
+  const fits = (min: number) => responsiveWidth === 0 || responsiveWidth >= min;
+  return {
+    showUndo: fits(SHOW_UNDO),
+    showZoom: fits(SHOW_ZOOM),
+    showParagraph: fits(SHOW_PARAGRAPH),
+    showMarks: fits(SHOW_MARKS),
+    showLink: fits(SHOW_LINK),
+    showAlign: fits(SHOW_ALIGN),
+    showLists: fits(SHOW_LISTS),
+    showIndent: fits(SHOW_INDENT),
+    showClear: fits(SHOW_CLEAR),
+    showAlignButtons: fits(SHOW_ALIGN_BUTTONS),
+  };
+}
 
-const TEXT_COLORS = [
-  '#1c1917',
-  '#57534e',
-  '#991b1b',
-  '#e11d48',
-  '#ea580c',
-  '#ca8a04',
-  '#15803d',
-  '#0369a1',
-  '#4338ca',
-  '#7e22ce',
-];
+export type ToolbarTierFlags = ReturnType<typeof toolbarTierFlags>;
 
-const HIGHLIGHT_COLORS = [
-  '#fef08a',
-  '#fde68a',
-  '#fca5a5',
-  '#f9a8d4',
-  '#c7d2fe',
-  '#a5f3fc',
-  '#bbf7d0',
-  '#e4e4e7',
-];
+/** Alignment is image-only at the schema level (images round-trip as
+ *  `{align=…}`); the command exists only when TextAlign is mounted. Caller
+ *  guards against a destroyed editor (`can()` throws there). */
+export function canAlignSelection(editor: Editor): boolean {
+  const can = editor.can() as unknown as { setTextAlign?: (a: string) => boolean };
+  return can.setTextAlign?.('center') === true;
+}
+
+/** Spellcheck lives on the editor DOM's `spellcheck` attribute — the ONE
+ *  source of truth, read at render, so the bar's inline button and the
+ *  overflow/⋯ menu item can never disagree. (v3 throws on `editor.view` once
+ *  destroyed; the toolbar renders against the last frozen editor during file
+ *  switches, so both helpers guard.) */
+function readSpellcheckEnabled(editor: Editor) {
+  const dom = editor.isDestroyed ? undefined : (editor.view.dom as HTMLElement | undefined);
+  return dom?.getAttribute('spellcheck') !== 'false';
+}
+
+function writeSpellcheckEnabled(editor: Editor, enabled: boolean) {
+  const dom = editor.isDestroyed ? undefined : (editor.view.dom as HTMLElement | undefined);
+  dom?.setAttribute('spellcheck', enabled ? 'true' : 'false');
+  setSpellcheckPreference(enabled);
+}
+
+/** Decoration-based checkboxes (MarkdownCheckbox): seed a bullet-list item
+ *  beginning with `[ ] `. Only toggles INTO a bulleted list (a blind toggle
+ *  would dissolve an existing one) and never double-marks a line. */
+function toggleChecklist(editor: Editor) {
+  if (!editor.isActive('bulletList')) {
+    editor.chain().focus().toggleBulletList().run();
+  }
+  const { $from } = editor.state.selection;
+  const paragraph = $from.parent;
+  if (
+    paragraph.type.name === 'paragraph' &&
+    !paragraph.textContent.startsWith('[ ]') &&
+    !paragraph.textContent.startsWith('[x]')
+  ) {
+    editor.chain().focus().insertContentAt($from.start(), '[ ] ').run();
+  }
+}
 
 const ZOOM_LEVELS = [50, 75, 90, 100, 125, 150, 200];
 const LINE_HEIGHTS = [1, 1.15, 1.5, 2, 2.5];
@@ -110,8 +155,65 @@ type MarkdownPageChrome = {
   margin: 'narrow' | 'normal' | 'wide';
   header: boolean;
   footer: boolean;
+  /** Page size in inches (Google Docs style only) — US Letter when unset. */
+  pageWidthIn?: number;
+  pageHeightIn?: number;
 };
 const DEFAULT_PAGE_CHROME: MarkdownPageChrome = { margin: 'normal', header: false, footer: false };
+// Mirrors DEFAULT_PAGE_WIDTH_IN/HEIGHT_IN in markdown-editor-frame.tsx — a
+// value import would cycle (the frame imports this toolbar).
+const PAGE_SIZE_DEFAULT_IN = { width: 8.5, height: 11 } as const;
+const PAGE_SIZE_MIN_IN = 3;
+const PAGE_SIZE_MAX_IN = 24;
+
+/** One page-size dimension in inches. Edits buffer in a draft so clamping
+ *  never rewrites keystrokes mid-entry (typing "11" over "8.5" must not become
+ *  "3" → "31" → 24 — Codex round 3); in-range values commit live (spinners,
+ *  finished numbers), everything clamps on blur/Enter. */
+function PageSizeInput({
+  label,
+  value,
+  onCommit,
+}: {
+  label: string;
+  value: number;
+  onCommit: (next: number) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const commit = (raw: string) => {
+    const parsed = Number.parseFloat(raw);
+    if (Number.isFinite(parsed)) {
+      onCommit(Math.min(PAGE_SIZE_MAX_IN, Math.max(PAGE_SIZE_MIN_IN, parsed)));
+    }
+    setDraft(null);
+  };
+  return (
+    <label className="flex items-center gap-1 text-[12px] text-stone-500">
+      {label}
+      <input
+        type="number"
+        step={0.5}
+        min={PAGE_SIZE_MIN_IN}
+        max={PAGE_SIZE_MAX_IN}
+        value={draft ?? value}
+        data-testid={`page-size-${label.toLowerCase()}`}
+        onChange={(event) => {
+          const raw = event.target.value;
+          setDraft(raw);
+          const parsed = Number.parseFloat(raw);
+          if (Number.isFinite(parsed) && parsed >= PAGE_SIZE_MIN_IN && parsed <= PAGE_SIZE_MAX_IN) {
+            onCommit(parsed);
+          }
+        }}
+        onBlur={(event) => commit(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter') commit((event.target as HTMLInputElement).value);
+        }}
+        className="w-16 rounded border border-stone-200 px-1.5 py-0.5 text-[12px] text-stone-700 focus:outline-none focus:ring-1 focus:ring-stone-300"
+      />
+    </label>
+  );
+}
 
 const Btn = forwardRef<
   HTMLButtonElement,
@@ -240,53 +342,6 @@ export function openEditorLinkMenu(editor: Editor) {
   window.dispatchEvent(new CustomEvent('sundial:open-link-menu'));
 }
 
-// Shared swatch grid for the text-color / highlight pickers (Tier-D popovers and
-// the condensed overflow menu). gridClass/swatchClass let callers size it; pass
-// onRemove to append a "Remove" row.
-function SwatchGrid({
-  colors,
-  onPick,
-  ariaPrefix,
-  gridClass,
-  swatchClass = 'h-6 w-6',
-  onRemove,
-  removeLabel,
-}: {
-  colors: readonly string[];
-  onPick: (color: string) => void;
-  ariaPrefix: string;
-  gridClass: string;
-  swatchClass?: string;
-  onRemove?: () => void;
-  removeLabel?: string;
-}) {
-  return (
-    <>
-      <div className={`grid gap-1 ${gridClass}`}>
-        {colors.map((color) => (
-          <button
-            key={color}
-            type="button"
-            onMouseDown={(event) => { event.preventDefault(); onPick(color); }}
-            className={`${swatchClass} rounded border border-stone-200 transition-transform hover:scale-105`}
-            style={{ backgroundColor: color }}
-            aria-label={`${ariaPrefix} ${color}`}
-          />
-        ))}
-      </div>
-      {onRemove && (
-        <button
-          type="button"
-          onMouseDown={(event) => { event.preventDefault(); onRemove(); }}
-          className="mt-2 w-full rounded px-2 py-1 text-[11px] text-stone-600 hover:bg-stone-100"
-        >
-          {removeLabel}
-        </button>
-      )}
-    </>
-  );
-}
-
 // Shared URL→image inserter for the Tier-D popover, the condensed overflow menu,
 // and the menu bar's Insert→Image — one markup + submit path keeps every image
 // inserter visually consistent.
@@ -368,6 +423,177 @@ function DropdownBtn({
   );
 }
 
+/** The condensed bar's hidden actions, as dropdown items. Rendered inside the
+ *  bar's own overflow popover — and, in the Docs style, inside the document ⋯
+ *  menu (one combined dots menu instead of two on the same pill). Derives
+ *  every command from `editor`, so hosts only supply the tier flags. */
+export function ToolbarOverflowItems({
+  editor,
+  flags,
+  onClose,
+  hidePrint = false,
+}: {
+  editor: Editor;
+  flags: ToolbarTierFlags;
+  onClose: () => void;
+  /** The document ⋯ menu already carries its own Print item — don't list it
+   *  twice in the one combined menu. */
+  hidePrint?: boolean;
+}) {
+  const [imageUrl, setImageUrl] = useState('');
+  const [, forceRender] = useState(0);
+  const spellcheckEnabled = readSpellcheckEnabled(editor);
+  const run = (fn: () => void) => {
+    // The document ⋯ menu (unlike the bar, which goes pointer-events-none)
+    // stays interactive while the page renders against the frozen destroyed
+    // editor during a file switch — v3 throws on any command there.
+    if (!editor.isDestroyed) fn();
+    onClose();
+  };
+  const alignmentActive = (value: 'left' | 'center' | 'right') =>
+    editor.isActive({ textAlign: value });
+  const setAlign = (value: 'left' | 'center' | 'right') =>
+    run(() => editor.chain().focus().setTextAlign(value).run());
+
+  return (
+    <div className="w-64">
+      {!flags.showUndo && (
+        <>
+          <DropdownItem onClick={() => run(() => editor.chain().focus().undo().run())}>
+            <ArrowCounterClockwiseIcon className="h-4 w-4" aria-hidden /> Undo
+          </DropdownItem>
+          <DropdownItem onClick={() => run(() => editor.chain().focus().redo().run())}>
+            <ArrowClockwiseIcon className="h-4 w-4" aria-hidden /> Redo
+          </DropdownItem>
+          {!hidePrint && (
+            <DropdownItem
+              onClick={() => run(() => typeof window !== 'undefined' && window.print())}
+            >
+              <PrinterIcon className="h-4 w-4" aria-hidden /> Print
+            </DropdownItem>
+          )}
+          <DropdownItem
+            active={spellcheckEnabled}
+            onClick={() =>
+              run(() => {
+                writeSpellcheckEnabled(editor, !spellcheckEnabled);
+                forceRender((value) => value + 1);
+              })
+            }
+          >
+            <TextAaIcon className="h-4 w-4" aria-hidden /> Spelling and grammar
+          </DropdownItem>
+          <div className="my-1 border-t border-stone-200" />
+        </>
+      )}
+      {!flags.showMarks && (
+        <>
+          <DropdownItem
+            testId="overflow-bold"
+            active={editor.isActive('bold')}
+            onClick={() => run(() => editor.chain().focus().toggleBold().run())}
+          >
+            <TextBIcon className="h-4 w-4" weight="bold" aria-hidden /> Bold
+          </DropdownItem>
+          <DropdownItem
+            active={editor.isActive('italic')}
+            onClick={() => run(() => editor.chain().focus().toggleItalic().run())}
+          >
+            <TextItalicIcon className="h-4 w-4" aria-hidden /> Italic
+          </DropdownItem>
+          <DropdownItem
+            active={editor.isActive('underline')}
+            onClick={() => run(() => editor.chain().focus().toggleUnderline().run())}
+          >
+            <TextUnderlineIcon className="h-4 w-4" aria-hidden /> Underline
+          </DropdownItem>
+          <DropdownItem
+            active={editor.isActive('highlight')}
+            onClick={() => run(() => editor.chain().focus().toggleHighlight().run())}
+          >
+            <HighlighterIcon className="h-4 w-4" aria-hidden /> Highlight
+          </DropdownItem>
+          <div className="my-1 border-t border-stone-200" />
+        </>
+      )}
+      {!flags.showLink && (
+        <>
+          <DropdownItem onClick={() => run(() => openEditorLinkMenu(editor))}>
+            <LinkIcon className="h-4 w-4" aria-hidden /> Link
+          </DropdownItem>
+          <ImageInsertField
+            value={imageUrl}
+            onChange={setImageUrl}
+            onSubmit={() => {
+              const url = imageUrl.trim();
+              if (!url) return;
+              run(() => editor.chain().focus().setImage({ src: url }).run());
+              setImageUrl('');
+            }}
+          />
+          <div className="my-1 border-t border-stone-200" />
+        </>
+      )}
+      {!flags.showAlign && !editor.isDestroyed && canAlignSelection(editor) && (
+        <>
+          <DropdownItem active={alignmentActive('left')} onClick={() => setAlign('left')}>
+            <TextAlignLeftIcon className="h-4 w-4" aria-hidden /> Align left
+          </DropdownItem>
+          <DropdownItem active={alignmentActive('center')} onClick={() => setAlign('center')}>
+            <TextAlignCenterIcon className="h-4 w-4" aria-hidden /> Align center
+          </DropdownItem>
+          <DropdownItem active={alignmentActive('right')} onClick={() => setAlign('right')}>
+            <TextAlignRightIcon className="h-4 w-4" aria-hidden /> Align right
+          </DropdownItem>
+          <div className="my-1 border-t border-stone-200" />
+        </>
+      )}
+      {!flags.showLists && (
+        <>
+          <DropdownItem
+            active={editor.isActive('bulletList')}
+            onClick={() => run(() => editor.chain().focus().toggleBulletList().run())}
+          >
+            <ListBulletsIcon className="h-4 w-4" aria-hidden /> Bulleted list
+          </DropdownItem>
+          <DropdownItem
+            active={editor.isActive('orderedList')}
+            onClick={() => run(() => editor.chain().focus().toggleOrderedList().run())}
+          >
+            <ListNumbersIcon className="h-4 w-4" aria-hidden /> Numbered list
+          </DropdownItem>
+          <DropdownItem onClick={() => run(() => toggleChecklist(editor))}>
+            <ListChecksIcon className="h-4 w-4" aria-hidden /> Checklist
+          </DropdownItem>
+          <div className="my-1 border-t border-stone-200" />
+        </>
+      )}
+      {!flags.showIndent && (
+        <>
+          <DropdownItem
+            onClick={() => run(() => editor.chain().focus().sinkListItem('listItem').run())}
+          >
+            <TextIndentIcon className="h-4 w-4" aria-hidden /> Increase indent
+          </DropdownItem>
+          <DropdownItem
+            onClick={() => run(() => editor.chain().focus().liftListItem('listItem').run())}
+          >
+            <TextOutdentIcon className="h-4 w-4" aria-hidden /> Decrease indent
+          </DropdownItem>
+          <div className="my-1 border-t border-stone-200" />
+        </>
+      )}
+      {!flags.showClear && (
+        <DropdownItem
+          onClick={() => run(() => editor.chain().focus().unsetAllMarks().clearNodes().run())}
+        >
+          <EraserIcon className="h-4 w-4" aria-hidden /> Clear formatting
+        </DropdownItem>
+      )}
+    </div>
+  );
+}
+
 export function MarkdownToolbar({
   editor,
   readOnly = false,
@@ -380,27 +606,26 @@ export function MarkdownToolbar({
   onPageChromeChange,
   menusHidden = false,
   onToggleMenus,
+  authorshipLens = false,
+  onToggleAuthorshipLens,
+  hideOverflowMenu = false,
+  hidePrint = false,
 }: MarkdownToolbarProps) {
-  const responsiveWidth =
-    containerWidth === 0 || !Number.isFinite(containerWidth)
-      ? containerWidth
-      : Math.max(0, containerWidth - (onToggleMenus ? 36 : 0) - 36);
-  // width 0 = unmeasured (initial/SSR): show the full bar rather than collapse.
-  const fits = (min: number) => responsiveWidth === 0 || responsiveWidth >= min;
-  const showUndo = fits(SHOW_UNDO);
-  const showZoom = fits(SHOW_ZOOM);
-  const showParagraph = fits(SHOW_PARAGRAPH);
-  const showFont = fits(SHOW_FONT);
-  const showFontSize = fits(SHOW_FONT_SIZE);
-  const showMarks = fits(SHOW_MARKS);
-  const showLink = fits(SHOW_LINK);
-  const showAlign = fits(SHOW_ALIGN);
-  const showLists = fits(SHOW_LISTS);
-  const showIndent = fits(SHOW_INDENT);
-  const showClear = fits(SHOW_CLEAR);
-  const showAlignButtons = fits(SHOW_ALIGN_BUTTONS);
+  const flags = toolbarTierFlags(containerWidth, onToggleMenus ? 36 : 0);
+  const {
+    showUndo,
+    showZoom,
+    showParagraph,
+    showMarks,
+    showLink,
+    showAlign,
+    showLists,
+    showIndent,
+    showClear,
+    showAlignButtons,
+  } = flags;
   // Thresholds ascend, so the last group fitting means every group fits.
-  const showOverflow = !showClear;
+  const showOverflow = !showClear && !hideOverflowMenu;
   // During a file switch the page keeps this bar rendered against the previous,
   // now-destroyed editor (frozen on its last state) so it doesn't blank. Reads
   // are safe, but commands aren't — make the frozen bar inert so a formatting
@@ -425,35 +650,27 @@ export function MarkdownToolbar({
   }, [editor, bumpRender]);
 
   const [paragraphOpen, setParagraphOpen] = useState(false);
-  const [fontOpen, setFontOpen] = useState(false);
   const [alignOpen, setAlignOpen] = useState(false);
   const [lineSpacingOpen, setLineSpacingOpen] = useState(false);
   const [zoomOpen, setZoomOpen] = useState(false);
   const [pageOpen, setPageOpen] = useState(false);
-  const [colorOpen, setColorOpen] = useState(false);
-  const [highlightOpen, setHighlightOpen] = useState(false);
   const [linkOpen, setLinkOpen] = useState(false);
   const [imageOpen, setImageOpen] = useState(false);
   const [overflowOpen, setOverflowOpen] = useState(false);
-  const [spellcheckEnabled, setSpellcheckEnabled] = useState(() => {
-    // v3 throws on `editor.view` once the editor is destroyed; the toolbar is
-    // rendered against the last (frozen) editor during file switches, so guard.
-    const dom = editor.isDestroyed ? undefined : (editor.view.dom as HTMLElement | undefined);
-    return dom?.getAttribute('spellcheck') !== 'false';
-  });
+  // Read at render, not mirrored in state: the ⋯ menu's copy of this toggle
+  // (ToolbarOverflowItems) writes the same DOM attribute, and a state mirror
+  // here would go stale the moment it does.
+  const spellcheckEnabled = readSpellcheckEnabled(editor);
 
   const [linkUrl, setLinkUrl] = useState('');
   const [linkText, setLinkText] = useState('');
   const [imageUrl, setImageUrl] = useState('');
 
   const paragraphRef = useRef<HTMLButtonElement | null>(null);
-  const fontRef = useRef<HTMLButtonElement | null>(null);
   const alignRef = useRef<HTMLButtonElement | null>(null);
   const lineSpacingRef = useRef<HTMLButtonElement | null>(null);
   const zoomRef = useRef<HTMLButtonElement | null>(null);
   const pageRef = useRef<HTMLButtonElement | null>(null);
-  const colorRef = useRef<HTMLButtonElement | null>(null);
-  const highlightRef = useRef<HTMLButtonElement | null>(null);
   const linkRef = useRef<HTMLButtonElement | null>(null);
   const imageRef = useRef<HTMLButtonElement | null>(null);
   const overflowRef = useRef<HTMLButtonElement | null>(null);
@@ -464,29 +681,19 @@ export function MarkdownToolbar({
   const lineHeight = lineHeightProp ?? localLineHeight;
   const [localPageChrome, setLocalPageChrome] = useState<MarkdownPageChrome>(DEFAULT_PAGE_CHROME);
   const effectivePageChrome = pageChrome ?? localPageChrome;
+  // Page-size inputs only exist on the Google Docs fixed-inch sheet.
+  const docsStylePage = useDocStyle() === 'docs';
 
   const headingLevel = ([1, 2, 3] as const).find((level) =>
     editor.isActive('heading', { level }),
   ) as HeadingLevel | undefined;
 
-  const activeFontFamily =
-    (editor.getAttributes('textStyle').fontFamily as string | undefined) ?? 'Arial';
-  const activeFontSize = (() => {
-    const raw = editor.getAttributes('textStyle').fontSize as string | undefined;
-    if (!raw) return 11;
-    const n = parseInt(raw.replace('px', ''), 10);
-    return Number.isFinite(n) ? n : 11;
-  })();
-
   const closeAll = useCallback(() => {
     setParagraphOpen(false);
-    setFontOpen(false);
     setAlignOpen(false);
     setLineSpacingOpen(false);
     setZoomOpen(false);
     setPageOpen(false);
-    setColorOpen(false);
-    setHighlightOpen(false);
     setLinkOpen(false);
     setImageOpen(false);
     setOverflowOpen(false);
@@ -502,13 +709,9 @@ export function MarkdownToolbar({
     [editor],
   );
   const toggleSpellcheck = useCallback(() => {
-    setSpellcheckEnabled((prev) => {
-      const next = !prev;
-      const dom = editor.isDestroyed ? undefined : (editor.view.dom as HTMLElement | undefined);
-      dom?.setAttribute('spellcheck', next ? 'true' : 'false');
-      return next;
-    });
-  }, [editor]);
+    writeSpellcheckEnabled(editor, !readSpellcheckEnabled(editor));
+    bumpRender();
+  }, [editor, bumpRender]);
 
   const setParagraph = useCallback(() => {
     editor.chain().focus().setParagraph().run();
@@ -522,50 +725,13 @@ export function MarkdownToolbar({
     [editor],
   );
 
-  const pickFont = useCallback(
-    (family: string) => {
-      editor.chain().focus().setFontFamily(family).run();
-      setFontOpen(false);
-    },
-    [editor],
-  );
-
-  const stepFontSize = useCallback(
-    (delta: number) => {
-      const next = Math.max(6, Math.min(96, activeFontSize + delta));
-      editor.chain().focus().setFontSize(`${next}px`).run();
-    },
-    [editor, activeFontSize],
-  );
-
   const bold = useCallback(() => editor.chain().focus().toggleBold().run(), [editor]);
   const italic = useCallback(() => editor.chain().focus().toggleItalic().run(), [editor]);
   const underline = useCallback(() => editor.chain().focus().toggleUnderline().run(), [editor]);
-  const setColor = useCallback(
-    (color: string) => {
-      editor.chain().focus().setColor(color).run();
-      setColorOpen(false);
-    },
-    [editor],
-  );
-  const unsetColor = useCallback(() => {
-    editor.chain().focus().unsetColor().run();
-    setColorOpen(false);
-  }, [editor]);
-  const toggleHighlight = useCallback(
-    (color: string) => {
-      editor.chain().focus().toggleHighlight({ color }).run();
-      setHighlightOpen(false);
-    },
-    [editor],
-  );
-  const removeHighlight = useCallback(() => {
-    editor.chain().focus().unsetHighlight().run();
-    setHighlightOpen(false);
-  }, [editor]);
+  const highlight = useCallback(() => editor.chain().focus().toggleHighlight().run(), [editor]);
 
   const setAlign = useCallback(
-    (value: 'left' | 'center' | 'right' | 'justify') => {
+    (value: 'left' | 'center' | 'right') => {
       editor.chain().focus().setTextAlign(value).run();
       setAlignOpen(false);
     },
@@ -599,20 +765,7 @@ export function MarkdownToolbar({
 
   const bulletList = useCallback(() => editor.chain().focus().toggleBulletList().run(), [editor]);
   const orderedList = useCallback(() => editor.chain().focus().toggleOrderedList().run(), [editor]);
-  const checklist = useCallback(() => {
-    if (!editor.isActive('bulletList')) {
-      editor.chain().focus().toggleBulletList().run();
-    }
-    const { $from } = editor.state.selection;
-    const paragraph = $from.parent;
-    if (
-      paragraph.type.name === 'paragraph' &&
-      !paragraph.textContent.startsWith('[ ]') &&
-      !paragraph.textContent.startsWith('[x]')
-    ) {
-      editor.chain().focus().insertContentAt($from.start(), '[ ] ').run();
-    }
-  }, [editor]);
+  const checklist = useCallback(() => toggleChecklist(editor), [editor]);
   const indent = useCallback(() => editor.chain().focus().sinkListItem('listItem').run(), [editor]);
   const outdent = useCallback(
     () => editor.chain().focus().liftListItem('listItem').run(),
@@ -676,12 +829,16 @@ export function MarkdownToolbar({
   const canSinkListItem = !frozen && editor.can().sinkListItem('listItem');
   const canLiftListItem = !frozen && editor.can().liftListItem('listItem');
 
-  const alignmentActive = (value: 'left' | 'center' | 'right' | 'justify') =>
+  // Alignment is image-only at the schema level (see markdownFormattingExtensions).
+  const canAlign = !readOnly && !frozen && canAlignSelection(editor);
+  const alignmentActive = (value: 'left' | 'center' | 'right') =>
     editor.isActive({ textAlign: value });
 
   return (
     <div
-      className={`flex w-full min-w-0 flex-nowrap items-center gap-0.5 px-2 py-1.5${frozen ? ' pointer-events-none' : ''}`}
+      // py-1: the h-7 buttons keep their own hit area; the bar's own padding
+      // was eating vertical space the document wants (founder, 2026-08-14).
+      className={`flex w-full min-w-0 flex-nowrap items-center gap-0.5 px-2 py-1${frozen ? ' pointer-events-none' : ''}`}
       role="toolbar"
       aria-label="Document formatting toolbar"
       aria-disabled={frozen || undefined}
@@ -697,9 +854,20 @@ export function MarkdownToolbar({
           <Btn disabled={readOnly || !canRedo} label="Redo" onClick={redo}>
             <ArrowClockwiseIcon className="h-4 w-4" weight="regular" aria-hidden />
           </Btn>
-          <Btn label="Print" onClick={print}>
-            <PrinterIcon className="h-4 w-4" weight="regular" aria-hidden />
-          </Btn>
+          {!hidePrint ? (
+            <Btn label="Print" onClick={print}>
+              <PrinterIcon className="h-4 w-4" weight="regular" aria-hidden />
+            </Btn>
+          ) : null}
+          {/* Authorship lens: the whole document banded by who wrote each
+              line, author · when in the margin. Signature, NOT Highlighter —
+              the text-highlight control further right uses that glyph, and
+              two identical icons read as duplicates (Belinda). */}
+          {onToggleAuthorshipLens ? (
+            <Btn active={authorshipLens} label="Show authorship" onClick={onToggleAuthorshipLens}>
+              <SignatureIcon className="h-4 w-4" weight="regular" aria-hidden />
+            </Btn>
+          ) : null}
           <Btn
             active={spellcheckEnabled}
             label="Spelling and grammar check"
@@ -784,6 +952,34 @@ export function MarkdownToolbar({
                 >
                   Footer
                 </DropdownItem>
+                {docsStylePage ? (
+                  // Google Docs style only: the page is a fixed-inch sheet
+                  // there, so its dimensions are editable like Docs' own
+                  // File → Page setup. The IDE page flows with the column —
+                  // size inputs would be dead knobs.
+                  <>
+                    <div className="my-1 h-px bg-stone-100" />
+                    <div className="px-2 pb-1 pt-1.5 text-[11px] font-medium text-stone-400">
+                      Page size (inches)
+                    </div>
+                    <div className="flex items-center gap-1.5 px-2 pb-1.5">
+                      <PageSizeInput
+                        label="W"
+                        value={effectivePageChrome.pageWidthIn ?? PAGE_SIZE_DEFAULT_IN.width}
+                        onCommit={(next) =>
+                          applyPageChrome({ ...effectivePageChrome, pageWidthIn: next })
+                        }
+                      />
+                      <PageSizeInput
+                        label="H"
+                        value={effectivePageChrome.pageHeightIn ?? PAGE_SIZE_DEFAULT_IN.height}
+                        onCommit={(next) =>
+                          applyPageChrome({ ...effectivePageChrome, pageHeightIn: next })
+                        }
+                      />
+                    </div>
+                  </>
+                ) : null}
               </div>
             </Popover>
           </div>
@@ -846,59 +1042,6 @@ export function MarkdownToolbar({
             </Popover>
           </div>
           </div>
-
-          <div className={`items-center gap-0.5 ${showFont ? 'flex' : 'hidden'}`}>
-          <Sep />
-
-          <div className="relative">
-            <DropdownBtn
-              disabled={readOnly}
-              label="Font"
-              anchorRef={fontRef}
-              open={fontOpen}
-              onToggle={() => {
-                const wasOpen = fontOpen;
-                closeAll();
-                setFontOpen(!wasOpen);
-              }}
-              minWidth="7rem"
-            >
-              <span className="truncate" style={{ fontFamily: activeFontFamily }}>
-                {activeFontFamily}
-              </span>
-              <CaretDownIcon className="h-3 w-3 shrink-0" weight="regular" aria-hidden />
-            </DropdownBtn>
-            <Popover open={fontOpen} onClose={() => setFontOpen(false)} anchorRef={fontRef}>
-              {FONT_FAMILIES.map((family) => (
-                <DropdownItem
-                  key={family}
-                  active={family === activeFontFamily}
-                  onClick={() => pickFont(family)}
-                >
-                  <span style={{ fontFamily: family }}>{family}</span>
-                </DropdownItem>
-              ))}
-            </Popover>
-          </div>
-          </div>
-
-          <div className={`items-center gap-0.5 ${showFontSize ? 'flex' : 'hidden'}`}>
-          <Sep />
-
-          <Btn disabled={readOnly} label="Smaller" onClick={() => stepFontSize(-1)}>
-            <MinusIcon className="h-3.5 w-3.5" weight="bold" aria-hidden />
-          </Btn>
-          <div
-            className="inline-flex h-7 w-9 items-center justify-center rounded border border-stone-300 bg-white text-[12px] tabular-nums text-stone-800"
-            aria-label="Font size"
-            data-toolbar-font-size
-          >
-            {activeFontSize}
-          </div>
-          <Btn disabled={readOnly} label="Larger" onClick={() => stepFontSize(1)}>
-            <PlusIcon className="h-3.5 w-3.5" weight="bold" aria-hidden />
-          </Btn>
-          </div>
         </div>
 
         {/* Tier D — text marks, then link / image */}
@@ -931,76 +1074,14 @@ export function MarkdownToolbar({
             <TextUnderlineIcon className="h-4 w-4" weight="regular" aria-hidden />
           </Btn>
 
-          <div className="relative">
-            <Btn
-              ref={colorRef}
-              active={colorOpen}
-              open={colorOpen}
-              disabled={readOnly}
-              label="Text color"
-              onClick={() => {
-                const wasOpen = colorOpen;
-                closeAll();
-                setColorOpen(!wasOpen);
-              }}
-            >
-              <span className="relative flex flex-col items-center">
-                <TextAaIcon className="h-4 w-4" weight="regular" aria-hidden />
-                <span
-                  className="mt-0.5 h-[3px] w-3.5 rounded-sm"
-                  style={{
-                    backgroundColor:
-                      (editor.getAttributes('textStyle').color as string | undefined) ?? '#1c1917',
-                  }}
-                />
-              </span>
-            </Btn>
-            <Popover open={colorOpen} onClose={() => setColorOpen(false)} anchorRef={colorRef}>
-              <div className="p-1">
-                <SwatchGrid
-                  colors={TEXT_COLORS}
-                  onPick={setColor}
-                  ariaPrefix="Set text color"
-                  gridClass="grid-cols-5"
-                  onRemove={unsetColor}
-                  removeLabel="Remove color"
-                />
-              </div>
-            </Popover>
-          </div>
-
-          <div className="relative">
-            <Btn
-              ref={highlightRef}
-              active={highlightOpen || editor.isActive('highlight')}
-              open={highlightOpen}
-              disabled={readOnly}
-              label="Highlight"
-              onClick={() => {
-                const wasOpen = highlightOpen;
-                closeAll();
-                setHighlightOpen(!wasOpen);
-              }}
-            >
-              <HighlighterIcon className="h-4 w-4" weight="regular" aria-hidden />
-            </Btn>
-            <Popover
-              open={highlightOpen}
-              onClose={() => setHighlightOpen(false)}
-              anchorRef={highlightRef}
-            >
-              <div className="p-1">
-                <SwatchGrid
-                  colors={HIGHLIGHT_COLORS}
-                  onPick={toggleHighlight}
-                  ariaPrefix="Apply highlight"
-                  gridClass="grid-cols-4"
-                  onRemove={removeHighlight}
-                  removeLabel="Remove highlight"
-                />
-              </div>
-            </Popover>
-          </div>
+          <Btn
+            active={editor.isActive('highlight')}
+            disabled={readOnly}
+            label="Highlight"
+            onClick={highlight}
+          >
+            <HighlighterIcon className="h-4 w-4" weight="regular" aria-hidden />
+          </Btn>
           </div>
 
           <div className={`items-center gap-0.5 ${showLink ? 'flex' : 'hidden'}`}>
@@ -1101,7 +1182,7 @@ export function MarkdownToolbar({
           {/* Alignment: dropdown when collapsed, 4 inline buttons when wide */}
           <div className={`relative ${showAlignButtons ? 'hidden' : ''}`}>
             <DropdownBtn
-              disabled={readOnly}
+              disabled={!canAlign}
               label="Align"
               anchorRef={alignRef}
               open={alignOpen}
@@ -1116,8 +1197,6 @@ export function MarkdownToolbar({
                 <TextAlignCenterIcon className="h-4 w-4" weight="regular" aria-hidden />
               ) : alignmentActive('right') ? (
                 <TextAlignRightIcon className="h-4 w-4" weight="regular" aria-hidden />
-              ) : alignmentActive('justify') ? (
-                <TextAlignJustifyIcon className="h-4 w-4" weight="regular" aria-hidden />
               ) : (
                 <TextAlignLeftIcon className="h-4 w-4" weight="regular" aria-hidden />
               )}
@@ -1133,15 +1212,12 @@ export function MarkdownToolbar({
               <DropdownItem active={alignmentActive('right')} onClick={() => setAlign('right')}>
                 <TextAlignRightIcon className="h-4 w-4" weight="regular" aria-hidden /> Right
               </DropdownItem>
-              <DropdownItem active={alignmentActive('justify')} onClick={() => setAlign('justify')}>
-                <TextAlignJustifyIcon className="h-4 w-4" weight="regular" aria-hidden /> Justify
-              </DropdownItem>
             </Popover>
           </div>
           <div className={`items-center gap-0.5 ${showAlignButtons ? 'flex' : 'hidden'}`}>
             <Btn
               active={alignmentActive('left')}
-              disabled={readOnly}
+              disabled={!canAlign}
               label="Align left"
               onClick={() => setAlign('left')}
             >
@@ -1149,7 +1225,7 @@ export function MarkdownToolbar({
             </Btn>
             <Btn
               active={alignmentActive('center')}
-              disabled={readOnly}
+              disabled={!canAlign}
               label="Align center"
               onClick={() => setAlign('center')}
             >
@@ -1157,19 +1233,11 @@ export function MarkdownToolbar({
             </Btn>
             <Btn
               active={alignmentActive('right')}
-              disabled={readOnly}
+              disabled={!canAlign}
               label="Align right"
               onClick={() => setAlign('right')}
             >
               <TextAlignRightIcon className="h-4 w-4" weight="regular" aria-hidden />
-            </Btn>
-            <Btn
-              active={alignmentActive('justify')}
-              disabled={readOnly}
-              label="Justify"
-              onClick={() => setAlign('justify')}
-            >
-              <TextAlignJustifyIcon className="h-4 w-4" weight="regular" aria-hidden />
             </Btn>
           </div>
 
@@ -1275,7 +1343,7 @@ export function MarkdownToolbar({
               setOverflowOpen(!wasOpen);
             }}
           >
-            <DotsThreeVerticalIcon className="h-4 w-4" weight="bold" aria-hidden />
+            <DotsThreeIcon className="h-4 w-4" weight="bold" aria-hidden />
           </Btn>
           <Popover
             open={overflowOpen}
@@ -1283,150 +1351,12 @@ export function MarkdownToolbar({
             anchorRef={overflowRef}
             align="right"
           >
-            <div className="w-64">
-              {!showUndo && (
-                <>
-                  <DropdownItem onClick={() => { undo(); setOverflowOpen(false); }}>
-                    <ArrowCounterClockwiseIcon className="h-4 w-4" aria-hidden /> Undo
-                  </DropdownItem>
-                  <DropdownItem onClick={() => { redo(); setOverflowOpen(false); }}>
-                    <ArrowClockwiseIcon className="h-4 w-4" aria-hidden /> Redo
-                  </DropdownItem>
-                  <DropdownItem onClick={() => { print(); setOverflowOpen(false); }}>
-                    <PrinterIcon className="h-4 w-4" aria-hidden /> Print
-                  </DropdownItem>
-                  <DropdownItem
-                    active={spellcheckEnabled}
-                    onClick={() => { toggleSpellcheck(); setOverflowOpen(false); }}
-                  >
-                    <TextAaIcon className="h-4 w-4" aria-hidden /> Spelling and grammar
-                  </DropdownItem>
-                  <div className="my-1 border-t border-stone-200" />
-                </>
-              )}
-              {!showMarks && (
-                <>
-                  <DropdownItem
-                    testId="overflow-bold"
-                    active={editor.isActive('bold')}
-                    onClick={() => { bold(); setOverflowOpen(false); }}
-                  >
-                    <TextBIcon className="h-4 w-4" weight="bold" aria-hidden /> Bold
-                  </DropdownItem>
-                  <DropdownItem
-                    active={editor.isActive('italic')}
-                    onClick={() => { italic(); setOverflowOpen(false); }}
-                  >
-                    <TextItalicIcon className="h-4 w-4" aria-hidden /> Italic
-                  </DropdownItem>
-                  <DropdownItem
-                    active={editor.isActive('underline')}
-                    onClick={() => { underline(); setOverflowOpen(false); }}
-                  >
-                    <TextUnderlineIcon className="h-4 w-4" aria-hidden /> Underline
-                  </DropdownItem>
-                  {/* Text color / Highlight have no overflow-safe sub-popover (their
-                      bar popovers are display:none when condensed), so render the
-                      swatches inline to keep parity with the full bar. */}
-                  {[
-                    { label: 'Text color', aria: 'Set text color', colors: TEXT_COLORS, apply: setColor },
-                    { label: 'Highlight', aria: 'Apply highlight', colors: HIGHLIGHT_COLORS, apply: toggleHighlight },
-                  ].map(({ label, aria, colors, apply }) => (
-                    <div key={label} className="px-2 pb-1 pt-1.5">
-                      <div className="pb-1 text-[10px] font-medium uppercase tracking-wide text-stone-400">
-                        {label}
-                      </div>
-                      <SwatchGrid
-                        colors={colors}
-                        onPick={(color) => { apply(color); setOverflowOpen(false); }}
-                        ariaPrefix={aria}
-                        gridClass="grid-cols-5"
-                        swatchClass="h-5 w-5"
-                      />
-                    </div>
-                  ))}
-                  <div className="my-1 border-t border-stone-200" />
-                </>
-              )}
-              {!showLink && (
-                <>
-                  <DropdownItem onClick={() => { openEditorLinkMenu(editor); setOverflowOpen(false); }}>
-                    <LinkIcon className="h-4 w-4" aria-hidden /> Link
-                  </DropdownItem>
-                  <ImageInsertField
-                    value={imageUrl}
-                    onChange={setImageUrl}
-                    onSubmit={() => { submitImage(); setOverflowOpen(false); }}
-                  />
-                  <div className="my-1 border-t border-stone-200" />
-                </>
-              )}
-              {!showAlign && (
-                <>
-                  <DropdownItem
-                    active={alignmentActive('left')}
-                    onClick={() => { setAlign('left'); setOverflowOpen(false); }}
-                  >
-                    <TextAlignLeftIcon className="h-4 w-4" aria-hidden /> Align left
-                  </DropdownItem>
-                  <DropdownItem
-                    active={alignmentActive('center')}
-                    onClick={() => { setAlign('center'); setOverflowOpen(false); }}
-                  >
-                    <TextAlignCenterIcon className="h-4 w-4" aria-hidden /> Align center
-                  </DropdownItem>
-                  <DropdownItem
-                    active={alignmentActive('right')}
-                    onClick={() => { setAlign('right'); setOverflowOpen(false); }}
-                  >
-                    <TextAlignRightIcon className="h-4 w-4" aria-hidden /> Align right
-                  </DropdownItem>
-                  <DropdownItem
-                    active={alignmentActive('justify')}
-                    onClick={() => { setAlign('justify'); setOverflowOpen(false); }}
-                  >
-                    <TextAlignJustifyIcon className="h-4 w-4" aria-hidden /> Justify
-                  </DropdownItem>
-                  <div className="my-1 border-t border-stone-200" />
-                </>
-              )}
-              {!showLists && (
-                <>
-                  <DropdownItem
-                    active={editor.isActive('bulletList')}
-                    onClick={() => { bulletList(); setOverflowOpen(false); }}
-                  >
-                    <ListBulletsIcon className="h-4 w-4" aria-hidden /> Bulleted list
-                  </DropdownItem>
-                  <DropdownItem
-                    active={editor.isActive('orderedList')}
-                    onClick={() => { orderedList(); setOverflowOpen(false); }}
-                  >
-                    <ListNumbersIcon className="h-4 w-4" aria-hidden /> Numbered list
-                  </DropdownItem>
-                  <DropdownItem onClick={() => { checklist(); setOverflowOpen(false); }}>
-                    <ListChecksIcon className="h-4 w-4" aria-hidden /> Checklist
-                  </DropdownItem>
-                  <div className="my-1 border-t border-stone-200" />
-                </>
-              )}
-              {!showIndent && (
-                <>
-                  <DropdownItem onClick={() => { indent(); setOverflowOpen(false); }}>
-                    <TextIndentIcon className="h-4 w-4" aria-hidden /> Increase indent
-                  </DropdownItem>
-                  <DropdownItem onClick={() => { outdent(); setOverflowOpen(false); }}>
-                    <TextOutdentIcon className="h-4 w-4" aria-hidden /> Decrease indent
-                  </DropdownItem>
-                  <div className="my-1 border-t border-stone-200" />
-                </>
-              )}
-              {!showClear && (
-                <DropdownItem onClick={() => { clearFormatting(); setOverflowOpen(false); }}>
-                  <EraserIcon className="h-4 w-4" aria-hidden /> Clear formatting
-                </DropdownItem>
-              )}
-            </div>
+            <ToolbarOverflowItems
+              editor={editor}
+              flags={flags}
+              hidePrint={hidePrint}
+              onClose={() => setOverflowOpen(false)}
+            />
           </Popover>
         </div>
       )}

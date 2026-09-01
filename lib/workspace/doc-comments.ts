@@ -28,6 +28,9 @@ export type DocCommentThread = {
    */
   clientKey?: string;
   projectId: string;
+  /** The thread's dedicated agent chat, once someone @sunny'd it. Optional: not
+   *  every producer of this shape (e.g. the local server) fills it in. */
+  chatId?: string | null;
   fileId: string;
   filePath: string;
   quote: string;
@@ -53,13 +56,159 @@ export type ResolvedDocCommentRange = {
   from: number;
   to: number;
   status: DocCommentStatus;
+  /** The emoji when this range is a reaction rather than a comment thread
+   *  (see `threadReactionEmoji`), else null. */
+  reaction?: string | null;
 };
+
+/* ── Emoji reactions ──────────────────────────────────────────────────
+ *  A reaction IS a comment thread whose single message body is exactly one
+ *  emoji — no schema change, no second table. Anchoring, realtime, permissions,
+ *  deletion, the local sidecar mirror and version history all keep working
+ *  unchanged; only the rendering differs (a compact chip instead of a card).
+ *  Replying to a reaction gives it a second message, at which point it stops
+ *  classifying as one and renders as an ordinary thread.
+ * ─────────────────────────────────────────────────────────────────── */
+
+/** The palette offered on the selection bubble. */
+export const REACTION_EMOJIS = ['👍', '❤️', '🎉', '😂', '😮', '🙏'] as const;
+
+// One emoji and nothing else: a flag (two regional indicators), or a pictograph
+// with its optional modifiers/variation selectors and ZWJ continuations.
+const EMOJI_TAIL = '(?:\\p{Emoji_Modifier}|\\uFE0F|\\u20E3)*';
+const SINGLE_EMOJI_RE = new RegExp(
+  `^(?:\\p{RI}\\p{RI}|\\p{Extended_Pictographic}${EMOJI_TAIL}(?:\\u200D\\p{Extended_Pictographic}${EMOJI_TAIL})*)$`,
+  'u',
+);
+
+/** True when `body` is exactly one emoji (skin tones, ZWJ sequences and flags
+ *  included) — the whole reaction/comment classification. */
+export function isSingleEmoji(body: string): boolean {
+  const trimmed = body.trim();
+  return trimmed.length > 0 && SINGLE_EMOJI_RE.test(trimmed);
+}
+
+/** The reaction emoji for a thread, or null when it's an ordinary comment. */
+export function threadReactionEmoji(thread: Pick<DocCommentThread, 'messages'>): string | null {
+  if (thread.messages.length !== 1) return null;
+  const body = thread.messages[0].body.trim();
+  return isSingleEmoji(body) ? body : null;
+}
+
+/**
+ * The caller's own reaction with `emoji` covering exactly `[from, to)`, or null.
+ * Picking the same emoji again on the same words removes it, so reacting is a
+ * toggle. Matched on RESOLVED positions, not on the stored anchor payloads —
+ * two captures of the same selection need not produce byte-identical Yjs
+ * relative positions, but they always resolve to the same range. Pure so it can
+ * be unit-tested without a live editor.
+ */
+export function findOwnReaction(
+  threads: readonly DocCommentThread[],
+  ranges: readonly ResolvedDocCommentRange[],
+  params: { emoji: string; from: number; to: number; userId: string | null },
+): DocCommentThread | null {
+  if (!params.userId) return null;
+  const rangeById = new Map(ranges.map((range) => [range.id, range]));
+  for (const thread of threads) {
+    if (thread.author.userId !== params.userId) continue;
+    if (threadReactionEmoji(thread) !== params.emoji) continue;
+    const range = rangeById.get(thread.id);
+    if (range && range.from === params.from && range.to === params.to) return thread;
+  }
+  return null;
+}
 
 /** Optimistic (not-yet-persisted) thread/message ids are prefixed so the UI can
  *  tell them apart from server ids — server actions can't be issued against them. */
 export const OPTIMISTIC_ID_PREFIX = 'optimistic-';
 export function isOptimisticCommentId(id: string) {
   return id.startsWith(OPTIMISTIC_ID_PREFIX);
+}
+
+/** Any agent handle as a whole word — people tag @agent/@claude/@codex as
+ *  readily as @sunny — never inside an email or a longer word. Client-safe
+ *  twin of the server's summon check (`hasSunnyMention`), so the UI can tell
+ *  a thread was already handed to an agent before the chat link lands. */
+const AGENT_MENTION_RE = /(^|\W)@(sunny|agent|claude|codex)\b/i;
+export function hasAgentMention(body: string): boolean {
+  return AGENT_MENTION_RE.test(body ?? '');
+}
+
+/** Agent-written comments (Sunny's own add_comment/reply_comment). Mirrors the
+ *  server's own-filter: local rows carry `agent:`/`ai:` ids, cloud rows carry the
+ *  sunny UUID with username 'sunny'. */
+export function isAgentCommentAuthor(author: Pick<DocCommentAuthor, 'userId' | 'username'>): boolean {
+  return /^(agent|ai|sunny):/.test(author.userId) || author.username === 'sunny';
+}
+
+/** The pending `@…` mention under the caret (word-start only), for the comment
+ *  composer's agent autocomplete. `start` indexes the `@`. The accepted
+ *  characters must cover everything commentMentionHandle can EMIT (usernames
+ *  and id fallbacks carry digits, dots and hyphens) — a narrower set closed the
+ *  menu the moment someone typed their own displayed handle. */
+export function findCommentMentionQuery(
+  text: string,
+  caret: number,
+): { start: number; query: string } | null {
+  const match = /(?:^|\s)@([\w.-]*)$/i.exec(text.slice(0, caret));
+  if (!match) return null;
+  return { start: caret - match[1].length - 1, query: match[1] };
+}
+
+/** One row of the comment composer's `@` menu. The agent row is the whole
+ *  discovery surface for "tag the agent and it answers", so it is pinned first
+ *  and never filtered out by a prefix the collaborators match too. */
+export type CommentMentionOption = {
+  handle: string;
+  label: string;
+  imageUrl?: string | null;
+  isAgent?: boolean;
+};
+
+/** The one advertised agent handle. The aliases (@sunny/@claude/@codex) stay
+ *  accepted when typed in full; they're just not listed — a menu of names
+ *  nobody recognizes reads as a quiz. */
+export const AGENT_MENTION_OPTION: CommentMentionOption = {
+  handle: '@Agent',
+  label: 'replies here',
+  isAgent: true,
+};
+
+/** A collaborator's `@` handle: their username when they have one, else a
+ *  slug of their display name. Never empty (falls back to the id). */
+export function commentMentionHandle(person: {
+  id: string;
+  name?: string | null;
+  username?: string | null;
+}): string {
+  const slug =
+    person.username?.trim() ||
+    person.name?.trim().split(/\s+/)[0]?.replace(/[^\w.-]/g, '') ||
+    person.id.slice(0, 8);
+  return `@${slug}`;
+}
+
+/** Menu rows for a pending `@<query>`: the agent ALWAYS first, then matching
+ *  human collaborators (deduped by handle, self excluded by the caller). */
+export function buildCommentMentionOptions(
+  people: readonly CommentMentionOption[],
+  query: string,
+): CommentMentionOption[] {
+  const prefix = query.toLowerCase();
+  const matches = (option: CommentMentionOption) =>
+    option.handle.slice(1).toLowerCase().startsWith(prefix);
+  const seen = new Set([AGENT_MENTION_OPTION.handle.toLowerCase()]);
+  const humans: CommentMentionOption[] = [];
+  for (const person of people) {
+    const key = person.handle.toLowerCase();
+    if (person.isAgent || seen.has(key) || !matches(person)) continue;
+    seen.add(key);
+    humans.push(person);
+  }
+  // `agent` also matches nothing else, so a query that excludes it leaves the
+  // humans alone; a query it matches keeps it on top regardless of theirs.
+  return matches(AGENT_MENTION_OPTION) ? [AGENT_MENTION_OPTION, ...humans] : humans;
 }
 
 const MAX_QUOTE_LENGTH = 180;
@@ -135,8 +284,9 @@ export function commentScrollTarget(params: {
 /**
  * Lay out the comment-lane cards Google-Docs style. Cards want to sit at their
  * anchor's vertical offset (`desiredTop`) but can't overlap, so they need
- * collision resolution. When a comment is focused (`focusKey`) it is pinned
- * exactly at its anchor and the others flow *away* from it — cards above are
+ * collision resolution. When a comment is focused (`focusKey`) it is pinned at
+ * its anchor (yielding downward only when the cards above wouldn't otherwise
+ * fit above it — cards never overlap) and the others flow *away* from it — cards above are
  * pushed up, cards below are pushed down — so the selected thread lands next to
  * its highlighted text instead of wherever a top-down cascade happened to drop
  * it (the "selected comment is 700px below its line" bug). With no focus it
@@ -163,15 +313,22 @@ export function layoutCommentLane(params: {
   }
 
   const focus = items[focusIndex];
-  const focusTop = Math.max(0, Math.round(focus.desiredTop));
+  // Cards must NEVER overlap. When the cards above can't fit between the lane
+  // origin and the focus's own anchor, the FOCUS yields downward — the lane
+  // grows — instead of the above-cluster piling onto 0 and rendering underneath
+  // it (the "new comment composer half-covered by a thread card" bug: a tall
+  // composer anchored near the top of the doc left no room for the thread above
+  // it). Pinning to the anchor is a preference; not overlapping is a rule.
+  let minFocusTop = 0;
+  for (let i = 0; i < focusIndex; i++) minFocusTop += items[i].height + gap;
+  const focusTop = Math.max(minFocusTop, Math.round(focus.desiredTop));
   tops[focus.key] = focusTop;
   // Above the focus: cascade the earlier cards top-down from the lane origin so
   // well-separated comments keep their own anchors and never overlap when there's
   // room. If the stack runs into the focus, slide the whole group up just enough
-  // to clear it, clamping at 0 — which only forces overlap when the cluster
-  // genuinely can't fit above the focus (where the wrapper's overflow-hidden would
-  // otherwise clip cards pushed above the origin). Cascading top-down (rather than
-  // up from the focus) is what keeps spaced-out earlier comments off the lane top.
+  // to clear it — it always fits now, since `focusTop` reserved exactly the
+  // stack's height above itself. Cascading top-down (rather than up from the
+  // focus) is what keeps spaced-out earlier comments off the lane top.
   if (focusIndex > 0) {
     // Pass 1: cascade top-down honoring anchors — non-overlapping, each >= its
     // own anchor (but the tail may run past the focus).
@@ -184,8 +341,8 @@ export function layoutCommentLane(params: {
     }
     // Pass 2: walk back up from the focus, pushing each card up only as far as it
     // must to clear the one below it. This keeps the gaps intact (a uniform shift
-    // + per-card clamp would cramp them) and clamps at 0 only when the cluster
-    // genuinely can't fit above the focus, where some overlap is unavoidable.
+    // + per-card clamp would cramp them); the 0 clamp is now a no-op safety net,
+    // since `focusTop` already reserved room for the whole stack.
     let limit = focusTop;
     for (let i = focusIndex - 1; i >= 0; i--) {
       const item = items[i];

@@ -12,6 +12,8 @@ import {
   CheckIcon,
   ClockCounterClockwiseIcon,
   EyeIcon,
+  PencilSimpleIcon,
+  PlusMinusIcon,
   TagIcon,
   User,
 } from '@phosphor-icons/react';
@@ -34,6 +36,7 @@ import {
   type ChangeEntry,
   type ChangeScopeFilter,
   type WorkspaceChangesResponse,
+  type WorkspaceChangesUnchanged,
 } from '@/lib/workspace/workspace-changes';
 import { ActionBtn, RangeCompareDetail, ReviewFilterBar, useFetchJson } from '@/components/workspace/review-panel-parts';
 import { buildHandoffPrompt, groupHistorySessions, rangeDocEditIds } from '@/lib/workspace/review-range';
@@ -162,11 +165,42 @@ function AuthorAvatar({ entry, size = 'md' }: { entry: ChangeEntry; size?: 'sm' 
   );
 }
 
-// Generic stand-ins the summarizer emits for empty/`done` turns and runs — they
-// add nothing next to the file list, so the row hides them.
+// Generic stand-ins the summarizer emits for empty/`done` turns, runs, and
+// applied sessions ("Edited draft.md", "Edited (2×) draft.md") — they restate
+// the verb and file rails, so the row hides them.
 function isGenericPreview(preview: string): boolean {
   const p = preview.trim();
-  return /^Edited \d+ files?$/i.test(p) || /^Suggested edits?\b/i.test(p);
+  return /^Edited \d+ files?$/i.test(p) || /^Suggested edits?\b/i.test(p) || /^Edited( \(\d+×\))? \S+$/.test(p);
+}
+
+type RowVerb = {
+  verb: string;
+  Icon: React.ComponentType<{ className?: string; weight?: 'fill' | 'bold' | 'regular'; 'aria-hidden'?: boolean }>;
+  tone: string;
+  weight?: 'fill' | 'bold';
+};
+
+/** What a row DID — the scan anchor of the icon+verb rail. Derived entirely
+ *  from the entry. Colour is spent exactly once: amber on a still-pending
+ *  Suggested (the rows that need the reviewer); everything else stays stone. */
+function changeAction(entry: ChangeEntry): RowVerb {
+  if (entry.kind === 'comment') {
+    const event = entry.comment?.event;
+    if (event === 'resolved') return { verb: 'Resolved', Icon: CheckCircleIcon, tone: 'text-stone-400' };
+    if (event === 'reopened') return { verb: 'Reopened', Icon: ArrowUUpLeftIcon, tone: 'text-stone-400' };
+    return { verb: 'Commented', Icon: ChatCircleIcon, tone: 'text-stone-400', weight: 'fill' };
+  }
+  if (entry.acceptedFrom) {
+    return entry.acceptedFrom.decision === 'rejected'
+      ? { verb: 'Rejected', Icon: ArrowUUpLeftIcon, tone: 'text-stone-400' }
+      : { verb: 'Accepted', Icon: CheckIcon, tone: 'text-stone-400', weight: 'bold' };
+  }
+  if (entry.editMode === 'suggest') {
+    return isSuggestionEntry(entry)
+      ? { verb: 'Suggested', Icon: PlusMinusIcon, tone: 'text-orange-600' }
+      : { verb: 'Reviewed', Icon: CheckIcon, tone: 'text-stone-400' };
+  }
+  return { verb: 'Edited', Icon: PencilSimpleIcon, tone: 'text-stone-400' };
 }
 
 /** Black workspace tooltip on hover — CSS-only (no portal/ResizeObserver) so it's
@@ -273,6 +307,47 @@ function RunReviewDetail({
       onOpenFile={onOpenFile}
       onPayloadChange={onPayloadChange}
     />
+  );
+}
+
+/** Read-only detail for a comment record: what was said (or resolved) and on
+ *  which quoted span. Comments are history entries, not reviewable diffs. */
+function CommentDetail({ entry, onOpenFile }: { entry: ChangeEntry; onOpenFile?: (path: string) => void }) {
+  const comment = entry.comment;
+  const filePath = entry.filePaths[0] ?? null;
+  const verb =
+    comment?.event === 'resolved' ? 'Resolved a comment' : comment?.event === 'reopened' ? 'Reopened a comment' : 'Commented';
+  return (
+    <div className="overflow-hidden rounded-xl border border-stone-200">
+      <div className="flex items-center gap-2 border-b border-stone-100 px-4 py-3">
+        <ChatCircleIcon className="h-4 w-4 shrink-0 text-stone-400" weight="fill" aria-hidden />
+        <span className="min-w-0 flex-1 truncate text-sm font-medium text-stone-800">
+          {verb}
+          {filePath ? ` on ${filePath}` : ''}
+        </span>
+        {filePath && onOpenFile ? (
+          <button
+            type="button"
+            onClick={() => onOpenFile(filePath)}
+            title="Open this file in the editor"
+            className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-stone-200 px-2.5 py-1 text-[12px] font-medium text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-800"
+          >
+            <EyeIcon className="h-3.5 w-3.5" /> Open file
+          </button>
+        ) : null}
+      </div>
+      <div className="space-y-3 px-4 py-4">
+        {comment?.quote ? (
+          <blockquote className="border-l-2 border-stone-200 pl-3 text-[13px] italic text-stone-500">
+            {comment.quote}
+          </blockquote>
+        ) : null}
+        {comment?.body ? <div className="whitespace-pre-wrap text-sm text-stone-700">{comment.body}</div> : null}
+        {!comment?.quote && !comment?.body ? (
+          <div className="text-sm text-stone-500">No comment text was recorded for this event.</div>
+        ) : null}
+      </div>
+    </div>
   );
 }
 
@@ -453,6 +528,20 @@ export function ReviewPanel({
   // Which collapsed same-author history sessions are expanded to their edits.
   const [expandedSessions, setExpandedSessions] = useState<Set<string>>(() => new Set());
   const lastKeyRef = useRef<string>('');
+  // Single-flight guard for the index fetch. Refs, not effect-local state: the
+  // effect re-runs on every `refreshKey` bump, so an effect-scoped flag would
+  // let each new instance start a request while the previous one is still open.
+  const inFlightRef = useRef(false);
+  const missedLoadRef = useRef(false);
+  const missedSpinnerRef = useRef(false);
+  // Poll short-circuit: the last response's change fingerprint, echoed back as
+  // `ifUnchanged=` so an idle poll costs the server two point queries instead
+  // of the whole index pipeline. Periodically dropped (below) so the panel
+  // still self-heals from any state the fingerprint can't see.
+  const pollTokenRef = useRef<string | null>(null);
+  const lastFullFetchRef = useRef(0);
+  /** Set by the poll chain; called when an edit should pull the next fetch in. */
+  const wakeRef = useRef<(() => void) | null>(null);
   // Local review outcomes (Keep/Undo) that must stick across background polls,
   // since the fast index can't cheaply reflect per-chunk undo state.
   const resolutionsRef = useRef<Map<string, LocalResolution>>(new Map());
@@ -541,6 +630,7 @@ export function ReviewPanel({
       resolutionsRef.current = new Map(); // new scope/filter — drop stale resolutions
       reviewIdAliasRef.current = new Map();
       seenEntriesRef.current = new Map(); // another timeline — ids must not remap across it
+      pollTokenRef.current = null; // the fingerprint attests a DIFFERENT query's page
       setPayload(null); // show the spinner, not the previous scope's stale list
       setOlder(null); // older pages belong to the previous scope's timeline
       setOlderError(null);
@@ -552,18 +642,41 @@ export function ReviewPanel({
       setCompareRevealed(false);
     }
     const load = async (spinner: boolean) => {
+      // Never let two of these overlap: the index is the expensive query, and a
+      // burst of writes would otherwise stack one request per Realtime bump. A
+      // trigger that lands mid-flight is remembered (with its spinner, so a
+      // scope change can't strand the panel in a loading state) and folded into
+      // one prompt follow-up.
+      if (inFlightRef.current) {
+        missedLoadRef.current = true;
+        missedSpinnerRef.current = missedSpinnerRef.current || spinner;
+        return;
+      }
+      inFlightRef.current = true;
       if (spinner) setLoading(true);
       try {
-        const res = await apiFetch(`/api/workspace/changes?workspaceId=${encodeURIComponent(workspaceId)}&${query}`, {
-          cache: 'no-store',
-        });
-        const data = await readJsonResponse<WorkspaceChangesResponse & { error?: string }>(res);
+        // Echo the fingerprint only on background polls of a page we already
+        // hold, and drop it every 30s so the occasional full fetch self-heals
+        // anything the fingerprint can't observe.
+        const stale = Date.now() - lastFullFetchRef.current > 30_000;
+        const token = !spinner && !stale ? pollTokenRef.current : null;
+        const res = await apiFetch(
+          `/api/workspace/changes?workspaceId=${encodeURIComponent(workspaceId)}&${query}${token ? `&ifUnchanged=${encodeURIComponent(token)}` : ''}`,
+          { cache: 'no-store' },
+        );
+        const data = await readJsonResponse<
+          (WorkspaceChangesResponse | WorkspaceChangesUnchanged) & { error?: string }
+        >(res);
         if (cancelled) return;
         if (!res.ok || !data) throw new Error(data?.error || `Failed to load changes (${res.status})`);
         setError(null); // a later poll succeeded — clear any stale transient error
+        pollTokenRef.current = data.pollToken ?? null;
+        if ('unchanged' in data && data.unchanged) return; // the page we hold is current
+        const full = data as WorkspaceChangesResponse;
+        lastFullFetchRef.current = Date.now();
         const reconciled: WorkspaceChangesResponse = {
-          ...data,
-          entries: applyResolutions(data.entries, resolutionsRef.current),
+          ...full,
+          entries: applyResolutions(full.entries, resolutionsRef.current),
         };
         setPayload((prev) =>
           prev && JSON.stringify(prev) === JSON.stringify(reconciled) ? prev : reconciled,
@@ -571,24 +684,66 @@ export function ReviewPanel({
       } catch (nextError) {
         if (!cancelled) setError(nextError instanceof Error ? nextError.message : 'Failed to load changes');
       } finally {
+        inFlightRef.current = false;
         if (!cancelled && spinner) setLoading(false);
       }
     };
     // Chained, not setInterval: the index is expensive on a busy workspace, and
     // a fixed interval stacks overlapping requests once latency exceeds it
     // (observed 10–20s pileups) — schedule the next poll only after this one
-    // settles.
+    // settles. With edits waking the chain (below) the timer is just the
+    // backstop; a trigger dropped mid-flight retries on the short delay so a
+    // live edit lands in the timeline in ~a second, not on the 4s beat.
     let timer: number | undefined;
     const tick = (spinner: boolean) =>
       load(spinner).finally(() => {
-        if (!cancelled) timer = window.setTimeout(() => void tick(false), 4000);
+        if (cancelled) return;
+        const missed = missedLoadRef.current;
+        const missedSpinner = missedSpinnerRef.current;
+        missedLoadRef.current = false;
+        missedSpinnerRef.current = false;
+        // 2s beat only where polling is cheap — i.e. the response carried a
+        // pollToken: the cloud route mints one when its ifUnchanged fast path
+        // applies, and the local sidecar shim mints one because it answers
+        // from SQLite (this poll is its only live signal). Scoped path-share
+        // guests never get a token and every poll runs the full multi-page
+        // pipeline — they keep the original 4s cadence.
+        const idleMs = pollTokenRef.current ? 2000 : 4000;
+        timer = window.setTimeout(() => void tick(missedSpinner), missed ? 250 : idleMs);
       });
+    // An edit WAKES this chain instead of re-creating it. Restarting the effect
+    // per Realtime bump would hand each new instance a lock still held by the
+    // previous one, and every bump would start its own competing chain. Waking
+    // reuses the single-flight guard, so a burst of writes can never put more
+    // than one index query in the air no matter how fast the bumps arrive.
+    wakeRef.current = () => {
+      if (cancelled || inFlightRef.current) {
+        missedLoadRef.current = true;
+        return;
+      }
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(() => void tick(false), 0);
+    };
     void tick(queryChanged);
     return () => {
       cancelled = true;
+      wakeRef.current = null;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [workspaceId, query, refreshKey, apiFetch]);
+  }, [workspaceId, query, apiFetch]);
+
+  // Edits wake the poll chain. Skipped on the FIRST run: the chain's own
+  // effect has just started a load, and waking into that in-flight request
+  // only sets `missedLoadRef`, buying a redundant second fetch of the
+  // expensive index on every mount / filter change (Codex, PR #1104).
+  const wakeArmedRef = useRef(false);
+  useEffect(() => {
+    if (!wakeArmedRef.current) {
+      wakeArmedRef.current = true;
+      return;
+    }
+    wakeRef.current?.();
+  }, [refreshKey]);
 
   // Older-history pagination: the first page reports `nextBeforeId`; each
   // loaded older page advances the cursor. Fetched once per click — the poll
@@ -920,7 +1075,12 @@ export function ReviewPanel({
       return history.map((entry) => [entry]);
     }
     const visibleById = new Map(history.map((entry) => [entry.reviewId, entry]));
-    return groupHistorySessions(rawEntries, undefined, (entry) => !visibleById.has(entry.reviewId))
+    // Comments never fuse into an edit session — they're their own row.
+    return groupHistorySessions(
+      rawEntries,
+      undefined,
+      (entry) => !visibleById.has(entry.reviewId) || entry.kind === 'comment',
+    )
       .filter((run) => visibleById.has(run[0]!.reviewId))
       .map((run) => run.map((entry) => visibleById.get(entry.reviewId)!));
   }, [rawEntries, history, filter.authorKinds, filter.authorIds]);
@@ -1081,12 +1241,13 @@ export function ReviewPanel({
   // chunks (an explicit id undoes regardless of decision state, so including
   // kept chunks would revert accepted edits), only the entry's own files, and
   // sequentially — each chunk's text anchor shifts as earlier ones revert.
-  const undoEntry = useCallback(async (entry: ChangeEntry) => {
+  const undoEntry = useCallback(async (entry: ChangeEntry, reason?: string) => {
     dropEntry(entry);
+    const note = reason?.trim() ? { reason: reason.trim() } : {};
     try {
       if (isHumanReviewId(entry.reviewId)) {
         await Promise.all(entry.filePaths.map((filePath) =>
-          postJson('/api/workspace/turn-edits/undo-chunk', { assistantMessageId: entry.reviewId, filePath, chunkId: '*', workspaceId })));
+          postJson('/api/workspace/turn-edits/undo-chunk', { assistantMessageId: entry.reviewId, filePath, chunkId: '*', workspaceId, ...note })));
       } else {
         const pl = await loadEntryPayload(entry);
         const scope = new Set(entry.filePaths);
@@ -1094,18 +1255,24 @@ export function ReviewPanel({
           if (!scope.has(file.filePath)) continue;
           for (const chunk of file.chunks) {
             if (chunk.status !== 'pending') continue;
-            await postJson('/api/workspace/turn-edits/undo-chunk', { assistantMessageId: entry.reviewId, filePath: file.filePath, chunkId: chunk.id, workspaceId });
+            await postJson('/api/workspace/turn-edits/undo-chunk', { assistantMessageId: entry.reviewId, filePath: file.filePath, chunkId: chunk.id, workspaceId, ...note });
           }
         }
       }
     } catch { reviveOnFailure(entry.reviewId); }
   }, [dropEntry, loadEntryPayload, reviveOnFailure, workspaceId]);
+  // Optional note beside the detail-pane Undo; it rides the reject to the
+  // suggesting agent's /events feed. Reset when the selected entry changes.
+  // Row-hover undo stays noteless and instant.
+  const [undoNote, setUndoNote] = useState('');
+  useEffect(() => { setUndoNote(''); }, [selected?.reviewId]);
   const keepAllSuggestions = useCallback(() => { suggestions.forEach((s) => void keepEntry(s)); }, [suggestions, keepEntry]);
   const undoAllSuggestions = useCallback(() => { suggestions.forEach((s) => void undoEntry(s)); }, [suggestions, undoEntry]);
 
   // Hover-revealed quick actions — suggestions keep/undo/revise, history restore/
   // ask/checkpoint. Siblings of the row button (not nested) so clicks don't select.
   const rowActions = (entry: ChangeEntry) => {
+    if (entry.kind === 'comment') return null; // read-only record — no verbs
     const sug = isSuggestionEntry(entry);
     return (
       <div className="pointer-events-none absolute right-1.5 top-1.5 flex items-center gap-0.5 rounded-md bg-stone-100/95 opacity-0 shadow-sm ring-1 ring-stone-200 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
@@ -1118,7 +1285,7 @@ export function ReviewPanel({
         ) : (
           <>
             <RowIcon testId={`row-restore-${entry.reviewId}`} title="Restore" onClick={() => restoreToChat(entry.filePaths)}><ClockCounterClockwiseIcon className="h-3.5 w-3.5" /></RowIcon>
-            <RowIcon testId={`row-ask-${entry.reviewId}`} title="Ask Sunny" onClick={() => askChange(entry)}><ChatCircleIcon className="h-3.5 w-3.5" /></RowIcon>
+            <RowIcon testId={`row-ask-${entry.reviewId}`} title="Ask agent" onClick={() => askChange(entry)}><ChatCircleIcon className="h-3.5 w-3.5" /></RowIcon>
             <RowIcon testId={`row-checkpoint-${entry.reviewId}`} title="Checkpoint" onClick={() => openEntry(entry.reviewId)}><TagIcon className="h-3.5 w-3.5" /></RowIcon>
           </>
         )}
@@ -1130,6 +1297,12 @@ export function ReviewPanel({
     const active = !range && entry.reviewId === selected?.reviewId;
     const fileList = entry.filePaths.join(' · ');
     const checkpoint = labelsByDocEditId.get(entry.docEditId);
+    const { verb, Icon, tone, weight } = changeAction(entry);
+    // Second line only when it says something the rails don't: an accepted/
+    // rejected row's preview ("Accepted X's suggestion") restates the verb and
+    // author columns, and the generic stand-ins restate the file list.
+    const preview =
+      isGenericPreview(entry.messagePreview) || entry.acceptedFrom ? '' : entry.messagePreview;
     return (
       <div key={entry.reviewId} className="group relative">
         <button
@@ -1140,17 +1313,19 @@ export function ReviewPanel({
             active ? 'bg-stone-200/80' : 'hover:bg-stone-100'
           }`}
         >
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-2">
+            {/* 1 — action rail. Fixed width so the verbs form a scan column. */}
+            <span className="flex w-[92px] shrink-0 items-center gap-1.5">
+              <Icon className={`h-3.5 w-3.5 shrink-0 ${tone}`} weight={weight} aria-hidden />
+              <span className="truncate text-[11px] font-medium text-stone-500">{verb}</span>
+            </span>
+            {/* 2 — file rail: full relative paths, truncated. */}
             <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-stone-700" title={fileList}>
               {fileList || 'No tracked files'}
             </span>
-            {/* Right edge stays quiet: only a chat marker and a checkpoint tag
-                when present, then the time. The "pending" dot is dropped — a
-                pending entry is always under the "Suggestions" group, so
-                the dot only ever restated the heading. */}
             {entry.chatId ? (
               <Tip content="Came from a chat thread">
-                <ChatCircleIcon className="h-3 w-3 shrink-0 text-stone-400" weight="fill" aria-label="From chat" />
+                <ChatCircleIcon className="h-3 w-3 shrink-0 text-stone-300" weight="fill" aria-label="From chat" />
               </Tip>
             ) : null}
             {checkpoint ? (
@@ -1162,18 +1337,19 @@ export function ReviewPanel({
                 <TagIcon className="h-3 w-3" weight="fill" aria-hidden />
               </span>
             ) : null}
-            <span className="shrink-0 text-[10px] text-stone-400">{formatTime(entry.createdAt)}</span>
+            {/* 3 — author rail */}
+            <span className="flex shrink-0 items-center gap-1">
+              <AuthorAvatar entry={entry} size="sm" />
+              <span className="max-w-[72px] truncate text-[11px] text-stone-500">{entry.author.name}</span>
+            </span>
+            {/* 4 — time rail */}
+            <span className="w-12 shrink-0 text-right text-[10px] tabular-nums text-stone-400">
+              {formatTime(entry.createdAt)}
+            </span>
           </div>
-          <div className="mt-0.5 flex items-center gap-1 text-[11px] text-stone-400">
-            <AuthorAvatar entry={entry} size="sm" />
-            <span className="shrink-0 truncate font-medium text-stone-500">{entry.author.name}</span>
-            {!isGenericPreview(entry.messagePreview) ? (
-              <>
-                <span className="text-stone-300">·</span>
-                <span className="min-w-0 flex-1 truncate">{entry.messagePreview}</span>
-              </>
-            ) : null}
-          </div>
+          {preview ? (
+            <div className="mt-0.5 truncate pl-[100px] text-[11px] text-stone-400">{preview}</div>
+          ) : null}
         </button>
         {rowActions(entry)}
       </div>
@@ -1202,14 +1378,18 @@ export function ReviewPanel({
           onClick={() => compareSession(oldest.reviewId, newest.reviewId)}
           className={`w-full rounded-lg px-2.5 py-1.5 pr-8 text-left transition-colors ${isSelected ? 'bg-stone-200/80' : 'hover:bg-stone-100'}`}
         >
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-2">
+            <span className="flex w-[92px] shrink-0 items-center gap-1.5">
+              <PencilSimpleIcon className="h-3.5 w-3.5 shrink-0 text-stone-400" aria-hidden />
+              <span className="truncate text-[11px] font-medium text-stone-500">Edited</span>
+            </span>
             <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-stone-700" title={fileList}>{fileList || 'No tracked files'}</span>
             <span className="shrink-0 rounded-full bg-stone-200/80 px-1.5 text-[9px] font-medium text-stone-500">{run.length} edits</span>
-            <span className="shrink-0 text-[10px] text-stone-400">{formatTime(newest.createdAt)}</span>
-          </div>
-          <div className="mt-0.5 flex items-center gap-1 text-[11px] text-stone-400">
-            <AuthorAvatar entry={newest} size="sm" />
-            <span className="truncate font-medium text-stone-500">{newest.author.name}</span>
+            <span className="flex shrink-0 items-center gap-1">
+              <AuthorAvatar entry={newest} size="sm" />
+              <span className="max-w-[72px] truncate text-[11px] text-stone-500">{newest.author.name}</span>
+            </span>
+            <span className="w-12 shrink-0 text-right text-[10px] tabular-nums text-stone-400">{formatTime(newest.createdAt)}</span>
           </div>
         </button>
         <button
@@ -1351,17 +1531,17 @@ export function ReviewPanel({
                   <span className="shrink-0 text-[10px] text-stone-400">read-only</span>
                   <ActionBtn
                     testId="ask-about"
-                    title="Ask Sunny what changed across this span"
+                    title="Ask agent what changed across this span"
                     onClick={() =>
                       onHandoffToChat?.(
                         buildHandoffPrompt({ kind: 'ask', files: [], range: { fromLabel: range.fromLabel, toLabel: range.toLabel, fromId: range.from, toId: range.to } }),
                       )
                     }
                   >
-                    <ChatCircleIcon className="h-3.5 w-3.5" /> Ask Sunny about this
+                    <ChatCircleIcon className="h-3.5 w-3.5" /> Ask agent about this
                   </ActionBtn>
                 </>
-              ) : selected ? (
+              ) : selected?.kind === 'comment' ? null : selected ? (
                 <>
                   {selected.chatId && onOpenChatTurn ? (
                     <VerbBtn testId="open-chat-turn" tip="Open the chat turn this change came from" onClick={() => openChatTurn(selected)}>
@@ -1369,8 +1549,8 @@ export function ReviewPanel({
                     </VerbBtn>
                   ) : null}
                   {onHandoffToChat ? (
-                    <VerbBtn testId="ask-change" tip="Ask Sunny about this change" onClick={() => askChange(selected)}>
-                      <ChatCircleIcon className="h-3.5 w-3.5" /> Ask Sunny
+                    <VerbBtn testId="ask-change" tip="Ask agent about this change" onClick={() => askChange(selected)}>
+                      <ChatCircleIcon className="h-3.5 w-3.5" /> Ask agent
                     </VerbBtn>
                   ) : null}
                   <Tip content="Pin a named checkpoint that includes this change">
@@ -1383,7 +1563,21 @@ export function ReviewPanel({
                   </Tip>
                   {isSuggestionEntry(selected) ? (
                     <>
-                      <VerbBtn testId="undo-change" tip="Undo this change" onClick={() => void undoEntry(selected)}>
+                      {/* Optional reason, inline. Undo fires in ONE click and
+                          carries whatever's typed (empty = no reason) — the
+                          note never gates the action. */}
+                      <input
+                        data-testid="undo-note-input"
+                        value={undoNote}
+                        onChange={(e) => setUndoNote(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') void undoEntry(selected, undoNote);
+                        }}
+                        placeholder="Why? (optional)"
+                        title="Optional note sent to the agent when you undo"
+                        className="h-6 w-32 shrink-0 rounded-md border border-stone-300 bg-white px-1.5 text-[11px] text-stone-700 outline-none placeholder:text-stone-400 focus:border-stone-400"
+                      />
+                      <VerbBtn testId="undo-change" tip="Undo this change" onClick={() => void undoEntry(selected, undoNote)}>
                         <ArrowUUpLeftIcon className="h-3.5 w-3.5" /> Undo
                       </VerbBtn>
                       <VerbBtn testId="keep-change" tip="Keep this change" primary onClick={() => void keepEntry(selected)}>
@@ -1391,7 +1585,7 @@ export function ReviewPanel({
                       </VerbBtn>
                     </>
                   ) : onHandoffToChat ? (
-                    <VerbBtn testId="restore-ai" tip="Ask Sunny to restore this change onto the current version" onClick={() => restoreToChat(selected.filePaths)}>
+                    <VerbBtn testId="restore-ai" tip="Ask agent to restore this change onto the current version" onClick={() => restoreToChat(selected.filePaths)}>
                       <ClockCounterClockwiseIcon className="h-3.5 w-3.5" /> Restore
                     </VerbBtn>
                   ) : null}
@@ -1410,7 +1604,13 @@ export function ReviewPanel({
             ) : selected ? (
               <>
                 <div className="min-h-0 flex-1 overflow-auto p-4">
-                  {selected.kind === 'turn' ? (
+                  {selected.kind === 'comment' ? (
+                    <CommentDetail
+                      key={selected.reviewId}
+                      entry={selected}
+                      onOpenFile={onOpenFile ? (path) => onOpenFile(path, { editable: false }) : undefined}
+                    />
+                  ) : selected.kind === 'turn' ? (
                     <TurnEditsCard
                       key={selected.reviewId}
                       assistantMessageId={selected.reviewId}

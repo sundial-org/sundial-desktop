@@ -94,6 +94,15 @@ function priorTranscript(messages: ModelMessage[]): string {
   return lines.join("\n\n");
 }
 
+// Synthesized user input for a history that does NOT end in a user message —
+// the stall-recovery shape, where the runner re-invokes the harness mid-turn
+// and the tail is the captured assistant text / tool results. The Claude
+// prompt must end in user input, so the real tail stays in the transcript
+// (correctly labeled) and this becomes the turn. Histories ending in a user
+// message — every non-recovery call — are byte-identical to before.
+export const CLAUDE_CONTINUATION_PROMPT =
+  "Continue exactly where you left off — the previous response was cut off mid-stream.";
+
 /**
  * Build the Claude `query()` prompt. Single-turn text → a plain string (the
  * common path, incl. the repo-summary eval). When the current turn carries
@@ -104,12 +113,16 @@ export function modelMessagesToClaudePrompt(
   messages: ModelMessage[],
 ): string | AsyncIterable<SDKUserMessage> {
   const last = messages[messages.length - 1];
-  const prior = messages.slice(0, -1);
-  const lastText = last
-    ? last.role === "user"
+  const endsInUser = last?.role === "user";
+  // Only a trailing USER message is the current input; a non-user tail (stall
+  // recovery) must not be popped — a trailing tool result would render empty
+  // and vanish, and trailing assistant text would be relabeled "User:".
+  const prior = endsInUser ? messages.slice(0, -1) : messages;
+  const lastText = !last
+    ? ""
+    : endsInUser
       ? splitUserContent(last.content).text
-      : textOf(last.content)
-    : "";
+      : CLAUDE_CONTINUATION_PROMPT;
 
   const transcript = priorTranscript(prior);
   const promptText = transcript ? `${transcript}\n\nUser: ${lastText}` : lastText;

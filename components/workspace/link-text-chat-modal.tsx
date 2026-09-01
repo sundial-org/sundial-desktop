@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import qrcode from 'qrcode-generator';
-import { SignInButton, SignUpButton, useClerk } from '@/lib/auth/optional-auth';
+import { SignInButton, SignUpButton } from '@/lib/auth/optional-auth';
 import { CheckCircleIcon, ChatTextIcon, CircleNotchIcon, XIcon } from '@phosphor-icons/react';
 import { ModalShell } from '@/components/modal-shell';
 
@@ -12,20 +12,14 @@ type LinkTextStatus = {
   hasPhone: boolean;
   hasLinqChat: boolean;
   phoneNumber: string | null;
-  clerkPhoneNumbers: string[];
-  hasClerkPhone: boolean;
   linkedHere: boolean;
   linkedElsewhere: boolean;
   currentlyLinkedChatId: string | null;
   currentlyLinkedLabel: string | null;
+  // Set when the line this chat was linked through is no longer delivering
+  // (Linq reputation flagged) — the user must re-link to the current number.
+  retiredNumber: string | null;
 };
-
-function formatPhoneList(numbers: string[]): string {
-  if (numbers.length === 0) return '';
-  if (numbers.length === 1) return numbers[0];
-  if (numbers.length === 2) return `${numbers[0]} or ${numbers[1]}`;
-  return `${numbers.slice(0, -1).join(', ')}, or ${numbers[numbers.length - 1]}`;
-}
 
 type LinkTextChatModalProps = {
   open: boolean;
@@ -37,13 +31,15 @@ type LinkTextChatModalProps = {
 const POLL_INTERVAL_MS = 4000;
 
 export function LinkTextChatModal({ open, chatId, chatLabel, onClose }: LinkTextChatModalProps) {
-  const { openUserProfile } = useClerk();
   const [status, setStatus] = useState<LinkTextStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState<'link' | 'unlink' | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [needsAuth, setNeedsAuth] = useState(false);
   const [justLinked, setJustLinked] = useState(false);
+  // One-tap link code: texting it from the phone is what proves ownership,
+  // so no phone number is ever typed here and no Clerk phone is required.
+  const [linkCode, setLinkCode] = useState<{ code: string; smsBody: string; expiresAt: number } | null>(null);
 
   const loadStatus = useCallback(async () => {
     if (!chatId) return;
@@ -65,6 +61,27 @@ export function LinkTextChatModal({ open, chatId, chatLabel, onClose }: LinkText
     }
   }, [chatId]);
 
+  const requestLinkCode = useCallback(async () => {
+    if (!chatId) return;
+    try {
+      const res = await fetch('/api/workspace/chats/link-text/code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chatId }),
+      });
+      if (res.status === 401) {
+        setNeedsAuth(true);
+        return;
+      }
+      if (!res.ok) throw new Error(`Could not create a link code (${res.status})`);
+      const payload = (await res.json()) as { code: string; smsBody: string; expiresAt?: string };
+      const expiresAt = payload.expiresAt ? Date.parse(payload.expiresAt) : Date.now() + 15 * 60_000;
+      setLinkCode({ code: payload.code, smsBody: payload.smsBody, expiresAt });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Could not create a link code');
+    }
+  }, [chatId]);
+
   useEffect(() => {
     if (!open || !chatId) return;
     setError(null);
@@ -77,12 +94,16 @@ export function LinkTextChatModal({ open, chatId, chatLabel, onClose }: LinkText
 
   useEffect(() => {
     if (!open || !chatId) return;
-    if (!needsAuth && (status?.hasLinqChat || status?.linkedHere)) return;
+    // A retired line still has hasLinqChat/linkedHere set, but we ARE waiting
+    // for a text (the relink) — keep polling until it lands.
+    if (!needsAuth && !status?.retiredNumber && (status?.hasLinqChat || status?.linkedHere)) return;
+    // Polling is how the "waiting for your text" state resolves: the inbound
+    // claim happens server-side, so nothing tells this tab but a refetch.
     const id = window.setInterval(() => {
       void loadStatus();
     }, POLL_INTERVAL_MS);
     return () => window.clearInterval(id);
-  }, [open, chatId, needsAuth, status?.hasLinqChat, status?.linkedHere, loadStatus]);
+  }, [open, chatId, needsAuth, status?.hasLinqChat, status?.linkedHere, status?.retiredNumber, loadStatus]);
 
   const linkNow = useCallback(async () => {
     if (!chatId) return;
@@ -106,12 +127,11 @@ export function LinkTextChatModal({ open, chatId, chatLabel, onClose }: LinkText
           hasPhone: payload.hasPhone ?? prev?.hasPhone ?? false,
           hasLinqChat: payload.hasLinqChat ?? prev?.hasLinqChat ?? false,
           phoneNumber: payload.phoneNumber ?? prev?.phoneNumber ?? null,
-          clerkPhoneNumbers: payload.clerkPhoneNumbers ?? prev?.clerkPhoneNumbers ?? [],
-          hasClerkPhone: payload.hasClerkPhone ?? prev?.hasClerkPhone ?? false,
           linkedHere: payload.linkedHere ?? prev?.linkedHere ?? false,
           linkedElsewhere: payload.linkedElsewhere ?? prev?.linkedElsewhere ?? false,
           currentlyLinkedChatId: payload.currentlyLinkedChatId ?? prev?.currentlyLinkedChatId ?? null,
           currentlyLinkedLabel: payload.currentlyLinkedLabel ?? prev?.currentlyLinkedLabel ?? null,
+          retiredNumber: payload.retiredNumber ?? prev?.retiredNumber ?? null,
         }));
         throw new Error(payload?.message ?? payload?.error ?? `Failed to link (${res.status})`);
       }
@@ -150,14 +170,43 @@ export function LinkTextChatModal({ open, chatId, chatLabel, onClose }: LinkText
 
   const sunnyDisplay = status?.sunnyPhoneNumber ?? '+1 (646) 261-7916';
   const sunnyE164 = status?.sunnyPhoneNumberE164 ?? '+16462617916';
-  const messageHref = `sms:${sunnyE164}&body=hi`;
-  const linkedHere = Boolean(status?.linkedHere);
-  const canLink = Boolean(status?.hasLinqChat) && !linkedHere && !busy;
-  const needsFirstText = Boolean(status && !linkedHere && (!status.hasPhone || !status.hasLinqChat));
+  const linkedHere = Boolean(status?.linkedHere) && !status?.retiredNumber;
+  // A retired line's linq_chat_id is dead, so "move my texts here" would act
+  // on a chat that can never deliver — only a fresh text can rebind it.
+  const lineRetired = Boolean(status?.retiredNumber);
+  const canLink = Boolean(status?.hasLinqChat) && !linkedHere && !lineRetired && !busy;
+  // Needs the phone to text us: never linked, linked elsewhere with nothing
+  // usable here, or bound to a line that stopped delivering.
+  const needsFirstText = Boolean(
+    status && (lineRetired || (!linkedHere && (!status.hasPhone || !status.hasLinqChat)))
+  );
+  const messageHref = `sms:${sunnyE164}${linkCode ? `&body=${encodeURIComponent(linkCode.smsBody)}` : ''}`;
+
+  // Mint the code as soon as we know the user needs to text — it's what the
+  // QR and the deep link carry — and re-mint before it expires, since this
+  // panel is frequently left open longer than the code's TTL.
+  useEffect(() => {
+    if (!open || !chatId || needsAuth || !needsFirstText) return;
+    if (!linkCode) {
+      void requestLinkCode();
+      return;
+    }
+    const msLeft = linkCode.expiresAt - Date.now() - 30_000;
+    if (msLeft <= 0) {
+      void requestLinkCode();
+      return;
+    }
+    const id = window.setTimeout(() => void requestLinkCode(), msLeft);
+    return () => window.clearTimeout(id);
+  }, [open, chatId, needsAuth, needsFirstText, linkCode, requestLinkCode]);
+
+  useEffect(() => {
+    if (!open) setLinkCode(null);
+  }, [open]);
 
   const qrRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    if (!open || !needsFirstText || !qrRef.current) return;
+    if (!open || !needsFirstText || !linkCode || !qrRef.current) return;
     const qr = qrcode(0, 'M');
     qr.addData(messageHref);
     qr.make();
@@ -168,7 +217,7 @@ export function LinkTextChatModal({ open, chatId, chatLabel, onClose }: LinkText
       svg.setAttribute('height', '128');
       svg.style.borderRadius = '8px';
     }
-  }, [open, needsFirstText, messageHref]);
+  }, [open, needsFirstText, linkCode, messageHref]);
 
   return (
     <ModalShell
@@ -188,7 +237,10 @@ export function LinkTextChatModal({ open, chatId, chatLabel, onClose }: LinkText
               {chatLabel ? `Text ${chatLabel} from your phone` : 'Text this chat from your phone'}
             </h2>
             <p className="mt-1 text-xs text-stone-500">
-              When connected, texting Sunny from your phone lands in this chat.
+              Texts you send Sunny will show up in this chat.
+            </p>
+            <p data-testid="link-text-alpha-note" className="mt-1.5 text-[11px] text-stone-400">
+              Alpha: Sunny&rsquo;s number can change. This panel always shows the current one.
             </p>
           </div>
           <button
@@ -201,6 +253,21 @@ export function LinkTextChatModal({ open, chatId, chatLabel, onClose }: LinkText
           </button>
         </div>
 
+        {!needsAuth && status?.retiredNumber ? (
+          <div
+            data-testid="link-text-retired-number"
+            className="mb-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700"
+          >
+            <div className="font-medium text-stone-800">That number stopped working</div>
+            <p className="mt-1 text-stone-600">
+              <span className="font-mono">{status.retiredNumber}</span> is no longer delivering
+              messages. Reconnect below to use{' '}
+              <span className="font-mono text-stone-900">{sunnyDisplay}</span> instead. Your chat
+              history stays.
+            </p>
+          </div>
+        ) : null}
+
         {needsAuth ? (
           <div
             data-testid="link-text-needs-auth"
@@ -211,8 +278,7 @@ export function LinkTextChatModal({ open, chatId, chatLabel, onClose }: LinkText
               Sign in to text Sunny from your phone
             </div>
             <p className="mt-2 text-stone-600">
-              Texts are tied to your Sundial account so we can route them back to the right chats.
-              Sign in or create an account to continue.
+              Your texts are routed through your account. Sign in or create one to continue.
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
               <SignInButton mode="modal">
@@ -249,7 +315,7 @@ export function LinkTextChatModal({ open, chatId, chatLabel, onClose }: LinkText
             <CheckCircleIcon className="mt-0.5 h-4 w-4 shrink-0" weight="fill" aria-hidden />
             <div className="min-w-0">
               <div className="font-medium">
-                {justLinked ? 'Connected. Texts to Sunny will appear here.' : 'Texts from your phone land in this chat.'}
+                {justLinked ? 'Connected. Texts to Sundial Agent will appear here.' : 'Texts from your phone land in this chat.'}
               </div>
               {status.phoneNumber ? (
                 <div className="mt-0.5 text-xs text-emerald-700/80">
@@ -257,96 +323,80 @@ export function LinkTextChatModal({ open, chatId, chatLabel, onClose }: LinkText
                   <span className="font-mono">{sunnyDisplay}</span>
                 </div>
               ) : null}
+              <div className="mt-1.5 text-xs text-emerald-700/80">
+                Text <span className="font-mono">/chats</span> to see every chat in all your
+                workspaces, <span className="font-mono">/go &lt;name&gt;</span> to switch, and{' '}
+                <span className="font-mono">/inbox on</span> to get messages from all workspaces
+                here. <span className="font-mono">/help</span> lists everything.
+              </div>
             </div>
           </div>
         ) : null}
 
-        {!needsAuth && status && needsFirstText && !status.hasClerkPhone ? (
+        {!needsAuth && status && needsFirstText ? (
           <div className="rounded-xl border border-stone-200 bg-stone-50 px-4 py-4 text-sm text-stone-700">
             <div className="flex items-center gap-2 font-medium text-stone-800">
               <ChatTextIcon className="h-4 w-4" weight="regular" aria-hidden />
-              Add your phone first
-            </div>
-            <p className="mt-2 text-stone-600">
-              We match inbound texts against the phone number on your Sundial account. Add a phone
-              to your account, then text{' '}
-              <span className="font-mono text-stone-900">{sunnyDisplay}</span> from it to finish
-              connecting.
-            </p>
-            <button
-              type="button"
-              onClick={() => openUserProfile()}
-              className="mt-3 inline-flex items-center justify-center rounded-lg bg-stone-900 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-stone-800"
-            >
-              Add phone to account
-            </button>
-          </div>
-        ) : null}
-
-        {!needsAuth && status && needsFirstText && status.hasClerkPhone ? (
-          <div className="rounded-xl border border-stone-200 bg-stone-50 px-4 py-4 text-sm text-stone-700">
-            <div className="flex items-center gap-2 font-medium text-stone-800">
-              <ChatTextIcon className="h-4 w-4" weight="regular" aria-hidden />
-              {status.hasPhone ? 'Send one more text to Sunny' : 'Text Sunny first'}
+              Text this code to connect
             </div>
             <div className="mt-3 flex items-start gap-4">
               <div
                 ref={qrRef}
                 aria-label={`QR code that opens iMessage to ${sunnyDisplay}`}
+                data-testid="link-text-qr"
                 className="shrink-0 rounded-lg border border-stone-200 bg-white p-1.5"
+                style={{ width: 128, height: 128 }}
               />
               <div className="min-w-0 flex-1 text-stone-600">
                 <p>
-                  Text <span className="font-mono text-stone-900">{sunnyDisplay}</span> from{' '}
-                  <span className="font-mono text-stone-900">
-                    {formatPhoneList(status.clerkPhoneNumbers)}
-                  </span>
-                  . We match against the phone on your Sundial account, so any text from{' '}
-                  {status.clerkPhoneNumbers.length > 1 ? 'one of those numbers' : 'that number'}{' '}
-                  lands on your account automatically.
+                  Scan the QR or tap the button. It opens Messages with the code filled in, ready
+                  to send to <span className="font-mono text-stone-900">{sunnyDisplay}</span>. Send
+                  it and this chat is connected to your phone.
                 </p>
+                <div
+                  data-testid="link-text-code"
+                  className="mt-2 font-mono text-base tracking-[0.2em] text-stone-900"
+                >
+                  {linkCode?.code ?? '……'}
+                </div>
                 <a
                   href={messageHref}
-                  className="mt-3 inline-flex items-center justify-center rounded-lg bg-stone-900 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-stone-800"
+                  data-testid="link-text-open-messages"
+                  className={`mt-3 inline-flex items-center justify-center rounded-lg px-3 py-1.5 text-xs font-medium text-white transition-colors ${
+                    linkCode ? 'bg-stone-900 hover:bg-stone-800' : 'pointer-events-none bg-stone-300'
+                  }`}
                 >
-                  Open iMessage
+                  Open Messages
                 </a>
               </div>
             </div>
-            <p className="mt-3 text-[11px] text-stone-400">
-              Texting from a different number will spin up a separate account — use a number on{' '}
-              <button
-                type="button"
-                onClick={() => openUserProfile()}
-                className="underline underline-offset-2 hover:text-stone-600"
-              >
-                your account
-              </button>
-              .
+            <p className="mt-3 flex items-center gap-1.5 text-[11px] text-stone-400">
+              <CircleNotchIcon className="h-3 w-3 animate-spin" weight="bold" aria-hidden />
+              Waiting for your text…
             </p>
           </div>
         ) : null}
 
-        {!needsAuth && status && !linkedHere && status.hasLinqChat ? (
+        {!needsAuth && status && !linkedHere && !lineRetired && status.hasLinqChat ? (
           <div className="space-y-3">
             <div className="rounded-xl border border-stone-200 bg-stone-50 px-4 py-4 text-sm text-stone-700">
               {status.linkedElsewhere ? (
                 <div className="text-stone-600">
-                  Your phone currently texts into{' '}
+                  Your phone is connected to{' '}
                   <span className="font-medium text-stone-800">
                     {status.currentlyLinkedLabel ?? 'another chat'}
                   </span>
-                  . Moving it here means texts from{' '}
-                  <span className="font-mono text-stone-900">{status.phoneNumber}</span> will land in
-                  this chat instead.
+                  . Move it here and texts from{' '}
+                  <span className="font-mono text-stone-900">{status.phoneNumber}</span> will land
+                  in this chat instead.
                 </div>
               ) : (
                 <div className="text-stone-600">
-                  Your iMessage thread with Sunny is{' '}
-                  <span className="font-medium text-stone-800">not connected anywhere yet</span>.
-                  Connecting will route texts from{' '}
-                  <span className="font-mono text-stone-900">{status.phoneNumber}</span> into this
-                  chat.
+                  Your phone{' '}
+                  <span className="font-medium text-stone-800">isn&rsquo;t connected to a chat yet</span>.
+                  Connect it and texts from{' '}
+                  <span className="font-mono text-stone-900">{status.phoneNumber}</span> will land
+                  here.
                 </div>
               )}
             </div>

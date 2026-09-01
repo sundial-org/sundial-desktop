@@ -158,7 +158,7 @@ export function RawMarkdownEditor({ editor, readOnly = false }: RawMarkdownEdito
   }, [value, autoResize]);
 
   return (
-    <div className="raw-markdown-editor relative">
+    <div className="raw-markdown-editor">
       <textarea
         ref={textareaRef}
         value={value}
@@ -168,16 +168,19 @@ export function RawMarkdownEditor({ editor, readOnly = false }: RawMarkdownEdito
         onKeyDown={handleKeyDown}
         readOnly={readOnly}
         spellCheck={false}
+        // Flat page, same white surface and page padding as the rendered view
+        // (MarkdownEditorFrame's 'normal' margin) so raw ↔ rendered doesn't
+        // shift the text. Colors are theme tokens — the palette remaps under
+        // `.dark` (globals.css), so no per-class dark variants.
         className={`
-          w-full min-h-[360px] resize-none overflow-hidden
-          bg-white border border-stone-200 rounded-xl shadow-[0_1px_2px_rgba(28,25,23,0.05)]
-          px-5 py-4 font-mono text-[13px] leading-[1.7] text-stone-700
-          placeholder:text-stone-400
-          focus:outline-none focus:ring-2 focus:ring-stone-200/60 focus:border-stone-300
-          transition-all duration-150
-          ${readOnly ? 'opacity-60 cursor-not-allowed bg-stone-50' : ''}
+          w-full min-h-[360px] resize-none overflow-hidden break-words
+          bg-white px-10 pt-5 pb-10 lg:px-14 lg:pt-6 lg:pb-12
+          font-mono text-[14px] leading-[1.75] text-stone-800
+          caret-stone-900 selection:bg-stone-300 selection:text-stone-900
+          placeholder:text-stone-400 focus:outline-none
+          ${readOnly ? 'cursor-default caret-transparent' : ''}
         `}
-        style={{ tabSize: 2 }}
+        style={{ tabSize: 2, fontVariantLigatures: 'none' }}
         placeholder="Write markdown here..."
       />
     </div>

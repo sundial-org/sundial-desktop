@@ -100,7 +100,7 @@ export function EditorAskInput({ editor }: { editor: Editor }) {
 
   const close = (refocusEditor: boolean) => {
     setState(null);
-    if (refocusEditor && !editor.isDestroyed) editor.commands.focus();
+    if (refocusEditor && !editor.isDestroyed) editor.commands.focus(undefined, { scrollIntoView: false });
   };
 
   const submit = () => {
@@ -134,7 +134,7 @@ export function EditorAskInput({ editor }: { editor: Editor }) {
         </div>
       )}
       <div className="flex items-center gap-1.5 px-1">
-        <SparkleIcon className="h-4 w-4 shrink-0 text-[#8a6d3b]" weight="fill" />
+        <SparkleIcon className="h-4 w-4 shrink-0 text-beige-600" weight="fill" />
         <input
           ref={inputRef}
           value={value}
@@ -148,7 +148,7 @@ export function EditorAskInput({ editor }: { editor: Editor }) {
               close(true);
             }
           }}
-          placeholder={state.text ? 'Ask Sunny to edit this…' : 'Ask Sunny to write here…'}
+          placeholder={state.text ? 'Ask agent to edit this…' : 'Ask agent to write here…'}
           className="w-full bg-transparent py-1 text-[13px] text-stone-800 placeholder:text-stone-400 focus:outline-none"
         />
         <kbd className="shrink-0 text-[10px] text-stone-300">⏎</kbd>

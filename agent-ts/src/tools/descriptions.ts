@@ -8,6 +8,8 @@ Usage:
 - The file_path parameter must be a workspace-relative path (no leading slash, no \`..\`).
 - By default, reads up to ~256KB of the file's contents (UTF-8).
 - You can optionally specify a 1-indexed \`offset\` (line to start at) and \`limit\` (max lines to read) to read a slice of the file. When a slice is requested, lines are returned in \`<line-number>\\t<content>\` format (cat -n style) so Edit/MultiEdit can target them unambiguously.
+- Images (png/jpg/gif/webp) return a note, never pixels. The note says either that the image is attached for you to look at on a following step, or exactly why it cannot be shown and what to tell the user. Never guess an image's contents.
+- Other binary files (PDF, HEIC, zip, docx, ...) return an error rather than empty content, and re-reading them will not help. A file stored as a blob can still be text (a very large file, or an extension the editor does not track) — read those with Bash.
 - Tier 1: this hits the workspace document store directly (no sandbox needed). The store is the source of truth — live editors see your edits stream in.
 `;
 

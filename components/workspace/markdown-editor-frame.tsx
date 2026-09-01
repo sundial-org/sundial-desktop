@@ -2,8 +2,8 @@
 
 import type { Editor } from '@tiptap/react';
 import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useDocStyle } from '@/lib/doc-style';
 import { MarkdownToolbar } from './markdown-toolbar';
-import { MarkdownMenuBar } from './markdown-menu-bar';
 
 export type MarkdownPageMargin = 'narrow' | 'normal' | 'wide';
 
@@ -11,14 +11,21 @@ export type MarkdownPageChrome = {
   margin: MarkdownPageMargin;
   header: boolean;
   footer: boolean;
+  /** Page size in inches (Google Docs style only) — defaults to US Letter. */
+  pageWidthIn?: number;
+  pageHeightIn?: number;
 };
+
+export const DEFAULT_PAGE_WIDTH_IN = 8.5;
+export const DEFAULT_PAGE_HEIGHT_IN = 11;
 
 interface MarkdownEditorFrameProps {
   editor: Editor | null;
   readOnly?: boolean;
   hidden?: boolean;
-  showMenuBar?: boolean;
   showToolbar?: boolean;
+  /** Split panes are print:hidden — no Print control and no global @page rule. */
+  hidePrint?: boolean;
   /** When provided, the content card's zoom is controlled by the caller. */
   zoom?: number;
   /** When provided, the content card's line-height is controlled by the caller. */
@@ -31,8 +38,8 @@ export function MarkdownEditorFrame({
   editor,
   readOnly = false,
   hidden = false,
-  showMenuBar = true,
   showToolbar = true,
+  hidePrint = false,
   zoom: zoomProp,
   lineHeight: lineHeightProp,
   pageChrome,
@@ -49,6 +56,9 @@ export function MarkdownEditorFrame({
   const lineHeight = lineHeightProp ?? internalLineHeight;
   const effectivePageChrome = pageChrome ?? internalPageChrome;
   const [width, setWidth] = useState(0);
+  // Document ⋯ menu → "Google Docs style". 'docs' restores the pre-redesign
+  // Google Docs page: a bordered white card with symmetric page margins.
+  const docsPage = useDocStyle() === 'docs';
 
   // Retain the last valid editor so brief recreation cycles (Hocuspocus
   // reconnects, ydoc swaps) don't unmount the toolbar visually.
@@ -83,59 +93,102 @@ export function MarkdownEditorFrame({
     return <>{children}</>;
   }
 
-  const showAnyChrome = showMenuBar || showToolbar;
-  const placeholderHeight = showMenuBar && showToolbar ? 'h-[76px]' : 'h-[40px]';
   const margin = effectivePageChrome.margin;
-  const pagePaddingClass =
-    margin === 'narrow'
-      ? 'px-6 py-8 lg:px-8'
+  // Obsidian style is asymmetric on purpose: the first line should sit near
+  // the top of the pane (Obsidian/VS Code) instead of below a full page-margin
+  // of dead space. Only the SCREEN padding is trimmed — print still uses
+  // --print-margin below, so the printed page keeps its even margins. Google
+  // Docs style keeps the even page margins on screen too.
+  const pagePaddingClass = docsPage
+    ? margin === 'narrow'
+      ? 'py-8'
       : margin === 'wide'
-        ? 'px-14 py-12 lg:px-20'
-        : 'px-10 py-10 lg:px-14 lg:py-12';
+        ? 'py-12'
+        : 'py-10 lg:py-12'
+    : margin === 'narrow'
+      ? 'pt-2 pb-8'
+      : margin === 'wide'
+        ? 'pt-8 pb-12'
+        : 'pt-2 pb-10 lg:pt-3 lg:pb-12';
+  // Horizontal margin scales with the PANE, not the viewport: a split pane /
+  // chat-squeezed editor in a wide window used to keep the `lg:` margin and
+  // leave a ~230px text column. Percentage padding resolves against the
+  // containing block (this frame), so at a full-width pane (≳ 870px) these are
+  // the old fixed values (56px normal, 80px wide, 32px narrow) and slope down
+  // to their floor by ~400px, where the primary's total gutter meets the split
+  // pane's 16px. Percentages, not a container query: `container-type` was a
+  // containing block for the editor's non-portaled position:fixed popovers on
+  // pre-Safari-18 WKWebView (desktop min macOS 13.5).
+  const pagePaddingInline =
+    margin === 'narrow'
+      ? 'clamp(0.5rem, 8% - 2rem, 2rem)'
+      : margin === 'wide'
+        ? 'clamp(1rem, 16% - 4rem, 5rem)'
+        : 'clamp(0.75rem, 12% - 3rem, 3.5rem)';
   // Printed page margin (the on-screen padding is in px; print wants inches).
   const printMargin = margin === 'narrow' ? '0.5in' : margin === 'wide' ? '1in' : '0.75in';
+  // Docs-style page size: a real sheet, in CSS inches (US Letter default).
+  const pageWidthIn = effectivePageChrome.pageWidthIn ?? DEFAULT_PAGE_WIDTH_IN;
+  const pageHeightIn = effectivePageChrome.pageHeightIn ?? DEFAULT_PAGE_HEIGHT_IN;
 
   return (
     <div ref={frameRef} className="flex w-full flex-col">
-      {showAnyChrome ? (
-        <div className="relative rounded-xl border border-stone-200 bg-stone-100 shadow-[0_1px_2px_rgba(28,25,23,0.05)]">
+      {docsPage && !hidePrint ? (
+        // The picked page size must ALSO be the printed paper size — the
+        // print stylesheet only handles zoom/margins, and without @page the
+        // browser paginates 6×9 content onto default Letter (Codex r8).
+        // @page can't read CSS vars in current engines, hence the literal rule.
+        <style>{`@page { size: ${pageWidthIn}in ${pageHeightIn}in; }`}</style>
+      ) : null}
+      {showToolbar ? (
+        <div className="sticky top-0 z-10 rounded-xl border border-stone-200 bg-white shadow-[0_1px_2px_rgba(28,25,23,0.05)]">
           {displayEditor ? (
-            <>
-              {showMenuBar ? (
-                <MarkdownMenuBar editor={displayEditor} readOnly={readOnly} />
-              ) : null}
-              {showToolbar ? (
-                <MarkdownToolbar
-                  editor={displayEditor}
-                  readOnly={readOnly}
-                  containerWidth={width}
-                  zoom={zoom}
-                  onZoomChange={setInternalZoom}
-                  lineHeight={lineHeight}
-                  onLineHeightChange={setInternalLineHeight}
-                  pageChrome={effectivePageChrome}
-                  onPageChromeChange={setInternalPageChrome}
-                />
-              ) : null}
-            </>
-          ) : (
-            <div
-              className={`${placeholderHeight} bg-stone-50/60`}
-              aria-hidden
+            <MarkdownToolbar
+              editor={displayEditor}
+              readOnly={readOnly}
+              containerWidth={width}
+              hidePrint={hidePrint}
+              zoom={zoom}
+              onZoomChange={setInternalZoom}
+              lineHeight={lineHeight}
+              onLineHeightChange={setInternalLineHeight}
+              pageChrome={effectivePageChrome}
+              onPageChromeChange={setInternalPageChrome}
             />
+          ) : (
+            <div className="h-9 bg-stone-50/60" aria-hidden />
           )}
         </div>
       ) : null}
       <div
         data-testid="editor-zoom-container"
         data-print-root
-        // Flat page: the document renders directly on the white panel (no
-        // card border/shadow) — the padding keeps the reading measure.
-        className={`${showAnyChrome ? 'mt-2' : ''} bg-white ${pagePaddingClass}`}
+        // Obsidian (flat) page: the document renders directly on the white
+        // panel (no card border/shadow) — the padding keeps the reading
+        // measure. Google Docs page: a white card on the shell's gray desk.
+        // The sheet is the picked page size in inches, but never wider than
+        // the pane: a fixed-inch sheet in a narrow pane slid under the chat
+        // panel / comment lane and read as a clipped page (Belinda). maxWidth
+        // caps the SCREEN sheet only — print resets it (max-width: none in
+        // @media print) so sub-100% zoom can still widen the root back out.
+        // Sharp-ish corners (rounded-sm): a real sheet, like Docs/Word.
+        className={`${showToolbar ? 'mt-2' : ''} bg-white ${
+          docsPage
+            ? 'mx-auto max-w-full rounded-sm border border-stone-200 shadow-[0_1px_2px_rgba(28,25,23,0.05)] '
+            : ''
+        }${pagePaddingClass}`}
         style={{
-          transform: zoom === 100 ? undefined : `scale(${zoom / 100})`,
-          transformOrigin: 'top left',
-          width: zoom === 100 ? undefined : `${(100 * 100) / zoom}%`,
+          paddingInline: pagePaddingInline,
+          // CSS zoom, NOT transform scale: zoom re-lays-out and re-rasterizes
+          // text at the target size (like the print path), while a composited
+          // scale() rasterizes at 100% and stretches the layer — which is what
+          // made the doc (the big in-file title most visibly) blurry at any
+          // non-100 zoom. Layout under zoom self-compensates, so the IDE
+          // width-compensation trick is gone; the docs sheet keeps its
+          // fixed-inch size in its own (zoomed) coordinates.
+          zoom: zoom === 100 ? undefined : zoom / 100,
+          width: docsPage ? `${pageWidthIn}in` : undefined,
+          minHeight: docsPage ? `${pageHeightIn}in` : undefined,
           // Printing reads these (see @media print in globals.css): the zoom
           // becomes the printed text size and the margin becomes the page padding.
           ['--print-zoom' as string]: zoom / 100,

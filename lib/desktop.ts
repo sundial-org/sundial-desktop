@@ -1,4 +1,6 @@
 const DESKTOP_FLAG = 'sundial:isDesktop';
+/** Mirrored as a cookie so proxy.ts can keep "/" from trapping the shell. */
+export const DESKTOP_COOKIE = 'sundial_desktop';
 
 /**
  * True when running inside the Tauri desktop shell (tauri/). Tauri reaches the
@@ -13,13 +15,61 @@ const DESKTOP_FLAG = 'sundial:isDesktop';
 export function isDesktopApp(): boolean {
   if (typeof window === 'undefined') return false;
   try {
-    if (new URLSearchParams(window.location.search).get('sundialDesktop') === '1') {
+    const desktop =
+      new URLSearchParams(window.location.search).get('sundialDesktop') === '1' ||
+      sessionStorage.getItem(DESKTOP_FLAG) === '1';
+    if (desktop) {
       sessionStorage.setItem(DESKTOP_FLAG, '1');
-      return true;
+      // Session-scoped like the flag above: the shell re-sends the launch param
+      // every start, and a browser that once saw a debug link forgets it on
+      // close. Mirrored from the stored branch too — a webview that latched
+      // the flag under pre-cookie code must still pick the cookie up.
+      document.cookie = `${DESKTOP_COOKIE}=1; Path=/; SameSite=Lax`;
     }
-    return sessionStorage.getItem(DESKTOP_FLAG) === '1';
+    return desktop;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Click handler for external `target="_blank"` links. The desktop shell's
+ * webview drops `target="_blank"` (and released builds predate the opener
+ * IPC permission), so those links silently no-op. But the shell intercepts
+ * ANY off-site navigation and hands it to the system browser (see
+ * tauri/src-tauri/src/lib.rs `leaves_app`), on every shell version — so in
+ * the shell we navigate in place instead. Browsers keep the normal _blank.
+ */
+export function openExternalOnDesktop(event: {
+  preventDefault: () => void;
+  currentTarget: { href: string };
+}): void {
+  if (!isDesktopApp()) return;
+  event.preventDefault();
+  window.location.assign(event.currentTarget.href);
+}
+
+const HIDE_TOP_BAR_KEY = 'sundial:hide-top-bar';
+
+/** Desktop-shell preference (the rail's ⋮ menu): hide the top bar + tab
+ *  strips, making the shell run the web's bar-less layout. Read synchronously
+ *  (like the shell flag) because the pane-snapshot restore needs it before
+ *  React state settles. Meaningless in the browser build, which is always
+ *  bar-less. */
+export function hideTopBarPreferred(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.localStorage.getItem(HIDE_TOP_BAR_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function setHideTopBarPreferred(hidden: boolean): void {
+  try {
+    window.localStorage.setItem(HIDE_TOP_BAR_KEY, hidden ? '1' : '0');
+  } catch {
+    /* private mode — the toggle still applies for this session */
   }
 }
 

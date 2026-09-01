@@ -8,42 +8,40 @@ import { SunnyLottie } from '@/components/sunny-lottie';
 import { isLatexSourceFile } from '@/lib/sync/policy';
 import { useAuth, useClerk, useUser, SignInButton } from '@/lib/auth/optional-auth';
 import {
-  ArrowLeftIcon,
-  ArrowSquareOutIcon,
   CaretDownIcon,
   CaretRightIcon,
   CaretUpIcon,
   ChatTeardropIcon,
-  MagnifyingGlassIcon,
-  FilePlusIcon,
+  ChatCircleDotsIcon,
   TextAaIcon,
   ChatTextIcon,
-  CodeIcon,
   CreditCardIcon,
+  CloudIcon,
   DiscordLogoIcon,
-  ExportIcon,
+  DotsThreeVerticalIcon,
+  StackSimpleIcon,
   EyeIcon,
-  FileTextIcon,
-  FolderSimpleIcon,
-  GearSixIcon,
-  GithubLogoIcon,
   GlobeHemisphereWestIcon,
+  LockSimpleIcon,
+  FileTextIcon,
+  GearSixIcon,
+  SignOutIcon,
+  GithubLogoIcon,
   DetectiveIcon,
-  HouseIcon,
   KeyIcon,
+  KeyboardIcon,
   LightningIcon,
-  ChatsCircleIcon,
+  ListBulletsIcon,
   ListIcon,
   SparkleIcon,
   MegaphoneIcon,
   NotePencilIcon,
+  PaintBrushIcon,
   ClockCounterClockwiseIcon,
   SidebarSimpleIcon,
   SunIcon,
-  WrenchIcon,
   // PlugsConnectedIcon, // Apps (Composio connectors) icon hidden for now
   PlusIcon,
-  UserIcon,
   UsersThreeIcon,
   XIcon,
   CheckCircleIcon,
@@ -54,6 +52,7 @@ import { brandForAgentId } from '@/lib/workspace/agent-brand';
 import { getAssistantBrand } from '@/components/workspace/provider-icons';
 import {
   addPanel,
+  chatFirstArrivalPending,
   legacyModeToOpenPanels,
   normalizeOpenPanels,
   removePanel,
@@ -66,32 +65,46 @@ import {
   nextWorkspaceHistoryMethod,
   resolvePopstateChatAction,
   shouldMirrorFileIdToUrl,
+  shouldSwapArrivalToDocument,
+  latchPanelView,
+  readPaneSnapshot,
+  persistPaneSnapshot,
   WORKSPACE_LAYOUT_STORAGE_KEY,
   workspaceLayoutStorageKey,
   type CenterPanel,
   type WorkspaceViewKey,
   type WorkspaceViewRefs,
 } from '@/lib/workspace/layout';
+import { pickDefaultDocument } from '@/lib/workspace/default-document';
+import { fetchWithDeadline } from '@/lib/workspace/fetch-deadline';
 import { ANON_AUTHOR_PREFIX, anonDisplayName, toAnonAuthorId } from '@/lib/auth/anon-identity';
 import { createLocalBinaryUpload, createLocalWorkspaceFetch } from '@/lib/local/workspace-api';
 import { ApiFetchProvider } from '@/lib/workspace/api-fetch-context';
 import { getLaunchParam, resolveSidecarConfig, sidecar as localSidecar, type SidecarConfig } from '@/lib/local/sidecar';
+import { workspaceTitleLabel } from '@/lib/local/project-label';
 import { desktopCredentialsUsable } from '@/lib/local/desktop-creds';
 import { useDesktopCredentials } from '@/lib/local/use-desktop-credentials';
 import { useDesktopProfile } from '@/lib/local/use-desktop-profile';
 import { useLocalShares } from '@/lib/local/use-local-shares';
+import { useLocalFileEventsKey } from '@/lib/local/use-local-file-events-key';
 import { excludeSelfPeers, useLocalCollabPresence } from '@/lib/local/use-local-presence';
-import { useWorkspaceCollabSocket } from '@/lib/workspace/collab-socket-context';
-import { ShareLocalModal } from '@/components/local/share-local-modal';
+import { prefetchProvider, useWorkspaceCollabSocket } from '@/lib/workspace/collab-socket-context';
+import { deriveShowOffline, useCollabSocketStatus } from '@/lib/workspace/collab-offline';
+import { ShareLocalModal, type ShareScope } from '@/components/local/share-local-modal';
 import { useClaimAnonOnLogin } from '@/lib/auth/use-claim-anon-on-login';
 import { buildReturnPath } from '@/lib/auth/use-require-signin';
 import type { Editor } from '@tiptap/react';
-import { CollabEditor, type PendingAddition } from '@/components/workspace/collab-editor';
+import { CollabEditor, type PendingAddition, type RevealPeerRequest } from '@/components/workspace/collab-editor';
 import { EditorTabStrip } from '@/components/workspace/editor-tab-strip';
+import { preloadMonaco } from '@/components/workspace/code-viewer';
 import { PaneDropOverlay, SplitEditorPaneReviewBody, useDocAlignLeft } from '@/components/workspace/split-editor-pane';
+import { useDocStyle } from '@/lib/doc-style';
 import {
   closeTab as closePaneTab,
+  collapseToPrimaryPane,
   createInitialPanes,
+  dropTabElsewhere,
+  resolveOpenTargetPaneId,
   EDITOR_TAB_MIME,
   flattenPanesForWeb,
   MAX_EDITOR_PANES,
@@ -116,18 +129,33 @@ import {
   type EditorPane,
   type TabDragPayload,
 } from '@/lib/workspace/editor-panes';
-import { chatTab, chatIdOfTab, diffIdOfTab, isChatTab, isSpecialTab } from '@/lib/workspace/editor-tabs';
-import { CollabCodeEditor, type CodeEditorHandle } from '@/components/workspace/collab-code-editor';
-import { CommandPalette, type CommandPaletteAction } from '@/components/workspace/command-palette';
-import { LatexPdfPane } from '@/components/workspace/latex-pdf-pane';
-import { LatexWorkbench, type LatexViewMode } from '@/components/workspace/latex-workbench';
-import { LatexEditorToolbar, latexEditorRefHandlers } from '@/components/workspace/latex-editor-toolbar';
-import { useLatexCompile } from '@/components/workspace/use-latex-compile';
-import { CompileSummaryBar } from '@/components/workspace/compile-summary-bar';
+import { chatTab, chatIdOfTab, diffTab, diffIdOfTab, isChatTab, isDiffTab, isLauncherTab, isReviewTab, isSpecialTab, reviewTab, reviewChatIdOfTab, LAUNCHER_TAB } from '@/lib/workspace/editor-tabs';
+import { parseWikiTarget, resolveWorkspacePath } from '@/lib/markdown/anchors.mjs';
+import { scrollEditorToAnchor, type WikiAnchor } from '@/lib/workspace/anchor-navigation';
+import type { CodeEditorHandle } from '@/components/workspace/collab-code-editor';
+import type { CommandPaletteAction } from '@/components/workspace/command-palette';
+import type {
+  PdfCommentMarker,
+  PdfCommentSelection,
+  SyncTexJump,
+} from '@/components/workspace/latex-pdf-viewer';
+import { matchPdfSelectionToSource } from '@/lib/latex/pdf-comment-anchor';
+import type { LatexViewMode } from '@/components/workspace/latex-workbench';
+import { PanelSurfaceSwitcher, type PanelNavTarget } from '@/components/workspace/panel-surface-switcher';
+import { applyPanelCommand, usePanelControl } from './_components/use-panel-control';
+import type { PanelSurface } from '@/lib/workspace/panel-control';
+import { LatexCompileControls, LatexToolbarRow, latexEditorRefHandlers, type LatexFixBlocked } from '@/components/workspace/latex-editor-toolbar';
+import { useLatexCompile, type LocalEditTracker } from '@/components/workspace/use-latex-compile';
+import { useLatexAutoFix, useLatexAutoCompilePref } from '@/components/workspace/use-latex-autofix';
+import { useLatexAnalytics } from '@/components/workspace/use-latex-analytics';
 import { buildCompileFixPrompt } from '@/lib/latex/fix-prompt';
-import { parseSyncTex, type SyncTexIndex } from '@/lib/latex/synctex';
+import { LATEX_FIX_CHAT_KIND, LATEX_FIX_CHAT_TITLE, LATEX_FIX_CHAT_MODEL, ensureLatexFixChat } from '@/lib/latex/fix-chat';
+import { parseSyncTex, pathFromRoot, pathRelativeToRoot, type SyncTexIndex } from '@/lib/latex/synctex';
 import { latexCompileTarget, useLatexMainDocument } from '@/components/workspace/latex-main-document';
-import { buildActionableWorkspacePendingAdditions, defaultAuthorLabel } from '@/lib/workspace/pending-additions';
+import { buildActionableWorkspacePendingAdditions, buildSuggestionAuthors, defaultAuthorLabel } from '@/lib/workspace/pending-additions';
+import { buildAuthorshipRanges } from '@/lib/workspace/authorship-lens';
+import { readJsonResponse } from '@/lib/http/read-json-response';
+import type { FileBlameResponse } from '@/lib/workspace/api-shared-types';
 import { pollFilesUntilSettled as pollFilesUntilSettledLoop } from '@/lib/workspace/poll-files-until-settled';
 import { scrollFraction, restoreScrollFraction } from '@/lib/workspace/scroll-fraction';
 import { buildSunnyAvatarMap, DEFAULT_SUNNY_AVATAR } from '@/lib/workspace/sunny-avatars';
@@ -150,49 +178,59 @@ import { useFilePendingTurns, type FilePendingTurn } from '@/lib/workspace/use-f
 import { useDocEditsRealtimeKey } from '@/lib/workspace/use-doc-edits-realtime-key';
 import { buildPendingEditsInvalidationToken } from '@/lib/workspace/pending-edits-invalidation';
 import { useChatTurnEdits } from '@/lib/workspace/use-chat-turn-edits';
-import { BillingSection } from '@/components/workspace/billing-section';
 import { CreditBalancePill } from '@/components/workspace/credit-balance-pill';
-import { UserGitHubTab } from '@/components/workspace/user-github-tab';
-import { UserOverleafTab } from '@/components/workspace/user-overleaf-tab';
-import { UserApiKeysTab } from '@/components/workspace/user-api-keys-tab';
-import { AddRepoModal } from '@/components/workspace/add-repo-modal';
-import { AddOverleafModal } from '@/components/workspace/add-overleaf-modal';
-import { LinkTextChatModal } from '@/components/workspace/link-text-chat-modal';
+import dynamic from 'next/dynamic';
 import { useLinkedRepos } from '@/lib/workspace/use-linked-repos';
-import { CommitsRail } from '@/components/workspace/commits-rail';
-// Tasks (scheduled chats) hidden from the UI for now — re-enable later.
-// import { TasksRail } from '@/components/workspace/tasks-rail';
-import { CommitDiffViewer } from '@/components/workspace/commit-diff-viewer';
+import { SchedulesPanel, ChatHeaderScheduleText } from '@/components/workspace/schedules-panel';
 import { track } from '@/lib/analytics/track';
-import { RawMarkdownEditor } from '@/components/workspace/raw-markdown-editor';
 import { MarkdownTOC } from '@/components/workspace/markdown-toc';
 import type { TocHeading } from '@/lib/markdown/toc';
 import { MarkdownEditorFrame, type MarkdownPageChrome } from '@/components/workspace/markdown-editor-frame';
 import { EditModeControl } from '@/components/workspace/edit-mode-control';
 import { useDocumentEditMode } from '@/lib/workspace/document-edit-mode-context';
-import { MarkdownToolbar } from '@/components/workspace/markdown-toolbar';
+import { MarkdownToolbar, ToolbarOverflowItems, toolbarTierFlags, type ToolbarTierFlags } from '@/components/workspace/markdown-toolbar';
 import { MarkdownMenuBar } from '@/components/workspace/markdown-menu-bar';
+import { DocumentActionsMenu } from '@/components/workspace/document-actions-menu';
+import { DocPaneHeader } from '@/components/workspace/doc-pane-header';
 import { Spinner } from '@/components/ui/spinner';
-import { DocCommentsPanel } from '@/components/workspace/doc-comments-panel';
-import { ImageViewer } from '@/components/workspace/viewers/image-viewer';
-import { CSVViewer } from '@/components/workspace/viewers/csv-viewer';
-import { JSONViewer } from '@/components/workspace/viewers/json-viewer';
-import { HTMLViewer } from '@/components/workspace/viewers/html-viewer';
+import { commentMentionHandle } from '@/lib/workspace/doc-comments';
+import { resolveCommentIdentity } from '@/lib/workspace/comment-identity';
 import { useWorkspaceUploads } from '@/components/workspace/use-workspace-uploads';
 import { uploadImageFromEditor } from '@/lib/workspace/upload-image-from-editor';
 import { safeGetEditorText } from '@/lib/workspace/safe-editor-text';
 import type { WorkspaceFileRow } from '@/lib/workspace/types';
 import { createBrowserClient } from '@/lib/supabase/browser';
 import { useVoiceInput } from '@/lib/hooks/use-voice-input';
-import { ensureUniquePath, formatBytes, sanitizeFilename } from '@/lib/workspace/uploads';
+import { useAfterFirstPaint } from '@/lib/hooks/use-after-first-paint';
+import { MAX_ZIP_ENTRY_COUNT, ensureUniquePath, formatBytes, resolveDraftPath, sanitizeFilename } from '@/lib/workspace/uploads';
+import { dropEntriesFrom, readDroppedEntries } from '@/lib/workspace/dropped-entries';
 import { type WorkspaceKind } from '@/lib/workspace/kinds';
 import { ModalShell } from '@/components/modal-shell';
 import { WorkspaceTab, SecretsTab, findRootAgentsFile } from '@/components/workspace/config-tab';
-import { PreferencesSection } from '@/components/workspace/preferences-section';
-import { ReviewPanel } from '@/components/workspace/review-panel';
-import { DiffReviewPanel } from '@/components/workspace/diff-review-panel';
-import { getCachedTurnEdits } from '@/lib/workspace/turn-edits-cache';
-import { clerkNeverLoads, isDesktopApp as isDesktopShell } from '@/lib/desktop';
+import { PreferencesSection, ShortcutsSection } from '@/components/workspace/preferences-section';
+import {
+  applyAutocompleteFlagFromUrl,
+  isAutocompleteEnabled,
+} from '@/lib/workspace/autocomplete/flag';
+import { getFlag, hydrateFlags, setFlag } from '@/lib/flags/client';
+import {
+  DEFAULT_AUTOCOMPLETE_MODE,
+  getAutocompleteMode,
+  isAutocompleteMode,
+  setAutocompleteMode,
+  type AutocompleteMode,
+} from '@/lib/workspace/autocomplete/mode';
+import { flagDefaults, resolveFlags } from '@/lib/flags/registry';
+import { AppearanceSection } from '@/components/workspace/appearance-section';
+import { getCachedTurnEdits, setTurnEditsCacheWorkspace } from '@/lib/workspace/turn-edits-cache';
+import {
+  clerkNeverLoads,
+  hideTopBarPreferred,
+  isDesktopApp as isDesktopShell,
+  openExternalOnDesktop,
+  setHideTopBarPreferred,
+} from '@/lib/desktop';
+import { formatShortcut, isMacPlatform } from '@/lib/workspace/shortcuts';
 import { computeSessionDurationSeconds } from '@/lib/workspace/agent-runtime';
 import {
   buildWorkspacePath,
@@ -200,7 +238,7 @@ import {
   buildWorkspaceChatPath,
 } from '@/lib/workspace/paths';
 import { CopyLinkButton } from '@/components/workspace/copy-link-button';
-import { FileShareMenu } from '@/components/workspace/file-share-menu';
+import { FileShareButton } from '@/components/workspace/file-share-button';
 import { EditableChatTitle } from '@/components/workspace/editable-chat-title';
 import { findByIdRef, findIndexByIdRef, resolveWorkspaceId, toShortIdRef } from '@/lib/workspace/public-ids';
 import {
@@ -223,9 +261,14 @@ import {
   type ChatHarness,
   type ChatRuntimePickerOption,
 } from '@/lib/workspace/chat-runtime';
+import { engineDetected, stampableHarness } from '@/lib/workspace/default-harness';
 import { useChatModels } from '@/lib/workspace/use-models';
+import {
+  buildChatTranscript,
+  conversationMessages,
+  type TranscriptMessage,
+} from '@/lib/workspace/chat-transcript';
 import type { ConnectedAppSummary } from '@/lib/composio/types';
-import { AppsPanel } from './_components/apps-panel';
 import { useWorkspaceAppConnectionCallback } from './_components/workspace-app-connection';
 import {
   useActiveChatForeignUserMessages,
@@ -238,8 +281,8 @@ import {
   useWorkspaceChatListEffects,
   useWorkspaceChatSidebarEffects,
 } from './_components/workspace-chat-runtime-effects';
-import { useSundialChat } from '@/lib/agent/use-sundial-chat';
-import { useRunCompletionCue } from '@/lib/agent/use-run-completion-cue';
+import { backfillTurnRows, useSundialChat } from '@/lib/agent/use-sundial-chat';
+import { isHardStreamOpenFailure, isSendStartFailure } from '@/lib/agent/sundial-chat-transport';
 import { decideChatAction } from '@/lib/agent/chat-action';
 import { useWorkspaceFileLifecycle, type WorkspaceStorageUsage } from './_components/workspace-file-lifecycle';
 import {
@@ -247,14 +290,27 @@ import {
   useWorkspaceFileEditingEffects,
   useWorkspaceFileInputEffects,
 } from './_components/workspace-file-ui-effects';
-import { useWorkspaceShare, shareOrigin } from './_components/workspace-share';
+import { useWorkspaceShare, useWorkspaceAudienceProbe, shareOrigin, isLinkSharedInfo } from './_components/workspace-share';
+import { PathShareModal, usePathShares } from './_components/path-share-modal';
+import {
+  broaderAccessLabel,
+  fileShareModalScope,
+  fileShareStatus,
+  fileShareTarget,
+  localSharedScopeMap,
+  overlappingPathShares,
+} from './_components/file-share-status';
+import { PATH_SHARE_TOKEN_PARAM, holdsRootGrantOnly, pathCapability, type PathGrant } from '@/lib/workspace/path-grants';
+import { appendPathShareTokenToUrl, currentPathShareToken, withPathShareToken } from '@/lib/workspace/path-share-token-client';
+import { usePathShareRealtimeAuthReady } from '@/lib/workspace/use-path-share-realtime-ready';
 import { DocColumnControls, DocFileNameControl } from './_components/doc-column-controls';
 import { useWorkspaceComments, WorkspaceCommentContextMenu } from './_components/workspace-comments';
-import { WorkspaceShareModal } from './_components/workspace-share-modal';
+import { TopbarShareButton } from './_components/topbar-share-button';
 import { LocalAgentModeModal, WorkspaceLocalAgentModal, useWorkspaceLocalAgent } from './_components/workspace-local-agent-modal';
-import { HostedConnectorTab } from '@/components/workspace/hosted-connector-tab';
 import { useWorkspaceLinkCopy } from './_components/workspace-link-copy';
-import { SidebarIdentity } from './_components/sidebar-identity';
+import { ClaimOwnershipNudge, SidebarIdentity } from './_components/sidebar-identity';
+import { ClaimKeyGate } from './_components/claim-key-gate';
+import { readAnonCookie } from '@/lib/auth/anon-identity-client';
 import { useWorkspaceNotice, WorkspaceNoticeToast } from './_components/workspace-notice';
 import { useWorkspaceStartupIntents } from './_components/workspace-startup-intents';
 import { useWorkspaceSwitcher, WorkspaceSwitcherMenu } from './_components/workspace-switcher';
@@ -275,6 +331,8 @@ import {
   toChatPreviewTextFromMessage,
   DRAFT_CHAT_PREFIX,
   isDraftChatId,
+  canManageChat,
+  canPinChat,
   type ChatStatus,
   type ChatLoopLatestStep,
   type ChatLoopSummary,
@@ -286,6 +344,19 @@ import {
 } from './_components/workspace-chat-model';
 import { FilesTabPanel } from './_components/files-tab-panel';
 import { ProjectSidebar } from './_components/project-sidebar';
+import { SundialSupport } from '@/components/support/sundial-support';
+import { ShellNavControls, SidebarTopChrome } from './_components/sidebar-top-chrome';
+import { GetSetUpCard } from '@/components/desktop/get-set-up-card';
+import { OpenWithModal, OpenWithRow } from '@/components/workspace/open-with-modal';
+import { WorkspaceCreationOverlay, WorkspaceRouteLoading } from '@/components/workspace/workspace-route-loading';
+import { WELCOME_TEX_INITIAL_COMPILE_ERROR, WELCOME_TEX_PATH } from '@/lib/workspace/welcome-doc';
+import {
+  clearOnboardingCreationTiming,
+  onboardingElapsedMs,
+  STARTER_DIAGNOSTIC_BUDGET_MS,
+  WORKSPACE_VISIBLE_BUDGET_MS,
+} from '@/lib/workspace/onboarding-performance';
+import { markOnboardingLandingDone, readOnboardingLandingDone } from '@/lib/workspace/onboarding-tour';
 import {
   DEFAULT_SIDEBAR_SECTIONS,
   expandSection,
@@ -298,24 +369,27 @@ import {
 import { prefetchRepositories } from '@/lib/github/repos-client';
 import {
   computeReorder,
+  mergeParentOrder,
   readFileOrder,
   ROOT_ORDER_KEY,
+  sameFileOrder,
+  sanitizeFileOrder,
   sortByManualOrder,
   writeFileOrder,
   type FileOrderMap,
 } from '@/lib/workspace/file-order';
-import { AnchoredDropdown } from '@/components/workspace/anchored-dropdown';
-// Scheduled tasks hidden from the UI for now — re-enable later.
-// import { ScheduleChip } from '@/components/workspace/schedule-chip';
+import { AnchoredDropdown, isInFloatingActionMenu } from '@/components/workspace/anchored-dropdown';
 import {
   shouldCollapseLatexPdfForChatOpen,
   isAgentTurnJustFinished,
   isAgentTurnJustStarted,
   type LatexChatCollapseState,
 } from '@/lib/workspace/latex-layout';
+import { buildLatexMarkers, resolveLatexLogPath } from '@/lib/workspace/latex-log-navigation';
 import { WorkspaceChatPane } from './_components/workspace-chat-pane';
-import { LocalEngineOnboarding } from './_components/local-engine-onboarding';
-import { ChatArrivalHero } from './_components/chat-arrival-hero';
+import { ChatArrivalHero, EmptyChatPrompt } from './_components/chat-arrival-hero';
+import { LocalEngineNotice } from './_components/local-engine-notice';
+import { DocStatsSpan } from './_components/doc-stats';
 import { PaneResizeHandle, ResizeHandle } from './_components/resize-handle';
 import {
   useDocumentVisible,
@@ -335,7 +409,6 @@ import {
   formatRelativeTime,
   getFileName,
   getFolderPath,
-  firstEditableTurnEditPath,
   getSidebarListItemStateClasses,
   isBinaryFile,
   isCodeFile,
@@ -349,12 +422,143 @@ import {
   isOfficeFile,
   isPdfFile,
   isTexFile,
+  LocalRootGlyph,
   setSidebarDragGhost,
   shouldDefaultRichViewer,
   WorkspaceEntryIcon,
-  WorkspaceRootGlyph,
 } from './_components/workspace-file-helpers';
 
+// The document-first route should not download every modal, settings surface,
+// review tool, and uncommon viewer before a Markdown file can paint. These
+// chunks are requested only when their existing render guards become true.
+const AddSkillModal = dynamic(
+  () => import('@/components/workspace/add-skill-modal').then((module) => module.AddSkillModal),
+  { ssr: false },
+);
+const CollabCodeEditor = dynamic(
+  () => import('@/components/workspace/collab-code-editor').then((module) => module.CollabCodeEditor),
+  { ssr: false },
+);
+const CommandPalette = dynamic(
+  () => import('@/components/workspace/command-palette').then((module) => module.CommandPalette),
+  { ssr: false },
+);
+const LatexPdfPane = dynamic(
+  () => import('@/components/workspace/latex-pdf-pane').then((module) => module.LatexPdfPane),
+  { ssr: false },
+);
+const LatexWorkbench = dynamic(
+  () => import('@/components/workspace/latex-workbench').then((module) => module.LatexWorkbench),
+  { ssr: false },
+);
+const SyncTexTipCard = dynamic(
+  () => import('@/components/workspace/synctex-tip-card').then((module) => module.SyncTexTipCard),
+  { ssr: false },
+);
+const AutoFixSuggestionCard = dynamic(
+  () => import('@/components/workspace/autofix-suggestion-card').then((module) => module.AutoFixSuggestionCard),
+  { ssr: false },
+);
+const BillingSection = dynamic(
+  () => import('@/components/workspace/billing-section').then((module) => module.BillingSection),
+  { ssr: false },
+);
+const UserGitHubTab = dynamic(
+  () => import('@/components/workspace/user-github-tab').then((module) => module.UserGitHubTab),
+  { ssr: false },
+);
+const UserOverleafTab = dynamic(
+  () => import('@/components/workspace/user-overleaf-tab').then((module) => module.UserOverleafTab),
+  { ssr: false },
+);
+const UserApiKeysTab = dynamic(
+  () => import('@/components/workspace/user-api-keys-tab').then((module) => module.UserApiKeysTab),
+  { ssr: false },
+);
+const AddRepoModal = dynamic(
+  () => import('@/components/workspace/add-repo-modal').then((module) => module.AddRepoModal),
+  { ssr: false },
+);
+const AddOverleafModal = dynamic(
+  () => import('@/components/workspace/add-overleaf-modal').then((module) => module.AddOverleafModal),
+  { ssr: false },
+);
+const LinkTextChatModal = dynamic(
+  () => import('@/components/workspace/link-text-chat-modal').then((module) => module.LinkTextChatModal),
+  { ssr: false },
+);
+const CloudAgentSignInModal = dynamic(
+  () => import('@/components/workspace/cloud-agent-signin-modal').then((module) => module.CloudAgentSignInModal),
+  { ssr: false },
+);
+const CommitsRail = dynamic(
+  () => import('@/components/workspace/commits-rail').then((module) => module.CommitsRail),
+  { ssr: false },
+);
+const CommitDiffViewer = dynamic(
+  () => import('@/components/workspace/commit-diff-viewer').then((module) => module.CommitDiffViewer),
+  { ssr: false },
+);
+const RawMarkdownEditor = dynamic(
+  () => import('@/components/workspace/raw-markdown-editor').then((module) => module.RawMarkdownEditor),
+  { ssr: false },
+);
+const DocCommentsPanel = dynamic(
+  () => import('@/components/workspace/doc-comments-panel').then((module) => module.DocCommentsPanel),
+  { ssr: false },
+);
+const ImageViewer = dynamic(
+  () => import('@/components/workspace/viewers/image-viewer').then((module) => module.ImageViewer),
+  { ssr: false },
+);
+const CSVViewer = dynamic(
+  () => import('@/components/workspace/viewers/csv-viewer').then((module) => module.CSVViewer),
+  { ssr: false },
+);
+const JSONViewer = dynamic(
+  () => import('@/components/workspace/viewers/json-viewer').then((module) => module.JSONViewer),
+  { ssr: false },
+);
+const HTMLViewer = dynamic(
+  () => import('@/components/workspace/viewers/html-viewer').then((module) => module.HTMLViewer),
+  { ssr: false },
+);
+const ReviewPanel = dynamic(
+  () => import('@/components/workspace/review-panel').then((module) => module.ReviewPanel),
+  { ssr: false },
+);
+const DiffReviewPanel = dynamic(
+  () => import('@/components/workspace/diff-review-panel').then((module) => module.DiffReviewPanel),
+  { ssr: false },
+);
+const ChatDiffPanel = dynamic(
+  () => import('@/components/workspace/chat-diff-panel').then((module) => module.ChatDiffPanel),
+  { ssr: false },
+);
+const TurnDiffPanel = dynamic(
+  () => import('@/components/workspace/chat-diff-panel').then((module) => module.TurnDiffPanel),
+  { ssr: false },
+);
+const AuthorshipHoverCard = dynamic(
+  () => import('@/components/workspace/authorship-hover-card').then((module) => module.AuthorshipHoverCard),
+  { ssr: false },
+);
+const AppsPanel = dynamic(
+  () => import('./_components/apps-panel').then((module) => module.AppsPanel),
+  { ssr: false },
+);
+const WorkspaceShareModal = dynamic(
+  () => import('./_components/workspace-share-modal').then((module) => module.WorkspaceShareModal),
+  { ssr: false },
+);
+const HostedConnectorTab = dynamic(
+  () => import('@/components/workspace/hosted-connector-tab').then((module) => module.HostedConnectorTab),
+  { ssr: false },
+);
+const DeleteChatDialog = dynamic(
+  () => import('./_components/delete-chat-dialog').then((module) => module.DeleteChatDialog),
+  { ssr: false },
+);
 const STREAM_IDLE_TIMEOUT_MS = 800;
 const STALE_SESSION_MS = 60_000;
 const STARTING_STATUS_GRACE_MS = 20_000;
@@ -378,6 +582,8 @@ function formatSnippetBlock(snippets: Array<{ text: string; path: string | null 
     .join('\n\n');
 }
 
+// Shown once per install, the first time a chat actually runs on a local engine.
+const LOCAL_ENGINE_NOTICE_KEY = 'sundial:local-engine-notice';
 const PENDING_DRAFT_KEY = 'sundial:pending-send-draft';
 function stashPendingDraft(projectId: string | null | undefined, text: string) {
   if (typeof window === 'undefined' || !projectId || !text.trim()) return;
@@ -449,6 +655,12 @@ type ChatRow = {
   goal_summary?: string | null;
   /** Folder the chat was started in ("New chat in this folder"); null = whole workspace. */
   folder_scope?: string | null;
+  /** Purpose marker for special chats (e.g. 'latex_fix'); null = ordinary chat. */
+  kind?: string | null;
+  /** Path whose new comments are fed to this chat ('*' = whole workspace); null = off. */
+  comment_watch_path?: string | null;
+  /** The watched file's id — authoritative across renames (the path goes stale). */
+  comment_watch_file_id?: string | null;
   /** Folders the chat's turns edited files in (doc_edits attribution). */
   touched_folders?: string[] | null;
   transport_types?: string[] | null;
@@ -465,7 +677,6 @@ const getExternalSession = (chat: Pick<ChatRow, 'external_session'> | null): Ext
   chat?.external_session ?? null;
 const externalAgentLabel = (external: ExternalSessionRef) =>
   CHAT_HARNESS_LABELS[external.agent === 'codex' ? 'openai' : 'claude'];
-const externalAgentHome = (external: ExternalSessionRef) => (external.agent === 'codex' ? '~/.codex' : '~/.claude');
 const externalAgentAuthorId = (external: ExternalSessionRef) => (external.agent === 'codex' ? 'ai:codex' : 'ai:claude-code');
 
 /** Chat-list / header badge for an external agent session: the agent's brand
@@ -515,7 +726,6 @@ type DraftEntry = {
   name: string;
 };
 
-const EDITOR_PANES_KEY_PREFIX = 'sundial:editor-panes:';
 
 function paneSquashStyle(zone: DropZone | undefined): CSSProperties | undefined {
   if (zone === 'right') return { marginRight: '50%' };
@@ -561,6 +771,11 @@ const REVIEW_PANEL_DEFAULT_WIDTH = 480;
 const REVIEW_PANEL_MIN_WIDTH = 320;
 const LEFT_RAIL_WIDTH_STORAGE_KEY = 'sundial:left-rail-width';
 const REVIEW_PANEL_WIDTH_STORAGE_KEY = 'sundial:review-panel-width';
+/** Width share a chat opened FROM a comment thread takes of the pane row — the
+ *  document keeps the rest. The even split every other open gets crushed the
+ *  doc (founder); the pane resize handle's own floor is 0.2, so this sits
+ *  comfortably above the narrowest width the layout supports. */
+const NARROW_CHAT_PANE_SHARE = 0.3;
 
 // Top-bar center-panel switcher: one pill of three independent toggles. Any
 // combination of Editor, Review, and Chat can be open at once.
@@ -584,17 +799,9 @@ function WorkspaceContextIcon() {
 function WorkspacePreferencesIcon() {
   return <GearSixIcon className="ws-icon" weight="regular" aria-hidden />;
 }
-function WorkspaceShareStatusIcon({ status, className }: { status: string | null | undefined; className: string }) {
-  if (status === 'public') {
-    return <GlobeHemisphereWestIcon className={className} weight="regular" aria-hidden />;
-  }
-  if (status === 'shared') {
-    return <UsersThreeIcon className={className} weight="regular" aria-hidden />;
-  }
-  return <UserIcon className={className} weight="regular" aria-hidden />;
+function WorkspaceAppearanceIcon() {
+  return <PaintBrushIcon className="ws-icon" weight="regular" aria-hidden />;
 }
-
-
 function downloadBlob(blob: Blob, fileName: string) {
   const objectUrl = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
@@ -724,8 +931,25 @@ export default function WorkspacePage() {
   const searchParams = useSearchParams();
   const projectSlug = typeof params.slug === 'string' ? params.slug : Array.isArray(params.slug) ? params.slug[0] : '';
   const workspaceRouteContext = useWorkspaceRoute();
-  const projectId = workspaceRouteContext?.projectId ?? resolveWorkspaceId(projectSlug);
+  // Anon ?pshare= links land on a public_id slug the layout can't resolve
+  // server-side (it can't read the token). The files payload returns the real
+  // UUID once the token authorizes; adopt it so realtime subscriptions
+  // (files.project_id=eq.…) and API calls match UUID-keyed rows.
+  const [resolvedProjectId, setResolvedProjectId] = useState<string | null>(null);
+  // The server-resolved id wins: the route context carries the raw slug when
+  // the layout couldn't resolve it (it never sees the token).
+  const projectId = resolvedProjectId ?? workspaceRouteContext?.projectId ?? resolveWorkspaceId(projectSlug);
   const initialFilesPayload = workspaceRouteContext?.initialFiles ?? null;
+  const reportedServerTimingRef = useRef(false);
+  useEffect(() => {
+    const spans = workspaceRouteContext?.initialServerTiming;
+    if (reportedServerTimingRef.current || !spans?.length) return;
+    reportedServerTimingRef.current = true;
+    track('workspace_open_server_performance', {
+      projectId,
+      spans: Object.fromEntries(spans.map(({ name, durationMs }) => [name, Math.round(durationMs)])),
+    });
+  }, [projectId, workspaceRouteContext?.initialServerTiming]);
   // Local (desktop sidecar) mode: same page, swapped data plane. `apiFetch`
   // emulates /api/workspace/* against the sidecar; cloud-only features gate
   // on `isLocalWorkspace` below.
@@ -738,26 +962,57 @@ export default function WorkspacePage() {
     () =>
       localConfig && projectId
         ? createLocalWorkspaceFetch(localConfig, projectId)
-        : (input, init) => fetch(input, init),
+        : // Cloud: forward the sticky ?pshare= link token — an anonymous
+          // path-share guest's only credential — on every workspace call.
+          withPathShareToken((input, init) => fetch(input, init)),
     [localConfig, projectId],
   );
-  // Local engines (the user's own Claude Code / Codex installs) + the
-  // install's default engine for new chats. Optimistic until the probe
-  // answers: engines assumed detected (a wrong guess only mislabels a hint —
-  // the run surfaces the real error) and defaultHarness assumed chosen (so
-  // the first-run onboarding card never flashes for returning users).
-  // defaultHarness: undefined = probe in flight (assume chosen, defer to the
-  // sidecar's stored default), null = probed and never chosen (show the
-  // first-run picker), value = the chosen default.
+  // Local mode serves attachment previews/links from the sidecar, not the
+  // cloud preview proxy (which knows nothing about sidecar project ids).
+  const localAttachmentHref = useMemo(
+    () =>
+      localConfig && projectId
+        ? (attachment: MessageAttachment) =>
+            attachment.path ? localSidecar.fileUrl(localConfig, projectId, attachment.path) : null
+        : undefined,
+    [localConfig, projectId],
+  );
+  // Local engines (the user's own Claude Code / Codex installs) + the engine
+  // new chats run on. There is no upfront chooser: the sidecar resolves the
+  // default from detection (Claude Code, then Codex, else Sunny) unless the
+  // user made an explicit pick. Optimistic until the probe answers: engines
+  // assumed detected (a wrong guess only mislabels a hint — the run surfaces
+  // the real error), defaultHarness undefined = probe in flight.
   const [localEngines, setLocalEngines] = useState<{
     claude: { available: boolean; loggedIn: boolean };
     codex: { available: boolean; loggedIn: boolean };
-    defaultHarness: ChatHarness | null | undefined;
+    defaultHarness: ChatHarness | undefined;
   }>({
     claude: { available: true, loggedIn: true },
     codex: { available: true, loggedIn: true },
     defaultHarness: undefined,
   });
+  // Mirror the sidecar's own adoption (adoptDefaultHarness): drafts and empty
+  // rows follow the install default, so the chip is truthful before the first
+  // message and the send gate reads the engine the run will actually use.
+  const adoptDefaultHarnessLocally = useCallback((harness: ChatHarness | null) => {
+    if (!harness) return; // implicit cloud fallback: rows stay unstamped
+    setChatThreads((prev) =>
+      prev.map((thread) =>
+        thread.chat.harness == null &&
+        (isDraftChatId(thread.chat.id) || (thread.chat.message_count ?? 0) === 0)
+          ? {
+              ...thread,
+              chat: {
+                ...thread.chat,
+                harness,
+                model: thread.chat.model ? coerceModelForHarness(harness, thread.chat.model) : thread.chat.model,
+              },
+            }
+          : thread,
+      ),
+    );
+  }, []);
   useEffect(() => {
     if (!localConfig) return;
     let cancelled = false;
@@ -765,70 +1020,67 @@ export default function WorkspacePage() {
       .localEngines(localConfig)
       .then(({ claude, codex, defaultHarness }) => {
         if (cancelled) return;
-        setLocalEngines({
-          claude,
-          codex,
-          defaultHarness: defaultHarness === null ? null : parseChatHarness(defaultHarness),
-        });
+        const harness = parseChatHarness(defaultHarness);
+        setLocalEngines({ claude, codex, defaultHarness: harness });
+        // The implicit cloud fallback is deliberately NOT stamped: a row (or a
+        // draft that promotes into one) carrying 'vercel' could never follow a
+        // CLI installed later. Unstamped already reads as the Agent.
+        adoptDefaultHarnessLocally(stampableHarness(harness));
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [localConfig]);
+  }, [adoptDefaultHarnessLocally, localConfig]);
   const localEnginesRef = useRef(localEngines);
   localEnginesRef.current = localEngines;
-  const chooseLocalDefaultEngine = useCallback(
-    (harness: ChatHarness) => {
-      setLocalEngines((prev) => ({ ...prev, defaultHarness: harness }));
-      // Mirror the sidecar's legacy-chat adoption (adoptDefaultHarness):
-      // already-loaded empty null-harness chats follow the pick too, so their
-      // labels and the pre-send engine resolution don't need a reload. Only
-      // after the sidecar acks — its rows are what the run actually reads, so
-      // stamping ahead of (or despite a failed) POST would let a send skip
-      // the sign-in gate while the sidecar still runs the chat as Sunny.
-      if (localConfig) {
-        void localSidecar
-          .setDefaultHarness(localConfig, harness)
-          .then(() => {
-            setChatThreads((prev) =>
-              prev.map((thread) =>
-                thread.chat.harness == null && (thread.chat.message_count ?? 0) === 0
-                  ? {
-                      ...thread,
-                      chat: {
-                        ...thread.chat,
-                        harness,
-                        // The sidecar coerces adopted models too — mirror it,
-                        // or the picker shows a model the engine can't run.
-                        model: thread.chat.model
-                          ? coerceModelForHarness(harness, thread.chat.model)
-                          : thread.chat.model,
-                      },
-                    }
-                  : thread,
-              ),
-            );
-          })
-          .catch(() => {});
-      }
-    },
-    [localConfig],
-  );
+  // First-use explanation for a local engine: one inline line, once per
+  // install (the chip carries the standing answer after that).
+  const [localEngineNotice, setLocalEngineNotice] = useState<ChatHarness | null>(null);
+  const noteLocalEngineUse = useCallback((harness: ChatHarness) => {
+    // Only once the engine is actually usable: a missing or logged-out CLI
+    // fails the turn, and burning the once-ever key there would mean the run
+    // that DOES work never gets its explanation.
+    const engines = localEnginesRef.current;
+    if (!engineDetected(harness === 'claude' ? engines.claude : engines.codex)) return;
+    try {
+      if (localStorage.getItem(LOCAL_ENGINE_NOTICE_KEY)) return;
+      localStorage.setItem(LOCAL_ENGINE_NOTICE_KEY, '1');
+    } catch {
+      return; // no storage → never nag, rather than nag on every send
+    }
+    setLocalEngineNotice(harness);
+  }, []);
+  const dismissLocalEngineNotice = useCallback(() => setLocalEngineNotice(null), []);
   // Local presence: awareness peers on the sidecar socket (cloud presence is
   // a Supabase channel local projects don't have). Inert when cloud.
   const workspaceCollabSocket = useWorkspaceCollabSocket(projectId ?? undefined);
   const localCollabPeers = useLocalCollabPresence(workspaceCollabSocket, isLocalWorkspace);
+  // Local projects: the Offline chip reads the sidecar socket itself — the
+  // per-editor status below never updates when a chat tab holds the primary
+  // pane (no editor mounted), which stranded it on 'connecting' → "Offline"
+  // in a perfectly healthy workspace. Idle (null) when cloud.
+  const localSocketStatus = useCollabSocketStatus(isLocalWorkspace ? workspaceCollabSocket : null);
+  // Every url this page (and the hooks it feeds) builds for itself runs
+  // through buildWorkspacePath, so `local` is what keeps a sidecar project id
+  // off the cloud `/w/` route — as a return path it came back to "Workspace
+  // not found", and as a copied link it named a workspace nobody can open.
   const workspaceRouteId = useMemo(
     () =>
-      workspaceRouteContext?.publicId
-        ? { id: projectId, public_id: workspaceRouteContext.publicId }
-        : projectId,
-    [projectId, workspaceRouteContext?.publicId]
+      isLocalWorkspace
+        ? { id: projectId, local: true }
+        : workspaceRouteContext?.publicId
+          ? { id: projectId, public_id: workspaceRouteContext.publicId }
+          : projectId,
+    [isLocalWorkspace, projectId, workspaceRouteContext?.publicId]
   );
   const selectedTeamId = searchParams.get('team')?.trim() || null;
   const deepLinkedFileId = searchParams.get('fileId')?.trim() || null;
   const deepLinkedFilePath = searchParams.get('filePath')?.trim() || null;
+  const onboardingTexIntent = searchParams.get('onboarding') === 'tex';
+  const onboardingPerfReportedRef = useRef<string | null>(null);
+  const onboardingGuideReportedRef = useRef<string | null>(null);
+  const [showOnboardingTexGuide, setShowOnboardingTexGuide] = useState(false);
   const deepLinkedChatId = searchParams.get('chatId')?.trim() || null;
   // Open the chat panel on load: a deep-linked chat (chatId only lands in the
   // URL while chat is open or via a shared chat link, so either way it must be
@@ -859,8 +1111,9 @@ export default function WorkspacePage() {
   const lastFileStorageKey = projectId ? `${LAST_FILE_KEY_PREFIX}${projectId}` : '';
   const router = useRouter();
   const { user, isLoaded: isAuthLoaded } = useUser();
-  const { openSignIn } = useClerk();
+  const { openSignIn, signOut: clerkSignOut } = useClerk();
   const [hasMounted, setHasMounted] = useState(false);
+  const backgroundDataReady = useAfterFirstPaint(hasMounted, projectId);
   // True only inside the macOS Tauri desktop wrapper, which uses an overlay
   // title bar — the traffic-light buttons float over our top bar, so the left
   // controls need to clear them. Defaults false; web/SSR is untouched.
@@ -870,13 +1123,29 @@ export default function WorkspacePage() {
   // chat-right, clicks replace what's displayed (founder call). Distinct from
   // isDesktopApp, which gates macOS traffic-light padding + drag regions.
   const [desktopTabs, setDesktopTabs] = useState(false);
+  // The desktop shell regardless of the top-bar preference — gates the
+  // Settings → Appearance Tabs/No tabs choice (the web build has no choice:
+  // it only ever runs bar-less).
+  const [inDesktopShell, setInDesktopShell] = useState(false);
   useEffect(() => {
     // Desktop shell detected via the launch-URL flag (see lib/desktop.ts);
     // Tauri exposes neither its globals nor a custom UA on the remote origin.
     if (!isDesktopShell()) return;
-    setDesktopTabs(true);
-    if (navigator.userAgent.includes('Macintosh')) setIsDesktopApp(true);
+    setInDesktopShell(true);
+    // The "No tabs" preference puts the shell on the web's bar-less
+    // no-tabs layout — every desktopTabs branch downgrades with it.
+    setDesktopTabs(!hideTopBarPreferred());
+    // macOS traffic-light chrome (72px pad + drag regions) only in the REAL
+    // shell: Tauri's webview is WKWebView, whose UA carries no "Chrome/"
+    // token. A Chrome tab testing with ?sundialDesktop=1 has no traffic
+    // lights to clear — the pad just shoved Home/Sidebar toward the middle.
+    if (navigator.userAgent.includes('Macintosh') && !navigator.userAgent.includes('Chrome')) {
+      setIsDesktopApp(true);
+    }
   }, []);
+  // ⌘ vs Ctrl for shortcut hints. Defaults Mac and corrects after mount so
+  // SSR markup stays stable (same pattern as the theme preference).
+  const macShortcuts = hasMounted ? isMacPlatform() : true;
   // Stable per-browser anonymous id used for cursor name/color. The cookie
   // is the source of truth — minted server-side on the first
   // /api/workspace/host call so the Hocuspocus token always carries a uid.
@@ -910,7 +1179,12 @@ export default function WorkspacePage() {
       cancelled = true;
     };
   }, [user]);
-  useClaimAnonOnLogin(Boolean(user?.id) && !workspaceRouteContext?.local);
+  // Claim-on-login refetches access as soon as the transfer lands, so an
+  // access wall / stale rights clear without a manual reload (the 15s files
+  // poll is only the fallback). reloadFiles is defined later — go via ref.
+  useClaimAnonOnLogin(Boolean(user?.id) && !workspaceRouteContext?.local, () => {
+    void reloadFilesRef.current?.(false);
+  });
   // For ownership comparisons in the transcript: signed-in users compare by
   // Clerk id; anon users compare by their `anon:<rawId>` identity, which is
   // what /api/workspace/messages stamps into metadata.author_user_id.
@@ -919,7 +1193,8 @@ export default function WorkspacePage() {
     [user?.id, anonId],
   );
   const [isMobile, setIsMobile] = useState(false);
-  type MobilePanel = 'chats' | 'files' | null;
+  // 'files' is the unified side panel (files + chats stacked).
+  type MobilePanel = 'files' | null;
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>(null);
   // Below Tailwind's `lg` (1024px) the center-panel switcher drops its text
   // labels (`hidden lg:inline`), leaving three mute icon buttons. Track that
@@ -999,10 +1274,13 @@ export default function WorkspacePage() {
   // lib/workspace/layout.ts for the pure open-set transitions.
   // The initial open-set is the ARRIVAL decision, taken from the URL alone
   // (same on server and client, so hydration is consistent): a plain workspace
-  // URL lands on the chat box on every form factor; editor-intent URLs land on
-  // the document. The desktop hydration effect re-applies this with the STORED
-  // layout folded in (applyStoredDesktopLayout {arrival:true}); mobile keeps
-  // this URL-only decision.
+  // URL lands on the DOCUMENT on every form factor, editor-intent URLs land on
+  // the document too, and only an explicit chat link lands on chat. The desktop
+  // hydration effect re-applies this with the STORED layout folded in
+  // (applyStoredDesktopLayout {arrival:true}); mobile keeps this URL-only
+  // decision. Because the no-stored-layout answer is now the SAME on both
+  // passes (['editor']), the common arrival no longer changes its mind after
+  // hydration — the file-first landing is decided before first paint.
   const [openPanels, setOpenPanels] = useState<CenterPanel[]>(() =>
     // A fresh template pick shows its seeded document beside chat (matches
     // applyFreshDesktopLayout; on mobile the editor wins the single panel).
@@ -1015,13 +1293,23 @@ export default function WorkspacePage() {
           chatIntent: deepLinkChatIntent,
         }),
   );
-  // True while the center shows the chat-first landing default (a plain-URL
-  // arrival, no editor intent). Cleared once acted on: read-only visitors get
-  // swapped to the doc — chat isn't theirs to drive — and the first agent edit
-  // slides the editor in (see the effects below).
+  // True while the center shows chat alone on arrival. Since file-first
+  // arrival that means an explicit chat link or a stored chat-only layout, so
+  // the only thing still keyed off it is the read-only visitor swap below.
   const arrivalChatDefaultRef = useRef(openPanels.length === 1 && openPanels[0] === 'chat');
-  /** Rail the chat-first arrival force-closed, for the read-only restore. */
-  const arrivalClosedRailRef = useRef<'project' | null>(null);
+  /** The initial-file heuristic's pick on a chat-sole arrival (explicit chat
+   *  link / stored chat-only layout): composer context, NOT an open intent —
+   *  the pane mirror must skip it once, or the document paints for a frame
+   *  before the arrival chat claims the pane. Never set on the file-first
+   *  default, where the pick IS the landing surface. */
+  const arrivalPreselectRef = useRef<string | null>(null);
+  /** True only when the non-owner swap below replaced the plain chat-first
+   *  arrival with the document — the one case the legacy chat-reveal must
+   *  not undo. Explicit chat links / restored layouts keep their reveal. */
+  const arrivalSwappedToDocRef = useRef(false);
+  /** Whether the arrival found a stored layout for this workspace (set where
+   *  the stored-layout restore decides it) — a first visit is the absence. */
+  const arrivalHadStoredLayoutRef = useRef(false);
   const [showRawView, setShowRawView] = useState(false);
   // Raw ↔ rendered swap: the two views have different total heights inside the
   // shared `doc-editor-body` scroll container, so a naive toggle clamps scrollTop
@@ -1044,11 +1332,40 @@ export default function WorkspacePage() {
     const el = docEditorBodyRef.current;
     if (el) return restoreScrollFraction(el, docScrollFractionRef.current);
   }, [showRawView]);
-  // The File/Edit/Insert/Format/View menu row is collapsed by default; the
-  // Show/Hide-menus button in the formatting toolbar toggles it open.
-  const [menusHidden, setMenusHidden] = useState(true);
-  // The formatting toolbar is openable, not default chrome (PR #907 one-bar):
-  // desktop hides it until toggled; the choice persists per browser.
+  // URL escape hatch for ghost-text autocomplete: `?autocomplete=on|off`
+  // flips the flag once at page load, before any editor mounts — for this
+  // load only, never persisted. The Settings → Advanced switch is the only
+  // thing that saves; the value is remembered here so the account hydration
+  // below skips (not clobbers) the overridden key.
+  useEffect(() => {
+    urlAutocompleteOverrideRef.current = applyAutocompleteFlagFromUrl();
+  }, []);
+  // Obsidian-style inline title: render the file name as the document's H1
+  // above the content (display only — never written into the markdown).
+  // Toggled from the ⋯ menu; persists per browser.
+  const [showDocTitle, setShowDocTitle] = useState(false);
+  useEffect(() => {
+    try {
+      setShowDocTitle(window.localStorage.getItem('sundial:show-doc-title') === '1');
+    } catch {
+      /* localStorage unavailable — keep the default */
+    }
+  }, []);
+  const toggleDocTitle = useCallback(() => {
+    setShowDocTitle((prev) => {
+      try {
+        window.localStorage.setItem('sundial:show-doc-title', prev ? '0' : '1');
+      } catch {
+        /* ignore */
+      }
+      return !prev;
+    });
+  }, []);
+  // The formatting toolbar is OFF by default in the IDE style (founder,
+  // 2026-08-13, reversing the one-day-old open default). An explicit open via
+  // Aa writes '1' and sticks per browser. The Google Docs style doesn't
+  // consult this at all — its toolbar can NEVER close (docsPage || … at every
+  // gate), exactly like Google Docs itself.
   const [showFormatToolbar, setShowFormatToolbar] = useState(false);
   useEffect(() => {
     try {
@@ -1077,9 +1394,19 @@ export default function WorkspacePage() {
   const [collabStatus, setCollabStatus] = useState<'local' | 'connecting' | 'connected' | 'disconnected'>('connecting');
   const [connectingGraceElapsed, setConnectingGraceElapsed] = useState(false);
   const [chatThreads, setChatThreads] = useState<ChatThread[]>([]);
+  // Mirror for callbacks that must read the current threads without taking
+  // them as a dep (e.g. promotion retries recovering a draft's folder scope).
+  const chatThreadsRef = useRef<ChatThread[]>(chatThreads);
+  chatThreadsRef.current = chatThreads;
   // Rail folder-focus (mirrored up from FilesTabPanel): the chat list scopes
   // to chats that live in — or touched files under — the focused folder.
   const [focusedSidebarFolder, setFocusedSidebarFolder] = useState<string | null>(null);
+  // Doc-header breadcrumb → sidebar: clicking a folder crumb opens the rail
+  // scoped to that folder (nonce re-fires a repeat click on the same crumb).
+  const [sidebarFolderFocusIntent, setSidebarFolderFocusIntent] = useState<{
+    path: string;
+    nonce: number;
+  } | null>(null);
   const [selectedChatIndex, setSelectedChatIndex] = useState(0);
   const [selectedChatSurface, setSelectedChatSurface] = useState<ChatSurface>({ type: 'direct', chatId: null });
   const [connectedApps, setConnectedApps] = useState<ConnectedAppSummary[]>([]);
@@ -1090,6 +1417,25 @@ export default function WorkspacePage() {
   // startup). null = not loaded yet. Seeds `preferredChatModel` for new chats
   // and backs the Settings → Models picker.
   const [savedDefaultModel, setSavedDefaultModel] = useState<string | null>(null);
+  // The autocomplete override from the same /api/user/preferences payload:
+  // `undefined` while it loads, `null` for "no override, use the server
+  // default". Owned here, like the default model, so the Settings panel never
+  // issues a second GET of a document this component already holds.
+  const [savedAutocompleteModel, setSavedAutocompleteModel] = useState<string | null | undefined>(
+    undefined,
+  );
+  // The account-backed flags object (every lib/flags/registry key resolved),
+  // from the same payload. `undefined` while it loads. The client flag store
+  // mirrors it so synchronous readers (e.g. the Monaco provider) keep working.
+  const [savedFlags, setSavedFlags] = useState<Record<string, boolean> | undefined>(undefined);
+  // The autocomplete behavior mode from the same payload; the client store
+  // mirrors it for the Monaco provider's synchronous reads.
+  const [savedAutocompleteMode, setSavedAutocompleteMode] = useState<AutocompleteMode | undefined>(
+    undefined,
+  );
+  // An explicit `?autocomplete=on|off` this load — a runtime-only override
+  // (never persisted anywhere): remembered so account hydration skips it.
+  const urlAutocompleteOverrideRef = useRef<boolean | null>(null);
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [showAppsPicker, setShowAppsPicker] = useState(false);
   const [workspaceMode, setWorkspaceMode] = useState<'assistant' | 'model_only'>('assistant');
@@ -1102,14 +1448,22 @@ export default function WorkspacePage() {
   const appConnectionHandledRef = useRef<string | null>(null);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [showAddRepoModal, setShowAddRepoModal] = useState(false);
+  // null = closed; 'create' arrives via "＋ New schedule" with the form open.
+  const [schedulesPanelMode, setSchedulesPanelMode] = useState<null | 'list' | 'create'>(null);
   const [showAddOverleafModal, setShowAddOverleafModal] = useState(false);
+  const [showOpenWithModal, setShowOpenWithModal] = useState(false);
+  const [showAddSkillModal, setShowAddSkillModal] = useState(false);
   const [linkedReposRefreshKey, setLinkedReposRefreshKey] = useState(0);
   const [selectedCommit, setSelectedCommit] = useState<{ repoId: string; sha: string } | null>(null);
   const {
     repos: linkedRepos,
     findRepoForPath: findLinkedRepoForPath,
     refetch: refetchLinkedRepos,
-  } = useLinkedRepos(cloudProjectId ?? '', linkedReposRefreshKey);
+  } = useLinkedRepos(
+    cloudProjectId ?? '',
+    linkedReposRefreshKey,
+    backgroundDataReady || showAddRepoModal || showAddOverleafModal || showOpenWithModal,
+  );
   // `?modal=` deep links (share/sign-in return paths, starter-doc links) are
   // dispatched by a single consume-and-clear effect near the modal openers.
   const modalDeepLinkParam = searchParams.get('modal');
@@ -1134,6 +1488,10 @@ export default function WorkspacePage() {
   // boundary between panes (PaneResizeHandle). Reset to equal whenever the
   // pane set changes; session-local (ids aren't persisted, so neither is this).
   const [paneGrow, setPaneGrow] = useState<Record<string, number>>({});
+  /** Armed with the pre-open pane-id key by the comment lane's "Open chat":
+   *  NARROW_CHAT_PANE_SHARE is applied only when the open actually created the
+   *  split, so a reused (possibly user-resized) pane keeps its width. */
+  const narrowChatPaneArmedRef = useRef<string | null>(null);
   const paneIdsKey = editorPanes.map((p) => p.id).join('|');
   useEffect(() => setPaneGrow({}), [paneIdsKey]);
   const handlePaneResizeCommit = useCallback((fractions: number[]) => {
@@ -1141,16 +1499,22 @@ export default function WorkspacePage() {
   }, []);
   // The right dock (PR #907 right panel): History (the review timeline) or
   // Outline. Closed by default; the top-bar toggle reopens the last-used view.
-  const [rightDockView, setRightDockView] = useState<'history' | 'outline' | null>(null);
-  const rightDockLastViewRef = useRef<'history' | 'outline'>('history');
-  const openRightDock = useCallback((view: 'history' | 'outline') => {
+  const [rightDockView, setRightDockView] = useState<'history' | 'outline' | 'support' | null>(null);
+  const [supportPanelHost, setSupportPanelHost] = useState<HTMLDivElement | null>(null);
+  const rightDockLastViewRef = useRef<'history' | 'outline' | 'support'>('history');
+  const openRightDock = useCallback((view: 'history' | 'outline' | 'support') => {
     rightDockLastViewRef.current = view;
     setRightDockView(view);
     // A selected Sync commit short-circuits the center to the diff viewer —
     // drop it so the dock actually appears beside the editor.
     setSelectedCommit(null);
   }, []);
-  // The pinned top-right cluster (comments · dock toggle · Share) overlays
+  useEffect(() => {
+    if (savedFlags && !savedFlags.sundial_support_enabled) {
+      setRightDockView((current) => (current === 'support' ? null : current));
+    }
+  }, [savedFlags]);
+  // The pinned top-right cluster (dock toggle · Share) overlays
   // whichever strip row runs beneath it — its measured width is reserved as
   // right padding there so tabs/icons never slide under Share.
   const [topbarRightWidth, setTopbarRightWidth] = useState(0);
@@ -1167,45 +1531,149 @@ export default function WorkspacePage() {
     topbarRightObserver.current.observe(el);
     measure();
   }, []);
-  // The tab strip's ＋ launcher (wireframe new-tab: New file / New chat).
-  const [showNewTabMenu, setShowNewTabMenu] = useState(false);
-  const newTabTriggerRef = useRef<HTMLButtonElement | null>(null);
+  // The floating Home/Sidebar cluster (top bar hidden + rail collapsed),
+  // measured the same way: a sole chat's header shifts right by this width so
+  // its title never runs under the floating controls.
+  const [topbarLeftFloatWidth, setTopbarLeftFloatWidth] = useState(0);
+  const topbarLeftFloatObserver = useRef<ResizeObserver | null>(null);
+  const topbarLeftFloatRef = useCallback((el: HTMLDivElement | null) => {
+    topbarLeftFloatObserver.current?.disconnect();
+    topbarLeftFloatObserver.current = null;
+    if (!el) {
+      setTopbarLeftFloatWidth(0);
+      return;
+    }
+    const measure = () => setTopbarLeftFloatWidth(el.offsetWidth);
+    topbarLeftFloatObserver.current = new ResizeObserver(measure);
+    topbarLeftFloatObserver.current.observe(el);
+    measure();
+  }, []);
+  // The control cluster seated INSIDE the formatting toolbar (mode picker,
+  // and in the Docs style Aa + ⋮ too) — measured so the toolbar's responsive
+  // tiers get only what's left and the two clusters can't collide. Separate
+  // from docControlsRef: the IDE header keeps that one for title centering
+  // while its toolbar carries this cluster at the same time.
+  const [toolbarControlsWidth, setToolbarControlsWidth] = useState(0);
+  const toolbarControlsObserver = useRef<ResizeObserver | null>(null);
+  const toolbarControlsRef = useCallback((el: HTMLDivElement | null) => {
+    toolbarControlsObserver.current?.disconnect();
+    toolbarControlsObserver.current = null;
+    if (!el) {
+      setToolbarControlsWidth(0);
+      return;
+    }
+    const measure = () => setToolbarControlsWidth(el.offsetWidth);
+    toolbarControlsObserver.current = new ResizeObserver(measure);
+    toolbarControlsObserver.current.observe(el);
+    measure();
+  }, []);
+  // The doc header BAR itself, measured for the collapse breakpoint: when the
+  // pane gets this tight the always-on controls fold into the ⋯ menu so the
+  // title keeps room. (Bar width = pane width, so collapsing the controls
+  // can't feed back into this measurement.)
+  const [docHeaderWidth, setDocHeaderWidth] = useState(0);
+  const docHeaderObserver = useRef<ResizeObserver | null>(null);
+  const docHeaderRef = useCallback((el: HTMLDivElement | null) => {
+    docHeaderObserver.current?.disconnect();
+    docHeaderObserver.current = null;
+    if (!el) {
+      setDocHeaderWidth(0);
+      return;
+    }
+    const measure = () => setDocHeaderWidth(el.offsetWidth);
+    docHeaderObserver.current = new ResizeObserver(measure);
+    docHeaderObserver.current.observe(el);
+    measure();
+  }, []);
+  // Mobile's merged bar isn't the doc header row, so it gets the viewport
+  // signal instead: below this width the same collapse applies.
+  const [isNarrowMobile, setIsNarrowMobile] = useState(false);
   useEffect(() => {
-    if (!showNewTabMenu) return;
-    const onPointerDown = (event: MouseEvent) => {
-      const target = event.target instanceof Node ? event.target : null;
-      if (target && newTabTriggerRef.current?.contains(target)) return;
-      if (target instanceof Element && target.closest('[data-floating-action-menu]')) return;
-      setShowNewTabMenu(false);
-    };
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setShowNewTabMenu(false);
-    };
-    document.addEventListener('mousedown', onPointerDown);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onPointerDown);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [showNewTabMenu]);
+    const query = window.matchMedia('(max-width: 479px)');
+    const update = () => setIsNarrowMobile(query.matches);
+    update();
+    query.addEventListener('change', update);
+    return () => query.removeEventListener('change', update);
+  }, []);
+  const collapseDocControls = isMobile ? isNarrowMobile : docHeaderWidth > 0 && docHeaderWidth < 460;
   const editorPanesRef = useRef(editorPanes);
   editorPanesRef.current = editorPanes;
+  // Split panes' live markdown editors, keyed by pane id — the page-built
+  // header/⋮ chrome binds to the pane's own editor. Setters are memoized per
+  // pane so the pane body's effect doesn't re-fire every render.
+  const [paneEditors, setPaneEditors] = useState<Record<string, Editor | null>>({});
+  const paneEditorSetters = useRef(new Map<string, (editor: Editor | null) => void>());
+  const paneEditorSetter = (paneId: string) => {
+    let setter = paneEditorSetters.current.get(paneId);
+    if (!setter) {
+      setter = (editor) =>
+        setPaneEditors((prev) => (prev[paneId] === editor ? prev : { ...prev, [paneId]: editor }));
+      paneEditorSetters.current.set(paneId, setter);
+    }
+    return setter;
+  };
+  // The pane the user last acted on (tab click / drop / ＋ launcher) — the
+  // desktop ⌘W close targets it; ids are session-local, so a pruned id just
+  // falls back to the primary.
+  const lastFocusedPaneIdRef = useRef(PRIMARY_PANE_ID);
+  // Rendered twin of the ref: which pane's chrome owns pane-scoped keyboard
+  // shortcuts (⌘F). Set on pointer-down in a pane, like the ref.
+  const [focusedPaneId, setFocusedPaneId] = useState(PRIMARY_PANE_ID);
+  // "No tabs" (desktop shell only, Settings → Appearance): dropping the strips
+  // reduces any multi-pane layout the same way a web arrival does — the
+  // visible file + the visible chat — since without tabs the extra panes are
+  // unreachable. Flattened OUTSIDE the state updater: flattening mints fresh
+  // pane ids (impure), so a re-run updater would commit different ids than
+  // the ⌘W focus remap saw. One flatten, one id set — the focus follows the
+  // pane that kept the focused surface (else the primary), or Close Tab over
+  // a focused chat would fall back to closing the doc.
+  const setTabsEnabled = useCallback(
+    (enabled: boolean) => {
+      if (enabled === desktopTabs) return;
+      setHideTopBarPreferred(!enabled);
+      if (!enabled) {
+        const prev = editorPanesRef.current;
+        const focused = prev.find((p) => p.id === lastFocusedPaneIdRef.current);
+        // The FOCUSED pane's surface survives the flatten: ordered first, it
+        // is the file (or chat) flattenPanesForWeb keeps — otherwise a user
+        // working in a second doc pane would silently get the first doc.
+        const ordered = focused ? [focused, ...prev.filter((p) => p !== focused)] : prev;
+        const next = flattenPanesForWeb(ordered);
+        lastFocusedPaneIdRef.current =
+          (focused?.active ? next.find((p) => p.active === focused.active)?.id : undefined) ??
+          next[0].id;
+        // The selection mirror binds the primary's active tab — hand it the
+        // survivor, or the mirror would swap the old selection straight back.
+        const primaryActive = next[0].active;
+        if (primaryActive && !isSpecialTab(primaryActive)) setSelectedFilePath(primaryActive);
+        setEditorPanes(next);
+      }
+      setDesktopTabs(enabled);
+    },
+    [desktopTabs],
+  );
   // Assigned once openChatById exists — pane transitions that land a chat tab
   // active re-point the live chat through it (see applyPaneTransition).
-  const openChatByIdRef = useRef<(chatId: string) => unknown>(() => undefined);
-  // Explicit file opens (tree click, review jump, deep link) claim the pane
-  // currently SHOWING a file (files-left/chats-right rules: a rail file click
-  // replaces the displayed file wherever it lives, falling back to the
-  // primary); with only a chat visible the doc claims the primary and the
-  // chat docks aside instead of being displaced. When an open displaces the
-  // last visible chat, the legacy 'chat' reveal intent must go with it or a
-  // reload re-covers the doc with the chat tab.
+  const openChatByIdRef = useRef<(chatId: string, opts?: { sidePanel?: boolean }) => unknown>(
+    () => undefined,
+  );
+  // Explicit file opens (tree click, review jump, deep link) claim exactly ONE
+  // pane — the FOCUSED pane when it shows a document, else the first pane that
+  // does (resolveOpenTargetPaneId; files-left/chats-right). Picking "the first
+  // file pane" outright meant a rail click always swapped the LEFTMOST
+  // document, changing a pane the user wasn't working in. With only a chat
+  // visible the doc claims the primary and the chat docks aside instead of
+  // being displaced. When an open displaces the last visible chat, the legacy
+  // 'chat' reveal intent must go with it or a reload re-covers the doc with
+  // the chat tab.
   const claimPrimaryWithFile = useCallback(
     (path: string, opts?: { append?: boolean; chatAside?: boolean }) => {
       setEditorPanes((prev) => {
-        const filePane = prev.find((p) => p.active !== '' && !isSpecialTab(p.active));
+        const targetId = resolveOpenTargetPaneId(prev, 'file', lastFocusedPaneIdRef.current, path);
+        const filePane = targetId ? prev.find((p) => p.id === targetId) : undefined;
         const next =
-          opts?.chatAside || (!opts?.append && !filePane && prev.some((p) => isChatTab(p.active)))
+          opts?.chatAside ||
+          (!opts?.append && !filePane && prev.some((p) => isChatTab(p.active)))
             ? openWithChatAside(prev, path)
             : opts?.append
               ? openPaneTab(prev, PRIMARY_PANE_ID, path)
@@ -1214,6 +1682,15 @@ export default function WorkspacePage() {
         // Outside the updater (React may run it twice); removePanel is idempotent.
         queueMicrotask(() => {
           if (!chatStillVisible) setOpenPanels((op) => removePanel(op, 'chat'));
+          // Rail-opened files never fire a pane pointer event — stamp ⌘W's
+          // focus ref at the pane that now shows the file.
+          const shown = next.find((pane) => pane.active === path);
+          if (shown) lastFocusedPaneIdRef.current = shown.id;
+          // This claim OWNS the selection: selectedFilePath names the PRIMARY
+          // pane's document, so an open that landed in a side pane must leave
+          // it alone (callers that set it optimistically converge here).
+          const primaryActive = next[0].active;
+          if (primaryActive && !isSpecialTab(primaryActive)) setSelectedFilePath(primaryActive);
         });
         return next;
       });
@@ -1225,6 +1702,10 @@ export default function WorkspacePage() {
    *  switch so the next project loads its own layout (and the save effect
    *  can't write the old layout under the new key meanwhile). */
   const editorPanesRestoredRef = useRef<string | null>(null);
+  /** Reactive mirror of the ref: the visibility gate and the chat-first
+   *  arrival decision both need to re-render when the restore lands, so the
+   *  first VISIBLE frame is always post-restore (no doc-then-chat frame). */
+  const [panesRestoredFor, setPanesRestoredFor] = useState<string | null>(null);
   const restoredSnapshotHadTabsRef = useRef(false);
   // Same room-binding freeze as pendingOpenFileMove, but for files open in
   // SECONDARY panes: their tabs remap optimistically on a move, and binding
@@ -1249,12 +1730,59 @@ export default function WorkspacePage() {
   // visibility — what the realtime/list/scroll-restore effects key off —
   // derives from the panes, and `openPanels` only carries reveal intent.
   const visibleColumns = resolveVisibleColumns(openPanels, isMobile);
+  // Embedded agent layout (?view=panel, latched inside side-panel browsers):
+  // one surface at a time. Post-mount only — the rail can't be open during
+  // hydration in panel mode, so this never diverges from the server pass.
+  const panelViewActive = hasMounted && latchPanelView();
+  // Chat-first arrival, before the chat id resolves: the pane renders the
+  // chat surface from the FIRST paint instead of mounting the preselected
+  // document and yanking it once the chat tab lands (the arrival flash).
+  const arrivalChatPending = chatFirstArrivalPending({
+    openPanels,
+    isMobile,
+    anyPaneTabs: editorPanes.some((pane) => pane.tabs.length > 0),
+    // Reactive (state, not the ref): the shell only becomes visible once the
+    // restore has landed (see the visibility gate), so the FIRST visible
+    // frame already knows whether the snapshot had tabs — a stale ['chat']
+    // open-set never paints chat over restoring tabs, and a no-snapshot
+    // arrival is chat-owned from its very first paint.
+    panesRestored: panesRestoredFor === projectId,
+  });
   // Desktop-only: mobile renders the legacy column layout, and a pane
   // snapshot restored from a desktop session must not hijack its editor.
-  const primaryChatActive = !isMobile && isChatTab(editorPanes[0].active);
+  const primaryChatActive = !isMobile && (isChatTab(editorPanes[0].active) || arrivalChatPending);
+  const primaryLauncherActive = !isMobile && isLauncherTab(editorPanes[0].active);
+  const primaryReviewActive = !isMobile && isReviewTab(editorPanes[0].active);
+  const primaryDiffActive = !isMobile && isDiffTab(editorPanes[0].active);
   const paneChatVisible = editorPanes.some((p) => isChatTab(p.active));
   const paneFileVisible = editorPanes.some((p) => p.active !== '' && !isSpecialTab(p.active));
   const isEditorVisible = isMobile ? openPanels.includes('editor') : paneFileVisible;
+  // The file whose editor last had focus — what presence broadcasts as "the
+  // file this user is in". selectedFilePath alone names the PRIMARY pane's
+  // file, which is wrong while the user types in a secondary split pane.
+  const [focusedEditorPath, setFocusedEditorPath] = useState<string | null>(null);
+  const handleEditorFocusedPath = useCallback((path: string) => setFocusedEditorPath(path), []);
+  // A file is ON SCREEN only when some pane's ACTIVE tab is that file. The
+  // primary selection can survive as a background tab under an active chat/
+  // launcher tab while a secondary pane keeps isEditorVisible true — such a
+  // file must be neither broadcast in presence nor offered as a Share scope.
+  const paneShowsFile = useCallback(
+    (path: string) =>
+      isMobile
+        ? isEditorVisible && path === selectedFilePath
+        : editorPanes.some((pane) => pane.active === path),
+    [isMobile, isEditorVisible, selectedFilePath, editorPanes],
+  );
+  // The Sync commit viewer replaces the whole editor column (doc header
+  // included) — one flag naming its render condition. While it covers the
+  // editor, no pane file is really on screen: presence must not broadcast
+  // one and the Share menu must not offer one.
+  const commitDiffOpen = Boolean(
+    selectedCommit &&
+      linkedRepos.length > 0 &&
+      openLeftRail === 'project' &&
+      !isSectionCollapsed(sidebarSections, 'sync'),
+  );
   const isReviewVisible = isMobile ? openPanels.includes('review') : rightDockView === 'history';
   const isChatVisible = isMobile ? visibleColumns.chat : paneChatVisible;
   // 'chat' === chat is the sole surface (old full-chat mode); on desktop that
@@ -1269,49 +1797,102 @@ export default function WorkspacePage() {
   // A chat opens as a tab: replace-on-open in the pane already holding it
   // (else the primary), demoting any other pane's active chat — the workspace
   // runs ONE live chat stream (use-sundial-chat is instantiated once).
-  const openChatTabInPanes = useCallback((chatId: string, opts?: { side?: boolean; append?: boolean }) => {
+  /** Tab an open just handed to a pane, awaiting its focus stamp. */
+  const pendingFocusTabRef = useRef<string | null>(null);
+  /** Bumped by each chat-tab open so the reconcile effect runs once per open. */
+  const [chatTabOpenSeq, setChatTabOpenSeq] = useState(0);
+  const openChatTabInPanes = useCallback((chatId: string, opts?: { side?: boolean; append?: boolean; paneId?: string }) => {
     const tab = chatTab(chatId);
     const transition = (prev: EditorPane[]) => {
+      // Already on screen: the click just focuses that pane. No pane's active
+      // tab changes — re-running the open below could otherwise move the chat
+      // into a different pane and blank the one it left. (Not for `append`:
+      // the ＋ launcher must still consume its own tab, which the paths below
+      // handle.)
+      const shown = opts?.append ? undefined : prev.find((p) => p.active === tab);
+      if (shown) return enforceSingleActiveChat(prev, shown.id);
       const holder = prev.find((p) => p.tabs.includes(tab));
       if (opts?.append && !holder) {
-        // ＋ launcher: a NEW leaf beside the current tab, never replacing it.
-        return enforceSingleActiveChat(openPaneTab(prev, PRIMARY_PANE_ID, tab), PRIMARY_PANE_ID);
+        // ＋ launcher: a NEW leaf beside the current tab, never replacing it —
+        // in the pane whose ＋ was clicked (pane ids are session-local, so an
+        // unknown id falls back to the primary).
+        const paneId =
+          opts.paneId && prev.some((p) => p.id === opts.paneId) ? opts.paneId : PRIMARY_PANE_ID;
+        return enforceSingleActiveChat(openPaneTab(prev, paneId, tab), paneId);
       }
       // side: with only a FILE visible the chat SPLITS to the right of it
       // (files-left/chats-right) instead of replacing it; falls through to
       // replace when the primary is empty/chat, or when some pane already
       // shows a chat (then the click replaces the DISPLAYED chat, not the
-      // doc). A background copy of the tab in the PRIMARY moves aside too —
-      // only a holder that can show the chat without displacing the doc (a
-      // side pane) short-circuits to plain activation below.
+      // doc). A background copy of the tab travels with the open — one tab
+      // lives in exactly one pane, and a copy left behind is what a later
+      // rail click would hijack.
       if (
         opts?.side &&
         prev[0].active !== '' &&
         !isChatTab(prev[0].active) &&
         !prev.some((p) => isChatTab(p.active))
       ) {
-        const primaryBackground = holder?.id === PRIMARY_PANE_ID;
-        if (!holder || primaryBackground) {
-          const base = primaryBackground
-            ? prev.map((p, i) => (i === 0 ? { ...p, tabs: p.tabs.filter((t) => t !== tab) } : p))
-            : prev;
-          const next = openPaneToSide(base, tab);
-          const pane = next.find((p) => p.tabs.includes(tab));
-          return pane ? enforceSingleActiveChat(next, pane.id) : next;
-        }
+        const base = holder ? dropTabElsewhere(prev, tab) : prev;
+        const next = openPaneToSide(base, tab);
+        const pane = next.find((p) => p.tabs.includes(tab));
+        return pane ? enforceSingleActiveChat(next, pane.id) : next;
       }
       // Replace-on-open per GROUP: in a doc+chat split, a chat opened from
-      // the rail replaces the chat PANE's tab — never the document.
+      // the rail replaces the chat PANE's tab — never the document, and never
+      // a pane that merely holds this chat BEHIND its active tab (that
+      // background-holder-wins rule swapped the document in one pane and the
+      // chat in another from a single rail click — the onboarding report).
       const paneId =
-        holder?.id ?? prev.find((p) => isChatTab(p.active))?.id ?? PRIMARY_PANE_ID;
-      return enforceSingleActiveChat(replaceActiveTab(prev, paneId, tab), paneId);
+        resolveOpenTargetPaneId(prev, 'chat', lastFocusedPaneIdRef.current) ??
+        holder?.id ??
+        PRIMARY_PANE_ID;
+      const base = dropTabElsewhere(prev, tab, paneId);
+      return enforceSingleActiveChat(replaceActiveTab(base, paneId, tab), paneId);
     };
-    const predicted = transition(editorPanesRef.current);
+    // Nothing but the transition goes in the updater. React REPLAYS queued
+    // updaters on later renders, so a side effect scheduled from inside runs
+    // again and again: the old queueMicrotask + setSelectedFilePath pair
+    // re-armed itself every render and spun the workspace at React's
+    // update-depth ceiling (2026-08-06). Selection and focus reconcile from
+    // the COMMITTED panes in the effect below.
     setEditorPanes(transition);
-    // Replace-on-open can close the selected file's tab — keep the selection
-    // only while some pane still holds it (applyPaneTransition's rule).
-    setSelectedFilePath((prev) => (prev && !predicted.some((p) => p.tabs.includes(prev)) ? '' : prev));
+    pendingFocusTabRef.current = tab;
+    setChatTabOpenSeq((seq) => seq + 1);
   }, []);
+  // Reconcile ONE chat-tab open, once, against the panes it committed.
+  // Replace-on-open can close the selected file's tab, so a selection no pane
+  // holds any more clears. Deliberately keyed on the open counter, not on
+  // `editorPanes`: inside the pane updater React's updater replay re-armed the
+  // side effect forever (an update-depth loop), and on every pane change it
+  // fought the restore/deep-link effects that set a selection before its tab
+  // exists (both observed 2026-08-06).
+  useEffect(() => {
+    if (!chatTabOpenSeq) return;
+    const panes = editorPanesRef.current;
+    setSelectedFilePath((sel) => (sel && !panes.some((pane) => pane.tabs.includes(sel)) ? '' : sel));
+    const tab = pendingFocusTabRef.current;
+    pendingFocusTabRef.current = null;
+    // Rail/header-opened chats fire no pane pointer event — stamp ⌘W's focus
+    // ref at the pane that now shows the chat.
+    const shown = tab ? panes.find((pane) => pane.active === tab) : null;
+    if (shown) lastFocusedPaneIdRef.current = shown.id;
+    // A chat opened from a comment thread lands NARROW instead of taking half
+    // the window. Consumed on every chat open (never left armed), and only
+    // honored when this open changed the pane set — i.e. it created the split.
+    const armed = narrowChatPaneArmedRef.current;
+    narrowChatPaneArmedRef.current = null;
+    const idsKey = panes.map((pane) => pane.id).join('|');
+    if (armed !== null && armed !== idsKey && shown && shown.id !== PRIMARY_PANE_ID) {
+      const share = NARROW_CHAT_PANE_SHARE;
+      setPaneGrow(
+        Object.fromEntries(
+          panes.map((pane) => [pane.id, pane.id === shown.id ? share : (1 - share) / (panes.length - 1)]),
+        ),
+      );
+    }
+  }, [chatTabOpenSeq]);
+
   // Assigned once currentChatId exists; lets the early reveal primitives
   // (openCenterPanel/setWorkspaceViewMode) open the current chat's tab.
   const openChatTabForCurrentRef = useRef<(opts?: { side?: boolean }) => void>(() => {});
@@ -1341,53 +1922,75 @@ export default function WorkspacePage() {
     });
   }, []);
   const [accessError, setAccessError] = useState<'signin' | 'forbidden' | 'not-found' | null>(null);
+  // Key-gated AND unclaimed (anon-owned, no account owner): the wall swaps
+  // its dead-end sign-in for the claim-key field — signing in without the
+  // handoff cookie would change nothing (claim-on-login never fires).
+  const [accessClaimable, setAccessClaimable] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('workspace');
   const [canWrite, setCanWrite] = useState(true);
+  // Optimistic true (like canWrite): the arrival swap below only fires once a
+  // payload proves the visitor is NOT the owner. Reset on project switch so a
+  // non-owned workspace's state never leaks into the next arrival.
+  const [isOwner, setIsOwner] = useState(true);
   const [canSuggest, setCanSuggest] = useState(true);
   const [canComment, setCanComment] = useState(true);
   const [canAccessSecrets, setCanAccessSecrets] = useState<boolean | null>(null);
+  // Path-share grants elevate per-file capability past the workspace baseline
+  // (guests AND read-only members); `isScopedGuest` = access exists ONLY via
+  // grants (drives the guest-only UI states, e.g. the disabled composer).
+  const [pathGrants, setPathGrants] = useState<PathGrant[]>([]);
+  // Chat ids a scoped guest may read (shared local chats).
+  const [chatGrants, setChatGrants] = useState<string[]>([]);
+  const [isScopedGuest, setIsScopedGuest] = useState(false);
+  // Ref mirror so stable callbacks (loadChatThreads) read it without deps churn.
+  const isScopedGuestRef = useRef(isScopedGuest);
+  isScopedGuestRef.current = isScopedGuest;
+  const chatGrantsRef = useRef(chatGrants);
+  chatGrantsRef.current = chatGrants;
+  const canWriteWorkspacePath = useCallback(
+    (path: string) =>
+      pathCapability({ canWrite, canSuggest, canComment }, pathGrants, path).canWrite,
+    [canWrite, canSuggest, canComment, pathGrants],
+  );
+  // Can the caller create files inside `targetFolder` (null = workspace
+  // root)? Probes a child name — folder grants cover any descendant.
+  const canUploadToFolder = useCallback(
+    (targetFolder: string | null) =>
+      canWriteWorkspacePath(targetFolder ? `${targetFolder}/upload.tmp` : 'upload.tmp'),
+    [canWriteWorkspacePath],
+  );
+  // Client mirror of the server's canCreatePath: brand-new content (and
+  // compiles, whose artifacts are creates) needs workspace write or a FOLDER
+  // edit grant covering the path — exact-file grants never qualify.
+  const canCreateWorkspacePath = useCallback(
+    (path: string | null) =>
+      canWrite ||
+      (Boolean(path) &&
+        pathGrants.some(
+          (grant) =>
+            grant.role === 'edit' &&
+            grant.kind !== 'file' &&
+            Boolean(path?.startsWith(`${grant.path}/`)),
+        )),
+    [canWrite, pathGrants],
+  );
   const [editorPageChrome, setEditorPageChrome] = useState<MarkdownPageChrome>({
     margin: 'normal',
     header: false,
     footer: false,
   });
-  // Commenters (canSuggest without canWrite) get an editable editor locked to
-  // Suggesting — their typing lands as reviewable suggestions, GDocs-style.
-  const documentReadOnly = !canWrite && !canSuggest;
-  // The chat-first landing is for people who can drive the agent. Access
-  // resolves async (the files payload carries canWrite), so a read-only
-  // visitor on a bare link briefly sees chat — swap them to the document they
-  // came for, but only while the untouched arrival default is still up.
-  useEffect(() => {
-    if (canWrite || !arrivalChatDefaultRef.current) return;
-    arrivalChatDefaultRef.current = false;
-    setOpenPanels((prev) => (prev.length === 1 && prev[0] === 'chat' ? ['editor'] : prev));
-    // Desktop chat visibility lives in the panes: demote any active chat tab
-    // to its nearest file tab so the visitor lands on the document.
-    setEditorPanes((prev) => {
-      let changed = false;
-      const next = prev.map((pane) => {
-        if (!isChatTab(pane.active)) return pane;
-        changed = true;
-        const files = pane.tabs.filter((t) => !isChatTab(t));
-        return { ...pane, active: files[files.length - 1] ?? '' };
-      });
-      return changed ? next : prev;
-    });
-    // The chat-first arrival closed the rail for the hero; this visitor lands
-    // on the document instead, so give them back the rail the arrival closed
-    // (from the ref — persistence has already overwritten the stored layout).
-    if (arrivalClosedRailRef.current) setOpenLeftRail(arrivalClosedRailRef.current);
-  }, [canWrite]);
   const { mode: documentEditMode, setMode: setDocumentEditMode } = useDocumentEditMode();
   const [projectTitle, setProjectTitle] = useState('Untitled workspace');
   const [projectStatus, setProjectStatus] = useState<'active' | 'archived'>('active');
   const [projectKind, setProjectKind] = useState<WorkspaceKind | null>(null);
+  const [projectCreatedAt, setProjectCreatedAt] = useState<string | null>(null);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editingTitleValue, setEditingTitleValue] = useState('');
   const [showWorkspaceSwitcher, setShowWorkspaceSwitcher] = useState(false);
   const [isArchiving, setIsArchiving] = useState(false);
   const [openChatMenuId, setOpenChatMenuId] = useState<string | null>(null);
+  /** Chat awaiting the delete confirmation (null = dialog closed). */
+  const [chatPendingDelete, setChatPendingDelete] = useState<{ id: string; title: string | null } | null>(null);
   const [chatDetailsChatId, setChatDetailsChatId] = useState<string | null>(null);
   // Per-chat "Connect to mobile" — opens LinkTextChatModal for this chat id.
   const [linkTextChatId, setLinkTextChatId] = useState<string | null>(null);
@@ -1395,6 +1998,79 @@ export default function WorkspacePage() {
   // draft chat id → its promoted real id (written by replaceDraftChat). Lets
   // the inline-ask send verify the on-screen chat really came from ITS draft.
   const draftPromotionsRef = useRef<Record<string, string>>({});
+  // deleted real chat id → the draft that replaced it (the demote mirror of
+  // draftPromotionsRef, written by demoteChatToDraft).
+  const demotedDraftByRealIdRef = useRef<Record<string, string>>({});
+  // chat id → the FIRST id of its promote/demote lineage. The composer is
+  // keyed by this instead of the raw chat id so the mid-typing draft→real id
+  // swap keeps the same composer instance mounted — a remount here restored
+  // the text but parked the caret at position 0, displacing the first typed
+  // character to the end ("hi there" → "therehi ").
+  const chatLineageIdRef = useRef<Record<string, string>>({});
+  // Follow the promotion/demotion mappings from a possibly-stale chat id to
+  // the live one. Composer events and upload completions can report under an
+  // id the swap already retired (their remount/round-trip races it).
+  const resolveLiveChatId = useCallback((chatId: string) => {
+    // Fixed point with cycle protection: every promote/demote appends a hop,
+    // so a long-running upload may need to cross arbitrarily many swaps.
+    let id = chatId;
+    const seen = new Set<string>([id]);
+    for (;;) {
+      const next = isDraftChatId(id)
+        ? draftPromotionsRef.current[id]
+        : demotedDraftByRealIdRef.current[id];
+      if (!next || seen.has(next)) break;
+      seen.add(next);
+      id = next;
+    }
+    return id;
+  }, []);
+  // Real chat ids that exist ONLY because the composer was typed into (no
+  // message sent yet). Fully backspacing their composer deletes the row again —
+  // a chat may live in the DB only while a message is drafted or sent. The set
+  // is mirrored to localStorage (arm/disarm below) so a cleanup interrupted by
+  // a reload or a failed DELETE is finished on the next load instead of
+  // leaving the empty row behind forever.
+  const typedEmptyChatIdsRef = useRef(new Set<string>());
+  // Both persistence keys are scoped by the signed-in identity as well as the
+  // project: drafts are private input, and a project-only key would show user
+  // A's unsent text to user B after an account switch in the same browser.
+  const draftStorageScope = user?.id ?? 'anon';
+  const typedEmptyStorageKey = projectId
+    ? `sundial:chat-cleanup:${draftStorageScope}:${projectId}`
+    : null;
+  const persistTypedEmptyMarker = useCallback(
+    (chatId: string, armed: boolean) => {
+      if (!typedEmptyStorageKey || typeof window === 'undefined') return;
+      try {
+        const stored = new Set<string>(
+          JSON.parse(window.localStorage.getItem(typedEmptyStorageKey) ?? '[]') as string[]
+        );
+        if (armed) stored.add(chatId);
+        else stored.delete(chatId);
+        if (stored.size === 0) window.localStorage.removeItem(typedEmptyStorageKey);
+        else window.localStorage.setItem(typedEmptyStorageKey, JSON.stringify([...stored]));
+      } catch {
+        // localStorage unavailable — cleanup still works within this session.
+      }
+    },
+    [typedEmptyStorageKey]
+  );
+  const armTypedEmpty = useCallback(
+    (chatId: string) => {
+      typedEmptyChatIdsRef.current.add(chatId);
+      persistTypedEmptyMarker(chatId, true);
+    },
+    [persistTypedEmptyMarker]
+  );
+  const disarmTypedEmpty = useCallback(
+    (chatId: string) => {
+      const wasArmed = typedEmptyChatIdsRef.current.delete(chatId);
+      persistTypedEmptyMarker(chatId, false);
+      return wasArmed;
+    },
+    [persistTypedEmptyMarker]
+  );
   const sectionAppendsByChatIdRef = useRef<Record<string, Record<string, string>>>({});
   const [messageDraftVersion, setMessageDraftVersion] = useState(0);
   const [attachmentsByChatId, setAttachmentsByChatId] = useState<Record<string, MessageAttachment[]>>({});
@@ -1413,6 +2089,14 @@ export default function WorkspacePage() {
   );
   const [workspaceStorageUsage, setWorkspaceStorageUsage] = useState<WorkspaceStorageUsage | null>(null);
   const [filesLoaded, setFilesLoaded] = useState(false);
+  // Docs vs IDE is chosen FOR you, never asked (founder, 2026-08-10: a new user
+  // has no basis for the answer), and the answer is always IDE (founder,
+  // 2026-08-12) — the flat surface, with the formatting bar open. That is
+  // `getDocStylePreference`'s unset value, so an arrival writes nothing at all:
+  // no per-workspace inference, no share-guest slice deciding this device's
+  // style. A stored pref (document ⋯ menu / Settings → Appearance) still wins,
+  // because it is the only thing that ever writes the key.
+
   const deepLinkedWorkspaceFile = useMemo(
     () =>
       deepLinkedFileId
@@ -1452,18 +2136,41 @@ export default function WorkspacePage() {
   const [pickerQuery, setPickerQuery] = useState('');
   const [draftEntry, setDraftEntry] = useState<DraftEntry | null>(null);
   const [dragOverPath, setDragOverPath] = useState<string | null>(null);
-  // Manual sidebar order (drag-to-reorder), per workspace + device.
+  // Manual sidebar order (drag-to-reorder). Shared workspace state; the
+  // localStorage read is just the paint cache so the arranged tree shows
+  // before the files payload lands.
   const [fileOrder, setFileOrder] = useState<FileOrderMap>({});
   useEffect(() => {
     setFileOrder(projectId ? readFileOrder(projectId) : {});
   }, [projectId]);
+  // Bumped by every drag. `reloadFiles` captures it before its fetch and drops
+  // the payload's order if it moved in flight — same generation guard the file
+  // list itself uses (filesGenRef), for the same reason.
+  const fileOrderGenRef = useRef(0);
   const [renameEntry, setRenameEntry] = useState<RenameEntry | null>(null);
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
   const [openMenuPath, setOpenMenuPath] = useState<string | null>(null);
   // The ⌘K command palette (files + actions) — opened by Cmd/Ctrl+K or the
-  // sidebar search bar.
+  // sidebar search bar. (⌘T is its own surface: the New-tab launcher tab.)
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  // Set when the palette was opened FROM a New-tab chooser ("Open file"):
+  // the picked file must fill THAT pane (consuming its launcher tab), not
+  // whichever pane handleFileClick would claim. Not cleared by onClose —
+  // the palette closes before it routes the choice — so every non-chooser
+  // open path resets it instead. Stale values are harmless: it only applies
+  // while the target pane still shows the launcher.
+  const [paletteTargetPaneId, setPaletteTargetPaneId] = useState<string | null>(null);
   const pendingRevealLineRef = useRef<number | null>(null);
+  // Root-grant token for every copied workspace URL (the useWorkspaceShare
+  // state loads further down — refs bridge the hook order). The sticky URL
+  // token is only reusable when it PROVABLY resolves to the root grant: any
+  // narrower grant alongside (a tokenless public workspace opened via a
+  // narrower ?pshare link, say) means the sticky token may be that narrow
+  // capability, and embedding it would leak the stronger scope to every
+  // recipient (PR-bot findings on #997 and #1052).
+  const rootShareTokenRef = useRef<string | null>(null);
+  const holdsRootGrantRef = useRef(false);
+  holdsRootGrantRef.current = holdsRootGrantOnly(pathGrants);
   const {
     copiedChatLinkId,
     handleCopyChatLink,
@@ -1472,6 +2179,12 @@ export default function WorkspacePage() {
     projectId,
     workspaceRouteId,
     setOpenMenuPath,
+    getShareToken: useCallback(
+      () =>
+        rootShareTokenRef.current ??
+        (holdsRootGrantRef.current ? currentPathShareToken() : null),
+      [],
+    ),
   });
   const [layoutConfigReady, setLayoutConfigReady] = useState(false);
 
@@ -1577,6 +2290,37 @@ export default function WorkspacePage() {
 
   // Voice input — shared hook with onboarding
   const currentChatRef = useRef<{ id: string } | null>(null);
+  // Composer drafts persist locally (per project) so drafted chats keep their
+  // text across reloads — a drafted row without its text is exactly the
+  // clutter the lazy chat lifecycle exists to avoid. Draft-id entries persist
+  // too: a draft whose promotion kept failing (offline) is resurrected as a
+  // fresh local draft at the next load instead of losing the text.
+  const chatDraftStorageKey = projectId
+    ? `sundial:chat-drafts:${draftStorageScope}:${projectId}`
+    : null;
+  const persistChatDraft = useCallback(
+    (chatId: string, text: string) => {
+      if (!chatDraftStorageKey || typeof window === 'undefined') return;
+      try {
+        const stored = JSON.parse(
+          window.localStorage.getItem(chatDraftStorageKey) ?? '{}'
+        ) as Record<string, string>;
+        if (text) stored[chatId] = text;
+        else delete stored[chatId];
+        if (Object.keys(stored).length === 0) window.localStorage.removeItem(chatDraftStorageKey);
+        else window.localStorage.setItem(chatDraftStorageKey, JSON.stringify(stored));
+      } catch {
+        // localStorage unavailable (private mode, quota) — drafts stay in-memory.
+      }
+    },
+    [chatDraftStorageKey]
+  );
+  // Read through a ref so setStoredMessageDraft keeps a STABLE identity —
+  // one-shot listeners (⌘J context, voice) capture it once, and a
+  // project-scoped closure would strand their writes on the initial storage
+  // key when a ?pshare= link adopts the workspace UUID after load.
+  const persistChatDraftRef = useRef(persistChatDraft);
+  persistChatDraftRef.current = persistChatDraft;
   const setStoredMessageDraft = useCallback((chatId: string, text: string, notify = false) => {
     if (!chatId) return;
     if (text) {
@@ -1584,6 +2328,7 @@ export default function WorkspacePage() {
     } else {
       delete messageInputByChatIdRef.current[chatId];
     }
+    persistChatDraftRef.current(chatId, text);
     if (notify) {
       setMessageDraftVersion((prev) => prev + 1);
     }
@@ -1625,6 +2370,9 @@ export default function WorkspacePage() {
         opts?: { forceNew?: boolean; keepMode?: boolean }
       ) => Promise<string | null>)
     | null
+  >(null);
+  const promoteDraftWithSettingsRef = useRef<
+    ((draftId: string) => Promise<ChatThread | null>) | null
   >(null);
   useEffect(() => {
     const handler = async (event: Event) => {
@@ -1673,6 +2421,13 @@ export default function WorkspacePage() {
       // nothing, so a closed chat tab must reopen (docked beside a doc).
       // Fresh drafts already opened their tab in startDraftChat.
       if (!isMobileRef.current && !createdFresh) {
+        // A selection-driven open lands NARROW like the comment lane's "Open
+        // chat": an even split crushes the document the selection came from.
+        // Armed with the pre-open pane key, so a reused (possibly resized)
+        // pane keeps its width. Plain ⌘J (no selection) keeps the even split.
+        if (text || detail?.instruction?.trim()) {
+          narrowChatPaneArmedRef.current = editorPanesRef.current.map((pane) => pane.id).join('|');
+        }
         openChatTabForCurrentRef.current({ side: true });
       }
       // Inline ask (selection popup / "/ai …"): send a full turn immediately —
@@ -1689,12 +2444,19 @@ export default function WorkspacePage() {
         // gets the doc but not the spot and edits the wrong place.
         const where =
           detail?.caret === 'inside'
-            ? 'My cursor is on the quoted line — apply this right there.'
+            ? 'My cursor is on the quoted line, so apply this right there.'
             : detail?.caret === 'after'
-              ? 'My cursor is on an empty line immediately after the quoted text — write there.'
+              ? 'My cursor is on an empty line immediately after the quoted text, so write there.'
               : detail?.caret === 'start'
                 ? 'My cursor is at the top of the document.'
                 : '';
+        // Drafts only persist on demand (first keystroke or send) — this
+        // auto-send IS the demand, so promote explicitly (with the draft's
+        // own model/harness); without it the settled() wait below would
+        // always time out into the degraded path.
+        if (isDraftChatId(chatId)) {
+          await promoteDraftWithSettingsRef.current?.(chatId);
+        }
         // Wait for a PROMOTED (non-draft) current chat before sending: a
         // draft id would make handleSendMessage promote mid-send and trip its
         // `chat.id !== currentChatId` guard, silently dropping the turn
@@ -1786,15 +2548,24 @@ export default function WorkspacePage() {
   }, []);
 
   // Cmd/Ctrl+K (the sidebar search bar's shortcut) toggles the command
-  // palette. The markdown editor claims the press first — link popover — but
-  // only when it has a NON-EMPTY selection, and preventDefaults when it fires;
-  // an empty caret falls through here, so ⌘K anywhere else means "palette".
+  // palette, and so do ⌘O (Obsidian's quick switcher), ⌘P (VS Code's quick
+  // open) and ⌘⇧P (VS Code's command palette — ours is one unified surface,
+  // files ranked first, actions last). Browsers let all of these be
+  // prevented, unlike ⌘N/⌘T; in the desktop shell the native File menu
+  // consumes ⌘O (Open folder) before the webview sees it, so quick open is
+  // ⌘P there. The markdown editor claims ⌘K first — link popover — but only
+  // with a NON-EMPTY selection, and preventDefaults when it fires; an empty
+  // caret falls through here. Monaco likewise preventDefaults the keys it
+  // owns inside code files.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
-      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
-      if (event.key.toLowerCase() !== 'k') return;
+      if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (key !== 'k' && key !== 'o' && key !== 'p') return;
+      if (event.shiftKey && key !== 'p') return;
       event.preventDefault();
+      setPaletteTargetPaneId(null);
       setCommandPaletteOpen((open) => !open);
     };
     window.addEventListener('keydown', onKeyDown);
@@ -1823,6 +2594,8 @@ export default function WorkspacePage() {
     } else {
       delete messageInputByChatIdRef.current[toChatId];
     }
+    persistChatDraftRef.current(fromChatId, '');
+    persistChatDraftRef.current(toChatId, draft ?? '');
     if (notify) {
       setMessageDraftVersion((prev) => prev + 1);
     }
@@ -1843,7 +2616,6 @@ export default function WorkspacePage() {
   const draftIdRef = useRef(0);
   const cancelDraftRef = useRef(false);
   // The tab-strip launcher's "new TAB" intent for the next committed draft.
-  const draftAppendTabRef = useRef(false);
   const filesChannelRef = useRef<BroadcastChannel | null>(null);
   // Bumped by every optimistic file-tree mutation (create/delete/move/rename).
   // `reloadFiles` captures it before its fetch and drops the result if it
@@ -1851,6 +2623,10 @@ export default function WorkspacePage() {
   // would otherwise clobber the optimistic update (resurrect a deleted file,
   // un-move a moved one).
   const filesGenRef = useRef(0);
+  // Self-reference for the initial-load retry below (reloadFiles is defined
+  // later and would otherwise not be callable from inside itself).
+  const reloadFilesRef = useRef<((shouldSetInitial?: boolean) => Promise<number | undefined>) | null>(null);
+  const emptyRetryProjectRef = useRef<string | null>(null);
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   /** Stores the click X-offset for header renames so cursor is placed at click position */
   const renameClickOffsetRef = useRef<{ x: number; text: string } | null>(null);
@@ -1860,13 +2636,17 @@ export default function WorkspacePage() {
   const lastClickedPathRef = useRef<string | null>(null);
   const fileMenuRef = useRef<HTMLDivElement | null>(null);
   const assistantPickerRef = useRef<HTMLDivElement | null>(null);
-  // The same picker (one `showAssistantPicker` flag) is mounted in two places —
-  // the top-bar chat name and the chat-column "+" header — which can both be
-  // live in full-chat mode. Each wrapper needs its own ref so the outside-click
-  // dismiss treats clicks in either menu as "inside".
-  const chatHeaderPickerRef = useRef<HTMLDivElement | null>(null);
   const assistantPickerCueTimeoutRef = useRef<number | null>(null);
   const optimisticStartingUntilByChatIdRef = useRef<Map<string, number>>(new Map());
+  // Comment-watch toggles: per-chat request chain + latest-wins token, so a
+  // rapid start→stop can't leave the server watching behind a stopped chip.
+  const commentWatchSeqRef = useRef<Map<string, number>>(new Map());
+  const commentWatchQueueRef = useRef<Map<string, Promise<void>>>(new Map());
+  // Last value the SERVER confirmed per chat — what a failed toggle reverts to.
+  const commentWatchConfirmedRef = useRef<Map<string, string | null>>(new Map());
+  // Chats with a toggle PATCH in flight — loadChatThreads must not overwrite
+  // their confirmed value with a read that may predate the landing PATCH.
+  const commentWatchPendingRef = useRef<Map<string, number>>(new Map());
   const draftPromotionByIdRef = useRef<Map<string, Promise<ChatThread | null>>>(new Map());
   // In-flight model/harness PATCHes per chat. A send must not race these: the
   // runner reads chats.model/chats.harness at turn start, so a turn fired
@@ -1924,13 +2704,16 @@ export default function WorkspacePage() {
       cancelled = true;
     };
   }, [localConfig]);
-  const desktopSignedIn = useDesktopCredentials(desktopConfig);
+  const desktopSignedIn = useDesktopCredentials(desktopConfig) === true;
   const desktopProfile = useDesktopProfile(desktopSignedIn && !user);
   // Local projects never touch Supabase — a null client no-ops every realtime
-  // hook (presence, files channel, comments, doc-edits) in one place.
+  // hook (presence, files channel, comments, doc-edits) in one place. Anonymous
+  // `?pshare=` guests additionally wait for their realtime JWT mint: a channel
+  // subscribed before the socket has auth claims stays event-less forever.
+  const pshareRealtimeReady = usePathShareRealtimeAuthReady();
   const supabaseClient = useMemo(
-    () => (isClerkLoaded && !isLocalWorkspace ? createBrowserClient() : null),
-    [isClerkLoaded, isLocalWorkspace],
+    () => (isClerkLoaded && pshareRealtimeReady && !isLocalWorkspace ? createBrowserClient() : null),
+    [isClerkLoaded, pshareRealtimeReady, isLocalWorkspace],
   );
   const workspacePresenceState = useWorkspacePresence({
     supabaseClient,
@@ -1939,6 +2722,22 @@ export default function WorkspacePage() {
     anonId,
     anonDisplayName: anonId ? anonDisplayName(anonId) : null,
     anonColor: anonId ? pickColor(`${ANON_AUTHOR_PREFIX}${anonId}`) : null,
+    // Broadcast which file this browser is in so other clients' bubble
+    // clicks can jump straight to us. The last-FOCUSED editor's file wins
+    // (split panes make the primary selection wrong); either way only a file
+    // some pane actively SHOWS is broadcast — the primary selection can be a
+    // background tab under an active chat tab, and in chat mode
+    // selectedFilePath lingers after the editor (and its caret) unmounts.
+    // While the commit diff covers the editor column no pane file is truly
+    // on screen — same gate as the Share menu's file scopes.
+    openFilePath:
+      !isEditorVisible || commitDiffOpen
+        ? null
+        : focusedEditorPath && paneShowsFile(focusedEditorPath)
+          ? focusedEditorPath
+          : selectedFilePath && paneShowsFile(selectedFilePath)
+            ? selectedFilePath
+            : null,
   });
   const localAgentPresence = useLocalAgentPresence({ supabaseClient, projectId });
   // Cloud chats whose agent has a fresh doc_edits row — the "cursor in a
@@ -1952,25 +2751,50 @@ export default function WorkspacePage() {
   // the restored desktop layout mid-session (it re-syncs once on resize).
   useEffect(() => {
     if (isMobile) return;
+    // …except the chat-first arrival's preselection: the arrival's draft chat
+    // and the file list race, so mirroring here flashes the document and then
+    // yanks it. Strictly one-shot — the marker is spent on the first selection
+    // either way, so it can never skip a later, real one. (A rail click opens
+    // the file through handleFileClick, not through this mirror.)
+    const preselected = selectedFilePath && selectedFilePath === arrivalPreselectRef.current;
+    if (selectedFilePath) arrivalPreselectRef.current = null;
+    if (preselected) return;
     setEditorPanes((prev) => syncPrimaryActive(prev, selectedFilePath));
   }, [isMobile, selectedFilePath]);
+  // …and the reverse reconcile: the primary's editor chrome renders
+  // `selectedFilePath`, so the two must never disagree. The mirror above
+  // deliberately leaves the primary alone when the selection is already ON
+  // SCREEN in a side pane (a bare selection change must not open a second
+  // copy), so snap the selection back to the primary's own tab — otherwise
+  // its body would render a file its tab strip doesn't show. A selection
+  // sitting in the primary's BACKGROUND (behind a chat/diff tab) is the
+  // legitimate case and stays untouched.
+  useEffect(() => {
+    if (isMobile || !selectedFilePath) return;
+    const pane = editorPanes[0];
+    if (pane.tabs.includes(selectedFilePath) || isSpecialTab(pane.active) || !pane.active) return;
+    if (!editorPanes.some((p, i) => i > 0 && p.active === selectedFilePath)) return;
+    setSelectedFilePath(pane.active);
+  }, [editorPanes, isMobile, selectedFilePath]);
   // Restore the persisted pane layout once the file list can validate it…
   useEffect(() => {
     if (!projectId || !filesLoaded || editorPanesRestoredRef.current === projectId) return;
     editorPanesRestoredRef.current = projectId;
+    setPanesRestoredFor(projectId);
     // No (or corrupted) snapshot starts clean — also what drops the previous
     // workspace's panes after an in-place workspace switch.
     let restored = createInitialPanes();
     try {
-      const raw = window.localStorage.getItem(`${EDITOR_PANES_KEY_PREFIX}${projectId}`);
+      const raw = readPaneSnapshot(projectId);
       if (raw) restored = normalizePanes(JSON.parse(raw), existingPaths);
     } catch {
       /* corrupted snapshot — start clean */
     }
-    // Web (no-tabs) shell: a snapshot (possibly saved by a tabbed session)
-    // reduces to the visible file + whether a chat is open. Read the latched
-    // flag directly — the desktopTabs state may not have settled yet.
-    if (!isDesktopShell()) restored = flattenPanesForWeb(restored);
+    // No-tabs shell (web build, or desktop with the top bar hidden): a
+    // snapshot (possibly saved by a tabbed session) reduces to the visible
+    // file + whether a chat is open. Read the latched flag + preference
+    // directly — the desktopTabs state may not have settled yet.
+    if (!isDesktopShell() || hideTopBarPreferred()) restored = flattenPanesForWeb(restored);
     // Whether a real snapshot restored content — the legacy chat-reveal
     // effect must not replace a restored file tab, but a first arrival
     // (whose auto-selected file merely mirrored into the pane) still gets
@@ -2036,15 +2860,9 @@ export default function WorkspacePage() {
   useEffect(() => {
     // layoutConfigReady is the repo's "hydration settled" persistence gate —
     // before it, isMobile can still hold its pre-matchMedia initial false.
+    // Panel sessions never persist (gated inside persistPaneSnapshot).
     if (isMobile || !layoutConfigReady || !projectId || editorPanesRestoredRef.current !== projectId) return;
-    try {
-      window.localStorage.setItem(
-        `${EDITOR_PANES_KEY_PREFIX}${projectId}`,
-        JSON.stringify(panesSnapshot(editorPanes)),
-      );
-    } catch {
-      /* quota / private mode */
-    }
+    persistPaneSnapshot(projectId, panesSnapshot(editorPanes));
   }, [editorPanes, isMobile, layoutConfigReady, projectId]);
 
   // Optimistic file-tree edit: marks a local mutation so an in-flight reload
@@ -2101,14 +2919,20 @@ export default function WorkspacePage() {
   );
   const { uploads, queueUploads, removeUpload, reportUploadError } = useWorkspaceUploads({
     projectId,
-    canWrite,
+    // Path-share editors can upload inside their granted subtree — every
+    // queue call site gates per target (canUploadToFolder), so the hook's
+    // workspace-wide flag only needs to not block grant holders outright.
+    canWrite: canWrite || pathGrants.some((grant) => grant.role === 'edit'),
     existingPaths,
     fetchImpl: apiFetch,
     uploadBinary: localBinaryUpload,
     onUploadComplete: (file, upload) => {
       upsertWorkspaceFile(file);
       if (upload.target === 'chat' && upload.chatId) {
-        addChatAttachment(upload.chatId, buildAttachmentFromFile(file));
+        // The chat's id may have swapped (draft promotion / empty-chat
+        // demotion) while the upload was in flight — attach to the live id
+        // or the finished upload lands on a retired key and vanishes.
+        addChatAttachment(resolveLiveChatId(upload.chatId), buildAttachmentFromFile(file));
       }
     },
     onFilesChanged: () => filesChannelRef.current?.postMessage({ type: 'refresh' }),
@@ -2116,7 +2940,7 @@ export default function WorkspacePage() {
 
   const handleEditorImageDrop = useCallback(
     async (file: File) => {
-      if (!projectId || !canWrite) return null;
+      if (!projectId || !canUploadToFolder('assets')) return null;
       try {
         const result = await uploadImageFromEditor({
           projectId,
@@ -2132,7 +2956,7 @@ export default function WorkspacePage() {
         return null;
       }
     },
-    [projectId, canWrite, existingPaths, localBinaryUpload, reportUploadError],
+    [projectId, canUploadToFolder, existingPaths, localBinaryUpload, reportUploadError],
   );
 
   const layoutStorageKey = workspaceLayoutStorageKey(projectId);
@@ -2167,12 +2991,16 @@ export default function WorkspacePage() {
       const cfg = config ?? {};
       // Migrate legacy rails ('files'/'chats'/'commits') to the unified column.
       const stored = cfg.openLeftRail as unknown as string | null | undefined;
+      // A first visit opens the file rail everywhere: the arrival lands on a
+      // document, and the tree beside it is what makes the workspace legible
+      // (and where the Chats section lives).
+      const arrivalRail: LeftRail = 'project';
       if (stored === null) setOpenLeftRail(null);
       else if (stored != null) setOpenLeftRail('project');
-      // Nothing stored on an arrival = first visit; apply the collapsed default
-      // so a soft workspace switch can't leak the previous workspace's rail
-      // into the new workspace's persisted layout.
-      else if (opts?.arrival) setOpenLeftRail(null);
+      // Nothing stored on an arrival = first visit; apply the default so a soft
+      // workspace switch can't leak the previous workspace's rail into the new
+      // workspace's persisted layout.
+      else if (opts?.arrival) setOpenLeftRail(arrivalRail);
       const hasDeepLinkedFile = Boolean(deepLinkedFileId || deepLinkedFilePath);
       // Prefer the stored open-set; migrate a legacy single `mode` if that's all
       // we have. `null` means nothing stored.
@@ -2188,21 +3016,17 @@ export default function WorkspacePage() {
           hasEditorAnchor: Boolean(deepLinkedCommentThreadId || deepLinkedDiffId),
           chatIntent: deepLinkChatIntent,
         });
-        // Chat-first landing (no editor intent in the URL): remember it so the
-        // async access check can swap read-only visitors to the doc they came
-        // for, and put the caret in the composer — arriving here means "say
-        // what you want".
+        // Chat-sole landing (explicit chat link, or a stored chat-only
+        // layout): remember it so the async access check can swap read-only
+        // visitors to the doc, and put the caret in the composer — arriving
+        // here means "say what you want". The rail is NOT forced here: a first
+        // visit already took the shell default above, and on a return visit
+        // the rail the user left behind is theirs, chat-only layout or not.
         arrivalChatDefaultRef.current = panels.length === 1 && panels[0] === 'chat';
-        if (arrivalChatDefaultRef.current) {
-          setShouldFocusChatInput(true);
-          // Chat-first landings start without the files rail, whatever the
-          // stored layout says — the empty-chat hero is the whole screen.
-          // Remember what we closed in a ref: persistence writes the live
-          // state, so localStorage no longer holds the pre-arrival rail by
-          // the time the async access check may need to give it back.
-          arrivalClosedRailRef.current = stored != null ? 'project' : null;
-          setOpenLeftRail(null);
-        }
+        arrivalSwappedToDocRef.current = false; // new arrival, new decision
+        // First visit = nothing stored — the non-owner swap keys off this.
+        arrivalHadStoredLayoutRef.current = storedPanels !== null;
+        if (arrivalChatDefaultRef.current) setShouldFocusChatInput(true);
         setOpenPanels(panels);
       } else if (storedPanels || hasDeepLinkedFile || deepLinkChatIntent) {
         // Mid-session re-apply (mobile↔desktop flip): restore what the user had
@@ -2222,13 +3046,17 @@ export default function WorkspacePage() {
 
   const applyFreshDesktopLayout = useCallback(
     (_config: Partial<WorkspaceLayoutConfig> | null) => {
-      setOpenLeftRail(null);
+      setOpenLeftRail('project');
       setShowSettingsModal(false);
-      // A just-created workspace lands on the chat box (the seeded doc is one
-      // click away); a template pick keeps its document beside the chat.
-      setOpenPanels(freshTemplateChatIntent ? ['editor', 'chat'] : ['chat']);
-      arrivalChatDefaultRef.current = !freshTemplateChatIntent;
-      setShouldFocusChatInput(true);
+      // A just-created workspace lands on its seeded welcome.md with the file
+      // tree beside it; a template pick keeps its document beside the chat.
+      // Same value the URL-only initializer already chose, so the fresh
+      // arrival never repaints from chat to document after hydration.
+      setOpenPanels(freshTemplateChatIntent ? ['editor', 'chat'] : ['editor']);
+      arrivalChatDefaultRef.current = false;
+      arrivalSwappedToDocRef.current = false;
+      arrivalHadStoredLayoutRef.current = false;
+      if (freshTemplateChatIntent) setShouldFocusChatInput(true);
       setSidebarSections([...DEFAULT_SIDEBAR_SECTIONS]);
     },
     [freshTemplateChatIntent]
@@ -2236,7 +3064,10 @@ export default function WorkspacePage() {
 
   const persistLayoutConfig = useCallback(
     (overrides: Partial<WorkspaceLayoutConfig> = {}) => {
-      if (!hasMounted || !projectId || !layoutConfigReady || isMobile || blockFreshLayoutPersistenceRef.current) return;
+      // latchPanelView: an embedded panel session (?view=panel) never
+      // persists — unlike the fresh-layout block, this gate holds for the
+      // whole session, so the embed can't clobber the real-browser layout.
+      if (!hasMounted || !projectId || !layoutConfigReady || isMobile || blockFreshLayoutPersistenceRef.current || latchPanelView()) return;
       const config: WorkspaceLayoutConfig = {
         openLeftRail,
         openPanels,
@@ -2274,7 +3105,7 @@ export default function WorkspacePage() {
   }, []);
 
   const openCenterPanel = useCallback(
-    (panel: CenterPanel, opts?: { chatId?: string; side?: boolean }) => {
+    (panel: CenterPanel, opts?: { chatId?: string; side?: boolean; append?: boolean }) => {
       // Opening a center panel drops any selected commit so the columns show
       // instead of the commit diff viewer keeping the center (Phase 1 behavior).
       setSelectedCommit(null);
@@ -2288,8 +3119,11 @@ export default function WorkspacePage() {
       // still points at the previous chat when they fire, and auto-opening it
       // would replace the primary doc with a stale chat tab.
       if (panel === 'chat' && !isMobile) {
-        if (opts?.chatId) openChatTabInPanes(opts.chatId, { side: opts.side });
-        else openChatTabForCurrentRef.current();
+        if (opts?.chatId) openChatTabInPanes(opts.chatId, { side: opts.side, append: opts.append });
+        // `side` matters here too: on the file-first landing the chat is
+        // opened from the rail while a document owns the pane, and it must
+        // dock BESIDE that document rather than replace it.
+        else openChatTabForCurrentRef.current({ side: opts?.side });
       }
     },
     [isMobile, openChatTabInPanes, openRightDock],
@@ -2352,6 +3186,19 @@ export default function WorkspacePage() {
     setShowSettingsModal(true);
   }, [isMobile]);
 
+  // Pending "the Sundial Agent needs an account" prompt, raised by the send
+  // gate instead of jumping straight to Clerk (and, on desktop, to the system
+  // browser). Holds the resume path and the message that was being sent.
+  const [cloudSignInPrompt, setCloudSignInPrompt] = useState<{
+    redirectUrl?: string;
+    draft: string;
+  } | null>(null);
+  // Free anonymous runs left on an anon-owned workspace (null: not anon-owned
+  // / unknown). Fed by the files payload; read at send time only, so a ref —
+  // it must not re-render anything, and staleness just means the server gate
+  // gives the honest answer instead.
+  const anonRunsRemainingRef = useRef<number | null>(null);
+
   // Integrations are account-scoped. A logged-out user clicking one goes
   // straight to Clerk sign-in — NOT a connect modal with the sign-in modal
   // stacked on top — and lands back on the integration surface via the
@@ -2412,21 +3259,35 @@ export default function WorkspacePage() {
       if (!projectId) return;
       type FilesPayload = {
         files: WorkspaceFileRow[];
+        workspaceId?: string;
         canWrite?: boolean;
+        isOwner?: boolean;
         canSuggest?: boolean;
         canComment?: boolean;
         canAccessSecrets?: boolean;
+        isMember?: boolean;
+        anonRunsRemaining?: number | null;
+        pathGrants?: PathGrant[];
+        chatGrants?: string[];
+        scoped?: boolean;
         projectTitle?: string | null;
         projectStatus?: 'active' | 'archived' | null;
         projectKind?: WorkspaceKind | null;
+        projectCreatedAt?: string | null;
         hostUrl?: string | null;
         cold?: boolean;
         localRoots?: { prefix: string; root: string; name: string }[];
+        fileOrder?: FileOrderMap;
       };
       let payload: FilesPayload;
       // Generation at the moment this reload's data was fetched; used below to
       // skip a file-list overwrite that a local mutation has since superseded.
       let fetchGen: number | null = null;
+      // Same idea for the sidebar order, captured BEFORE the fetch: an
+      // in-flight check at apply time would still let a GET that started
+      // before a drag — and resolved after its PUT finished — snap the tree
+      // back under the cursor.
+      const orderGen = fileOrderGenRef.current;
       // SSR-preloaded files (first paint) skip the fetch entirely.
       if (preloaded) {
         setAccessError(null);
@@ -2435,6 +3296,8 @@ export default function WorkspacePage() {
         fetchGen = filesGenRef.current;
         const res = await apiFetch(`/api/workspace/files?projectId=${projectId}`);
         if (!res.ok) {
+          const denial = (await res.json().catch(() => null)) as { claimable?: boolean } | null;
+          setAccessClaimable(Boolean(denial?.claimable));
           // 401 = caller had no recognized identity — on a background poll
           // (shouldSetInitial=false) this is usually a transient Clerk JWT
           // refresh race on tab wake-up; the next poll repopulates state, so
@@ -2463,19 +3326,51 @@ export default function WorkspacePage() {
       // snapshot predates the change and would clobber the optimistic update
       // (resurrect a deleted file, un-move a moved one). Apply the rest of the
       // payload but leave the file list to the mutation's own follow-up reload.
-      if (fetchGen === null || filesGenRef.current === fetchGen) {
-        setWorkspaceFiles((previous) =>
-          hostUnavailable && previous.length > 0 ? previous : filesList
-        );
+      const listApplied = fetchGen === null || filesGenRef.current === fetchGen;
+      if (listApplied) {
+        setWorkspaceFiles((previous) => (hostUnavailable && previous.length > 0 ? previous : filesList));
       }
       setFilesLoaded(true);
+      // The initial load SKIPPED its list (a mutation raced the fetch), so the
+      // tree is empty but marked loaded, and nothing re-triggers it until the
+      // 15s poll — the reported "opened my project, no files; reopening fixed
+      // it". Re-fetch immediately. Once per project: a second miss falls back
+      // to the poll rather than spinning.
+      if (!listApplied && shouldSetInitial && emptyRetryProjectRef.current !== projectId) {
+        emptyRetryProjectRef.current = projectId;
+        void reloadFilesRef.current?.(true);
+      }
       if (payload.localRoots) setLocalRoots(payload.localRoots);
+      // The workspace's shared sidebar arrangement. Dropped when a drag landed
+      // while this reload was in flight (its payload predates the drag), and
+      // short-circuited when it already matches, so a poll can't churn the
+      // tree's memos every cycle.
+      if (payload.fileOrder && fileOrderGenRef.current === orderGen) {
+        const incoming = sanitizeFileOrder(payload.fileOrder);
+        setFileOrder((prev) => (sameFileOrder(prev, incoming) ? prev : incoming));
+        writeFileOrder(projectId, incoming);
+      }
       if (typeof payload.canWrite === 'boolean') {
         setCanWrite(payload.canWrite);
         setCanSuggest(payload.canSuggest ?? payload.canWrite);
         setCanComment(payload.canComment ?? payload.canWrite);
       }
+      if (typeof payload.anonRunsRemaining === 'number' || payload.anonRunsRemaining === null) {
+        anonRunsRemainingRef.current = payload.anonRunsRemaining;
+      }
+      if (typeof payload.isOwner === 'boolean') setIsOwner(payload.isOwner);
       setCanAccessSecrets(Boolean(payload.canAccessSecrets));
+      // Both servers (files route + SSR preload) always include the field;
+      // a payload WITHOUT it predates grants support and must not clear
+      // capability a previous response delivered.
+      if (Array.isArray(payload.pathGrants)) {
+        setPathGrants(payload.pathGrants);
+        setChatGrants(payload.chatGrants ?? []);
+        setIsScopedGuest(Boolean(payload.scoped));
+      }
+      if (typeof payload.workspaceId === 'string' && payload.workspaceId) {
+        setResolvedProjectId(payload.workspaceId); // no-op re-set for members
+      }
       if (typeof payload.projectTitle === 'string') {
         setProjectTitle(payload.projectTitle);
       }
@@ -2485,11 +3380,17 @@ export default function WorkspacePage() {
       if (payload.projectKind === 'standard') {
         setProjectKind(payload.projectKind);
       }
+      if (payload.projectCreatedAt) setProjectCreatedAt(payload.projectCreatedAt);
       // Legacy CRDT-snapshot prefetch is gone under Sunny sandbox — Supabase
       // no longer stores Yjs snapshots and the live host hydrates from the
       // plain text on disk during the Hocuspocus `onLoadDocument` hook.
 
-      if (!didSetInitialFileRef.current && shouldSetInitial && filesList.length) {
+      // `listApplied`: never seed the selection from a list we just REJECTED
+      // (a rename/move/delete raced this fetch). Selecting from it would also
+      // set didSetInitialFileRef, so the retry above could refresh the tree but
+      // never replace the stale pick — an empty editor, or a tab for a file
+      // that no longer exists, until you click something else.
+      if (listApplied && !didSetInitialFileRef.current && shouldSetInitial && filesList.length) {
         let initialPath: string | null = null;
         let storedPath: string | null = null;
         const deepLinkedFile =
@@ -2534,37 +3435,18 @@ export default function WorkspacePage() {
         }
 
         if (!initialPath) {
-          const isOpenable = (file: WorkspaceFileRow) =>
-            file.type !== 'proposal' && file.type !== 'folder' && !isMetaPath(file.path);
-          const basename = (path: string) => path.split('/').pop() ?? path;
-          const isReadme = (path: string) => /^readme(\.[a-z0-9]+)?$/i.test(basename(path));
-          const isMarkdown = (path: string) => /\.(md|mdx)$/i.test(path);
-          const isLatexDoc = (path: string) => /\.tex$/i.test(path);
-          const openable = filesList.filter(isOpenable);
-          const rootReadme = openable.find((f) => !f.path.includes('/') && isReadme(f.path));
-          const anyReadme = rootReadme ?? openable.find((f) => isReadme(f.path));
-          const rootMarkdown = openable.find((f) => !f.path.includes('/') && isMarkdown(f.path));
-          const firstMarkdown = rootMarkdown ?? openable.find((f) => isMarkdown(f.path));
-          // main.tex first, then any root .tex, then any .tex anywhere — so
-          // template workspaces land on the paper, not on a vendored .sty.
-          const rootMain = openable.find((f) => !f.path.includes('/') && /^main\.tex$/i.test(f.path));
-          const rootLatex = openable.find((f) => !f.path.includes('/') && isLatexDoc(f.path));
-          const firstLatex = rootMain ?? rootLatex ?? openable.find((f) => isLatexDoc(f.path));
-          // New visitors land on the seeded welcome.tex (the friendly intro),
-          // not on their imported project files. Returning visitors are handled
-          // above by `storedPath`, so this only affects a first open.
-          const welcomeTex = openable.find((f) => /^welcome\.tex$/i.test(f.path));
-          const firstFile =
-            welcomeTex ??
-            anyReadme ??
-            firstMarkdown ??
-            firstLatex ??
-            filesList.find((file) => file.type !== 'proposal' && file.type !== 'folder') ??
-            filesList[0];
-          initialPath = firstFile?.path ?? null;
+          // Most recently edited text doc → root README → tree order, with
+          // non-content files excluded (lib/workspace/default-document.ts).
+          // Returning visitors are handled above by `storedPath`.
+          initialPath = pickDefaultDocument(filesList)?.path ?? null;
         }
 
         if (initialPath) {
+          // A chat-first arrival lands on the chat box: this pick is context
+          // only, so keep it out of the panes (see arrivalPreselectRef).
+          // Desktop-only, like the mirror it defers — mobile never runs the
+          // mirror, so the marker would survive to clobber a later resize.
+          if (arrivalChatDefaultRef.current && !isMobileRef.current) arrivalPreselectRef.current = initialPath;
           setSelectedFilePath(initialPath);
           // A ?fileId=/?filePath= deep link is explicit intent: it claims the
           // primary pane even over a restored chat tab. The background
@@ -2580,6 +3462,7 @@ export default function WorkspacePage() {
     },
     [claimPrimaryWithFile, deepLinkedFileId, deepLinkedFilePath, lastFileStorageKey, projectId, apiFetch]
   );
+  reloadFilesRef.current = reloadFiles;
 
   // Local projects: the sidecar's SSE stream replaces Supabase realtime for
   // tree invalidation (external edits, agent writes, sync). Coalesce bursts.
@@ -2623,6 +3506,9 @@ export default function WorkspacePage() {
     setIsCreatingGroupChat(false);
     setPreferencesLoaded(false);
     setFilesLoaded(false);
+    // Back to the optimistic default until the new workspace's payload lands —
+    // a previous workspace's non-owner state must not leak into this arrival.
+    setIsOwner(true);
   }, []);
 
   useWorkspaceFileLifecycle({
@@ -2635,7 +3521,7 @@ export default function WorkspacePage() {
     selectedFilePath,
     showMetaFiles,
     supabaseClient,
-    storageUsageEnabled: !isLocalWorkspace,
+    storageUsageEnabled: !isLocalWorkspace && backgroundDataReady,
     reloadFiles,
     didSetInitialFileRef,
     filesChannelRef,
@@ -2732,40 +3618,6 @@ export default function WorkspacePage() {
     setShow: setShowWorkspaceSwitcher,
   });
 
-  const workspaceSwitcherMenu = showWorkspaceSwitcher ? (
-    <WorkspaceSwitcherMenu
-      position={workspaceSwitcherPos}
-      otherWorkspaces={otherWorkspaces}
-      localProjects={localProjects}
-      canWrite={canWrite}
-      isArchived={isArchived}
-      isArchiving={isArchiving}
-      archiveActionLabel={archiveActionLabel}
-      canArchive={!isLocalWorkspace}
-      onSwitchWorkspace={(workspaceId) => {
-        handleWorkspaceSwitch(workspaceId);
-        setShowWorkspaceSwitcher(false);
-      }}
-      onRename={startProjectTitleEdit}
-      onNewWorkspace={() => {
-        persistLayoutConfig();
-        setShowWorkspaceSwitcher(false);
-      }}
-      onDashboard={() => {
-        persistLayoutConfig();
-        setShowWorkspaceSwitcher(false);
-      }}
-      onToggleArchive={() => {
-        setShowWorkspaceSwitcher(false);
-        if (isArchived) {
-          void unarchiveWorkspace();
-        } else {
-          void archiveWorkspace();
-        }
-      }}
-    />
-  ) : null;
-
   useWorkspaceDropdownDismissal({
     openChatMenuId,
     chatMenuRef,
@@ -2812,6 +3664,7 @@ export default function WorkspacePage() {
         addOverleaf: () => setShowAddOverleafModal(true),
         chatApps: () => openSettingsTab('chatApps'),
         connectAgent: () => void openLocalAgentModal(),
+        openWith: () => setShowOpenWithModal(true),
       };
   useEffect(() => {
     const open = modalDeepLinkParam ? modalDeepLinkOpenersRef.current[modalDeepLinkParam] : null;
@@ -2855,6 +3708,74 @@ export default function WorkspacePage() {
   const [chatsLoaded, setChatsLoaded] = useState(false);
   const [chatLoadError, setChatLoadError] = useState<string | null>(null);
   const [chatsProjectId, setChatsProjectId] = useState<string | null>(null);
+  // The chat-first landing is the OWNER's (founder, 2026-08-05): anyone
+  // arriving at a workspace they don't own has to look at it first before
+  // chatting, so non-owners get swapped to the default document. Access
+  // resolves async (the files payload carries canWrite/isOwner), so the swap
+  // fires only while the untouched arrival default is still up. Read-only
+  // visitors always swap (chat isn't theirs to drive); can-write members only
+  // on a first visit — a stored chat-only layout is their own choice.
+  // A workspace with no DOCUMENT to show (a local chat-share mirror; or one
+  // holding only folders/proposals) can't be swapped onto: there the visitor
+  // came for the conversation, so land on the newest real chat instead of an
+  // empty editor.
+  useEffect(() => {
+    const swap = shouldSwapArrivalToDocument({
+      isOwner,
+      canWrite,
+      chatArrivalDefault: arrivalChatDefaultRef.current,
+      hadStoredLayout: arrivalHadStoredLayoutRef.current,
+      // An EXPLICIT chat link (?chatId= / ?chat=1) lands on chat even for
+      // guests (the mirror-chat share case) — only the plain default gets
+      // swapped. draft-* ids are SESSION-LOCAL: a URL copied from the owner's
+      // address bar carries their dead draft id, no chat intent for a guest.
+      explicitChatIntent:
+        deepLinkChatIntent && !String(deepLinkedChatId ?? '').startsWith('draft-'),
+    });
+    if (!swap) return;
+    if (!filesLoaded) return;
+    // Gate on having something OPENABLE, not on the row count: a workspace of
+    // only folders/proposals has rows but no document, and swapping there
+    // would strand the visitor on an empty editor ("Nothing open").
+    const firstDocPath = pickDefaultDocument(workspaceFiles)?.path ?? '';
+    if (!firstDocPath) {
+      if (!chatsLoaded) return;
+      const mirror = chatThreads.find((thread) => !thread.chat.id.startsWith('draft-'));
+      if (mirror) {
+        arrivalChatDefaultRef.current = false;
+        void openChatByIdRef.current(mirror.chat.id);
+      }
+      return; // nothing to open: the arrival hero is all there is
+    }
+    arrivalChatDefaultRef.current = false;
+    arrivalSwappedToDocRef.current = true;
+    setOpenPanels((prev) => (prev.length === 1 && prev[0] === 'chat' ? ['editor'] : prev));
+    // Desktop chat visibility lives in the panes: demote any active chat tab
+    // to its nearest file tab so the visitor lands on the document. A fresh
+    // guest has NO file tabs yet — demotion alone lands on '' and the chat
+    // hero stays up — so open the workspace's first document instead.
+    setEditorPanes((prev) => {
+      let changed = false;
+      const next = prev.map((pane) => {
+        if (!isChatTab(pane.active)) return pane;
+        changed = true;
+        const files = pane.tabs.filter((t) => !isChatTab(t));
+        return { ...pane, active: files[files.length - 1] ?? '' };
+      });
+      // Nothing left showing (a fresh guest may have NO tabs at all — the
+      // chat hero renders without a pane tab): open the first document.
+      if (!next.some((pane) => pane.active)) {
+        // Outside the updater (React may run it twice): the doc body resolves
+        // the file from selectedFilePath, not the pane tab alone.
+        queueMicrotask(() => setSelectedFilePath(firstDocPath));
+        return openPaneTab(next, next[0]?.id ?? PRIMARY_PANE_ID, firstDocPath);
+      }
+      return changed ? next : prev;
+    });
+    // The visitor lands on the document with the file tree open — arriving at
+    // someone else's workspace means orienting by seeing what was shared.
+    setOpenLeftRail('project');
+  }, [canWrite, isOwner, deepLinkChatIntent, deepLinkedChatId, filesLoaded, workspaceFiles, chatsLoaded, chatThreads]);
   // last_message_at recorded when the client marked a chat read — lets a stale
   // chat-list refresh be ignored when it tries to re-raise a count we cleared.
   const readMarkedAtByChatIdRef = useRef<Record<string, string>>({});
@@ -2881,7 +3802,12 @@ export default function WorkspacePage() {
   // (see SundialChatTransport.reconnectToStream) is the correct layer.
   const ensureChatMessagesLoaded = useCallback(async (
     chatId: string,
-    options?: { force?: boolean },
+    // `fromSequence` — the submitted user row's sequence — extends the read
+    // back to cover a whole turn. An uncapped turn persists far more rows than
+    // one page, so a reconcile after a cold reattach would otherwise leave the
+    // turn's middle (its announcements and tool rows) in neither the replayed
+    // stream nor this page: permanently missing from the transcript.
+    options?: { force?: boolean; fromSequence?: number; findTurnStart?: boolean },
   ): Promise<ChatMessage[]> => {
     if (!chatId || isDraftChatId(chatId)) return [];
     const cached = chatMessagesByIdRef.current[chatId];
@@ -2897,6 +3823,16 @@ export default function WorkspacePage() {
         if (!res.ok) return chatMessagesByIdRef.current[chatId] ?? [];
         const payload = (await res.json()) as { messages: ChatMessage[] };
         normalized = (payload.messages ?? []).map(normalizeChatMessage);
+        if (typeof options?.fromSequence === 'number' || options?.findTurnStart) {
+          normalized = await backfillTurnRows(normalized, {
+            chatId,
+            fromSequence: options.fromSequence,
+            findTurnStart: options.findTurnStart,
+            fetchImpl: apiFetch,
+            normalize: normalizeChatMessage,
+            pageSize: INITIAL_CHAT_MESSAGE_LIMIT,
+          });
+        }
       } catch {
         // Network failure — keep whatever we already have rather than rejecting
         // (callers use `void`/`.then` without a catch).
@@ -2949,6 +3885,10 @@ export default function WorkspacePage() {
   }, []);
   const loadChatThreads = useCallback(async (): Promise<ChatThread[]> => {
     if (!projectId) return [];
+    // Path-grant-only guests skip chats entirely (the route would return an
+    // empty list); chat-grant guests fetch — the route scopes the list to
+    // exactly their granted chats.
+    if (isScopedGuestRef.current && chatGrantsRef.current.length === 0) return [];
     const activeProjectId = projectId;
     try {
       const params = new URLSearchParams({ projectId: activeProjectId });
@@ -2988,6 +3928,15 @@ export default function WorkspacePage() {
         return drafts.length > 0 ? [...chats, ...drafts] : chats;
       });
       setChatsProjectId(activeProjectId);
+      // Server truth refreshes the confirmed watch map too — listen_comments,
+      // another tab, or any server-side change would otherwise leave a stale
+      // entry for a later failed toggle to "revert" to. Skipped while a toggle
+      // PATCH is in flight: this read may predate the value about to land.
+      for (const thread of chats) {
+        if (!commentWatchPendingRef.current.has(thread.chat.id)) {
+          commentWatchConfirmedRef.current.set(thread.chat.id, thread.chat.comment_watch_path ?? null);
+        }
+      }
       return chats;
     } catch {
       setChatLoadError('Failed to load chats');
@@ -3025,6 +3974,30 @@ export default function WorkspacePage() {
     loadChatThreads,
     setChatsLoaded,
   });
+
+  // Local first-message naming completion (see nameLocalChatFromFirstMessage):
+  // adopt the settled title immediately — rail, header, and tab labels all
+  // derive from chatThreads, and waiting for the 10s list poll left them on
+  // "New chat" long after the title landed in the sidecar store. Unset-guarded
+  // like the sidecar CAS, so an optimistic in-flight rename is never clobbered.
+  useEffect(() => {
+    if (!isLocalWorkspace) return;
+    const handleTitled = (event: Event) => {
+      const { chatId, title } = (event as CustomEvent<{ chatId?: string; title?: string }>).detail ?? {};
+      if (!chatId || !title) return;
+      setChatThreads((prev) =>
+        prev.map((thread) =>
+          // Same unnamed set as the sidecar CAS: blank or the legacy defaults.
+          thread.chat.id === chatId && ['', 'New Chat', 'New chat'].includes(thread.chat.title?.trim() ?? '')
+            ? { ...thread, chat: { ...thread.chat, title } }
+            : thread,
+        ),
+      );
+    };
+    window.addEventListener('sundial:local-chat-titled', handleTitled);
+    return () => window.removeEventListener('sundial:local-chat-titled', handleTitled);
+  }, [isLocalWorkspace]);
+
 
 
   const {
@@ -3075,10 +4048,11 @@ export default function WorkspacePage() {
     showSettingsModal,
   ]);
 
-  // Single load of the user's saved default model. This is the one place the
-  // default is read; it seeds the next-chat model and the Settings picker, and
-  // flips `preferencesLoaded` (the startup gate) independently of the Settings
-  // panel ever opening.
+  // Single load of the user's saved model preferences. This is the one place
+  // they are read; the default model seeds the next-chat model and the Settings
+  // picker, the autocomplete override feeds the Settings picker beside it, and
+  // this flips `preferencesLoaded` (the startup gate) independently of the
+  // Settings panel ever opening.
   useEffect(() => {
     // Wait for Clerk to settle: a signed-in user is briefly null while
     // hydrating, and treating that as anonymous would seed new chats (and the
@@ -3086,13 +4060,41 @@ export default function WorkspacePage() {
     if (!hasMounted || !isAuthLoaded) return;
     if (!user?.id) {
       setSavedDefaultModel(DEFAULT_MODEL_REF);
+      setSavedAutocompleteModel(null);
+      // No account to read from — the per-browser flag store (URL /
+      // localStorage) is all an anonymous visitor has.
+      setSavedFlags({ ...flagDefaults(), autocomplete_enabled: isAutocompleteEnabled() });
+      setSavedAutocompleteMode(getAutocompleteMode());
       setPreferencesLoaded(true);
       return;
     }
     let cancelled = false;
-    const settle = (saved: string) => {
+    const settle = (
+      saved: string,
+      autocomplete: string | null = null,
+      // Fetch-failure fallback: keep whatever the flag store already says
+      // rather than force-disabling a browser that had a flag on.
+      flags: Record<string, boolean> = {
+        ...flagDefaults(),
+        autocomplete_enabled: isAutocompleteEnabled(),
+        pdf_comments_enabled: getFlag('pdf_comments_enabled'),
+      },
+      // Fetch-failure fallback: keep whatever the store already says.
+      mode: AutocompleteMode = getAutocompleteMode(),
+    ) => {
       if (cancelled) return;
       setSavedDefaultModel(saved);
+      setSavedAutocompleteModel(autocomplete);
+      setAutocompleteMode(mode);
+      setSavedAutocompleteMode(mode);
+      // An explicit `?autocomplete=on|off` outranks the account for THIS load
+      // only: it sits in the store's in-memory cache, so hydration skips that
+      // key to not clobber it. Nothing is persisted — a link must never
+      // durably opt anyone in — and the Settings switch keeps showing the
+      // saved account value, the only thing a toggle there changes.
+      const urlOverride = urlAutocompleteOverrideRef.current;
+      hydrateFlags(flags, urlOverride !== null ? ['autocomplete_enabled'] : []);
+      setSavedFlags(flags);
       // Only seed the next-chat model while it's still the untouched app default
       // — never clobber a model the user (or an open chat) already chose.
       setPreferredChatModel((prev) => (prev === DEFAULT_MODEL_REF ? saved : prev));
@@ -3100,14 +4102,38 @@ export default function WorkspacePage() {
     };
     fetch('/api/user/preferences')
       .then((res) => (res.ok ? res.json() : Promise.reject()))
-      .then((prefs: { default_model?: string | null }) =>
-        settle(normalizeChatModelRef(prefs.default_model?.trim() || DEFAULT_MODEL_REF))
+      .then(
+        (prefs: {
+          default_model?: string | null;
+          autocomplete_model?: string | null;
+          autocomplete_mode?: string | null;
+          flags?: Record<string, boolean>;
+        }) =>
+          settle(
+            normalizeChatModelRef(prefs.default_model?.trim() || DEFAULT_MODEL_REF),
+            typeof prefs.autocomplete_model === 'string' ? prefs.autocomplete_model : null,
+            resolveFlags(prefs.flags),
+            isAutocompleteMode(prefs.autocomplete_mode) ? prefs.autocomplete_mode : DEFAULT_AUTOCOMPLETE_MODE,
+          )
       )
       .catch(() => settle(DEFAULT_MODEL_REF));
     return () => {
       cancelled = true;
     };
   }, [hasMounted, isAuthLoaded, user?.id, projectId]);
+
+  const handleAutocompleteModeChange = useCallback((mode: AutocompleteMode) => {
+    setSavedAutocompleteMode(mode);
+    // Mirror into the client store so open editors switch behavior live.
+    setAutocompleteMode(mode);
+  }, []);
+
+  const handleFlagChange = useCallback((key: string, enabled: boolean) => {
+    setSavedFlags((prev) => ({ ...(prev ?? flagDefaults()), [key]: enabled }));
+    // Mirror into the client flag store so open editors follow without a
+    // reload — e.g. the Monaco provider reads it synchronously per request.
+    setFlag(key, enabled);
+  }, []);
 
   const handlePreferencesSectionChange = useCallback(
     (values: { defaultModel: string }) => {
@@ -3141,12 +4167,25 @@ export default function WorkspacePage() {
           <PreferencesSection
             projectId={projectId}
             value={savedDefaultModel}
+            autocompleteValue={savedAutocompleteModel}
+            flags={savedFlags}
+            autocompleteMode={savedAutocompleteMode}
             onChange={handlePreferencesSectionChange}
+            onAutocompleteChange={setSavedAutocompleteModel}
+            onFlagChange={handleFlagChange}
+            onAutocompleteModeChange={handleAutocompleteModeChange}
+            canSavePreferences={Boolean(user?.id)}
           />
         </div>
       </div>
     );
   };
+
+  const renderShortcutsPanel = (layout: 'desktop' | 'mobile') => (
+    <div className={layout === 'mobile' ? 'px-4 py-3' : 'flex-1 overflow-auto px-4 py-4'}>
+      <ShortcutsSection desktopShell={desktopTabs} />
+    </div>
+  );
 
   const renderContextOverviewPanel = (layout: 'desktop' | 'mobile') => {
     const isMobileLayout = layout === 'mobile';
@@ -3170,7 +4209,7 @@ export default function WorkspacePage() {
                   </div>
                   <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
                     <div className="text-[11px] font-medium uppercase tracking-wide text-stone-400">Default responder</div>
-                    <div className="mt-1 text-sm font-medium text-stone-800">Sunny</div>
+                    <div className="mt-1 text-sm font-medium text-stone-800">Sundial Agent</div>
                   </div>
                   <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
                     <div className="text-[11px] font-medium uppercase tracking-wide text-stone-400">Runtime</div>
@@ -3454,12 +4493,13 @@ export default function WorkspacePage() {
     canShowShareControls,
     pendingEmailInvites,
     shareStatus,
+    workspaceAudience,
     handleOpenShare,
     handleCopyInvite,
     handleCreateLinkInvite,
     handleCreateEmailInvite,
-    handleVisibilityChange,
-    handlePublicAccessChange,
+    handleVisibilityChange: changeVisibility,
+    handlePublicAccessChange: changePublicAccess,
     handleUpdateMemberRole,
     handleRemoveMember,
     handleResendShareInvite,
@@ -3475,33 +4515,154 @@ export default function WorkspacePage() {
     user,
     router,
     openSignIn,
+    eagerLoad: backgroundDataReady,
   });
   // Local sharing: any tree node (or the whole project) shares to a cloud
   // workspace via the sidecar bridge — invites live on that workspace's ACL,
   // so per-file / per-subfolder audiences are separate shares.
-  const [localShareScope, setLocalShareScope] = useState<{ kind: 'project' | 'folder' | 'file'; path: string } | null>(null);
+  const [localShareScope, setLocalShareScope] = useState<ShareScope | null>(null);
+  // Cloud per-path sharing (path_shares): grant one file/folder to people
+  // outside the workspace. Loaded for share managers only (the API 403s
+  // everyone else, which the hook treats as "no badges").
+  const [pathShareScope, setPathShareScope] = useState<{ path: string; kind: 'file' | 'folder' } | null>(null);
+  const {
+    shares: cloudPathShares,
+    sharedPaths: cloudSharedScopePaths,
+    loaded: cloudPathSharesLoaded,
+    refresh: refreshCloudPathShares,
+  // `canInviteShare` is optimistic-true before /api/workspace/share answers
+  // (it 403s for pshare guests), so scoped guests are excluded explicitly.
+  } = usePathShares(
+    cloudProjectId,
+    !isLocalWorkspace && canInviteShare && !isScopedGuest && (backgroundDataReady || Boolean(pathShareScope)),
+  );
   const { shares: localShares, refreshShares: refreshLocalShares } = useLocalShares(
     localConfig,
     isLocalWorkspace ? projectId : null,
   );
+  // The sidecar knows what's SYNCED (enabled), not who can see it — the
+  // audience lives in the backing workspace's grants, and the share modal can
+  // empty it without stopping the sync. Read those grants so a synced-but-
+  // private scope stops reading "Shared with people" (see localSharedScopeMap).
+  // Only enabled grants-model rows (share_id names the union share row) may
+  // pick the backing id — a stale or legacy row first in the list would read
+  // grants from the wrong workspace and mark live scopes private.
+  const localBackingWorkspaceId = isLocalWorkspace
+    ? (localShares.find((share) => share.enabled && share.share_id)?.workspace_id ?? null)
+    : null;
+  // No signed-in gate (like useLocalShares): the packaged app's auth is the
+  // proxy-injected sd_ bearer, not a Clerk user. Signed-out just 403s into
+  // loaded=false, and the sync-state answer stands.
+  const {
+    sharedPaths: localBackingAudience,
+    linkSharedPaths: localBackingLinkPaths,
+    loaded: localBackingAudienceLoaded,
+    refresh: refreshLocalBackingAudience,
+  } = usePathShares(localBackingWorkspaceId, Boolean(localBackingWorkspaceId));
+  // A PROJECT scope's audience lives in the backing workspace's ACL (members,
+  // invites, org) plus the link lane — a path-grants read can't see it.
+  const { audience: localBackingAclAudience, lane: localBackingAclLane, refresh: refreshLocalBackingAcl } =
+    useWorkspaceAudienceProbe(localBackingWorkspaceId);
   const localSharedScopePaths = useMemo(
-    () => new Set(localShares.filter((share) => share.enabled).map((share) => share.scope_path)),
-    [localShares],
+    () =>
+      localSharedScopeMap(
+        localShares,
+        localBackingAudienceLoaded ? localBackingAudience : null,
+        localBackingAclAudience,
+        {
+          // Lane answers ride the same authoritative reads: unloaded = no
+          // lane claim, the scope stays 'shared' (the pre-lane icon).
+          linkPaths: localBackingAudienceLoaded ? localBackingLinkPaths : null,
+          projectLane: localBackingAclLane,
+        },
+      ),
+    [localShares, localBackingAudience, localBackingAudienceLoaded, localBackingAclAudience, localBackingAclLane, localBackingLinkPaths],
   );
+  // Tree badges consume only the recorded kind — identical to before (the
+  // blue-dot logic itself is untouched).
+  const localSharedScopeKinds = useMemo(
+    () => new Map(Array.from(localSharedScopePaths, ([p, v]) => [p, v.kind] as const)),
+    [localSharedScopePaths],
+  );
+
   const openShare = useCallback(() => {
     if (isLocalWorkspace) setLocalShareScope({ kind: 'project', path: '' });
     else handleOpenShare();
   }, [isLocalWorkspace, handleOpenShare]);
+  // Defined after openShare — the menu's Share entry is the workspace-level
+  // share entry point (the top bar carries no Share button).
+  const workspaceSwitcherMenu = showWorkspaceSwitcher ? (
+    <WorkspaceSwitcherMenu
+      position={workspaceSwitcherPos}
+      otherWorkspaces={otherWorkspaces}
+      localProjects={localProjects}
+      canWrite={canWrite}
+      isArchived={isArchived}
+      isArchiving={isArchiving}
+      archiveActionLabel={archiveActionLabel}
+      canArchive={!isLocalWorkspace}
+      onShare={
+        canShowShareControls
+          ? () => {
+              setShowWorkspaceSwitcher(false);
+              openShare();
+            }
+          : undefined
+      }
+      shareStatus={isLocalWorkspace ? null : shareStatus}
+      onSwitchWorkspace={(workspaceId) => {
+        handleWorkspaceSwitch(workspaceId);
+        setShowWorkspaceSwitcher(false);
+      }}
+      onRename={startProjectTitleEdit}
+      onNewWorkspace={() => {
+        persistLayoutConfig();
+        setShowWorkspaceSwitcher(false);
+      }}
+      onDashboard={() => {
+        persistLayoutConfig();
+        setShowWorkspaceSwitcher(false);
+      }}
+      onToggleArchive={() => {
+        setShowWorkspaceSwitcher(false);
+        if (isArchived) {
+          void unarchiveWorkspace();
+        } else {
+          void archiveWorkspace();
+        }
+      }}
+    />
+  ) : null;
   // Chat share: the full GDocs-style modal. A chat link is the workspace URL +
   // chatId, so people and general access are the workspace's (shown as
   // inherited); invites minted here are chat-targeted workspace invites.
-  // Local chats share by syncing the backing project, so they open the local
-  // share modal instead.
+  // Local chats open the local share modal at CHAT scope — sharing mirrors
+  // just that conversation to a cloud workspace, never the project's files.
   const [showChatShareModal, setShowChatShareModal] = useState(false);
-  const openChatShare = useCallback(() => {
-    if (isLocalWorkspace) setLocalShareScope({ kind: 'project', path: '' });
-    else setShowChatShareModal(true);
-  }, [isLocalWorkspace]);
+  // The chat header's ⋮ menu (founder: chats need one) — mirrors the sidebar
+  // chat-row ⋮ for the OPEN chat. Same outside-click/Escape dismissal as the
+  // other AnchoredDropdown menus.
+  const [chatHeaderMenuOpen, setChatHeaderMenuOpen] = useState(false);
+  const chatHeaderMenuWrapRef = useRef<HTMLDivElement | null>(null);
+  const chatHeaderMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (!chatHeaderMenuOpen) return;
+    const handleMouseDown = (event: MouseEvent) => {
+      // The panel itself is portaled to document.body — recognize clicks
+      // inside it by the floating-menu marker, not DOM ancestry.
+      if (isInFloatingActionMenu(event.target)) return;
+      if (!chatHeaderMenuWrapRef.current?.contains(event.target as Node)) setChatHeaderMenuOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setChatHeaderMenuOpen(false);
+    };
+    document.addEventListener('mousedown', handleMouseDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleMouseDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [chatHeaderMenuOpen]);
 
   const workspaceChatCollaborators = useMemo<CollaboratorBadge[]>(() => {
     if (shareInfo?.members?.length) {
@@ -3548,6 +4709,19 @@ export default function WorkspacePage() {
   const collaboratorById = useMemo(
     () => new Map(workspaceChatCollaborators.map((collaborator) => [collaborator.id, collaborator])),
     [workspaceChatCollaborators]
+  );
+  // Human rows of the comment composer's `@` menu (the agent row is pinned on
+  // top by the builder). Self excluded — you don't tag yourself.
+  const commentMentionPeople = useMemo(
+    () =>
+      workspaceChatCollaborators
+        .filter((collaborator) => !collaborator.isYou)
+        .map((collaborator) => ({
+          handle: commentMentionHandle(collaborator),
+          label: collaborator.name,
+          imageUrl: collaborator.imageUrl,
+        })),
+    [workspaceChatCollaborators],
   );
   const resolvePendingEditAuthorLabel = useCallback(
     (turn: FilePendingTurn) => {
@@ -3649,26 +4823,60 @@ export default function WorkspacePage() {
     currentChatId && !isDraftChatId(currentChatId) && typeof window !== 'undefined'
       ? `${window.location.origin}${buildWorkspaceChatPath(workspaceRouteId, currentChatId)}`
       : '';
+  // (Below currentChatHeaderTitle on purpose — the deps close over it.)
+  // Local chats share at CHAT scope: only this conversation mirrors to the
+  // cloud. Draft chats aren't persisted yet, so they fall back to the
+  // whole-project share surface.
+  const openChatShare = useCallback(() => {
+    if (!isLocalWorkspace) return setShowChatShareModal(true);
+    setLocalShareScope(
+      currentChatId && !isDraftChatId(currentChatId)
+        ? { kind: 'chat', path: currentChatId, label: currentChatHeaderTitle }
+        : { kind: 'project', path: '' },
+    );
+  }, [isLocalWorkspace, currentChatId, currentChatHeaderTitle]);
   // Copy link from the chat share modal: link-shared chats copy the chat URL
   // itself; restricted workspaces fall back to the hook, which mints/copies a
   // viewer invite link targeted at this chat.
+  rootShareTokenRef.current = (() => {
+    const url = shareInfo?.linkShare?.url;
+    if (!url) return null;
+    try {
+      return new URL(url).searchParams.get(PATH_SHARE_TOKEN_PARAM);
+    } catch {
+      return null;
+    }
+  })();
   const handleChatShareCopyLink = useCallback(() => {
-    const isPublic = shareInfo?.visibility === 'public' && shareInfo.publicAccess !== 'none';
+    const linkShare = shareInfo?.linkShare ?? null;
     // Restricted + able to invite → mint/copy a chat-targeted viewer invite
-    // link. Otherwise copy the plain chat URL: it works for anyone on a
-    // link-shared workspace and existing members on a restricted one. Cloud
-    // links use the public origin (desktop shells serve from a loopback
-    // proxy a collaborator can't reach).
-    if (currentChatId && !isDraftChatId(currentChatId) && (isPublic || !canInviteShare)) {
-      return handleCopyInvite(`${shareOrigin()}${buildWorkspaceChatPath(workspaceRouteId, currentChatId)}`);
+    // link. Otherwise copy the chat URL itself: it works for anyone on a
+    // link-shared workspace and existing members on a restricted one. A
+    // TOKENED root share admits by token, so the chat URL must carry it —
+    // without ?pshare the recipient lands on a 404, and the bare root link
+    // would lose the chat target (tokenless shares admit on the bare URL).
+    // Cloud links use the public origin (desktop shells serve from a
+    // loopback proxy a collaborator can't reach).
+    if (currentChatId && !isDraftChatId(currentChatId) && (linkShare?.url || !canInviteShare)) {
+      const chatUrl = `${shareOrigin()}${buildWorkspaceChatPath(workspaceRouteId, currentChatId)}`;
+      // Owners parse the token from linkShare.url; ROOT-link guests reuse the
+      // token off their own URL only when their grants prove it IS the root
+      // token (narrow file/chat tokens must never ride an unrelated link —
+      // they'd leak that scope). Token-less viewer MEMBERS copy the bare URL
+      // — valid for every member, the same reach they had on a restricted
+      // workspace.
+      const token =
+        (linkShare?.url ? new URL(linkShare.url).searchParams.get(PATH_SHARE_TOKEN_PARAM) : null) ??
+        (holdsRootGrantRef.current ? currentPathShareToken() : null);
+      return handleCopyInvite(token ? `${chatUrl}&${PATH_SHARE_TOKEN_PARAM}=${token}` : chatUrl);
     }
     return handleCreateLinkInvite();
-  }, [shareInfo?.visibility, shareInfo?.publicAccess, currentChatId, canInviteShare, workspaceRouteId, handleCopyInvite, handleCreateLinkInvite]);
+  }, [shareInfo?.linkShare, currentChatId, canInviteShare, workspaceRouteId, handleCopyInvite, handleCreateLinkInvite]);
   // A turn link is dead until someone else can open it: cloud chats need the
   // workspace shared (members/invites/link access); local chats live only on
-  // this machine — even a synced project share carries files, not chats — so
-  // they stay gated (the button opens the share modal instead of copying)
-  // until per-chat cloud sync exists.
+  // this machine — a share mirrors their transcript to the cloud ledger, but
+  // nothing renders it there yet — so they stay gated (the button opens the
+  // share modal instead of copying).
   const chatShareReady = !isLocalWorkspace && shareStatus !== 'private';
   const currentChatModel = normalizeChatModelRef(currentChat?.model ?? preferredChatModel);
   const currentChatHarness = parseChatHarness(currentChat?.harness);
@@ -3721,19 +4929,32 @@ export default function WorkspacePage() {
     // the pre-move path would be the permanently dead one.
     return mode === 'space' ? selectedFilePath || null : null;
   }, [currentChatId, mode, selectedFilePath]);
+  // Uploads stay keyed to the chat id they STARTED under; resolve BOTH sides
+  // through the promotion/demotion mappings — the upload's key and the
+  // rendered currentChatId can sit on opposite ends of an id swap for a
+  // render, and an unmatched comparison would open the send gate (and empty
+  // the strip) while the attachment is still uploading.
+  const liveCurrentChatId = currentChatId ? resolveLiveChatId(currentChatId) : null;
   const chatUploads = useMemo(
-    () => uploads.filter((upload) => upload.target === 'chat' && upload.chatId === currentChatId),
-    [currentChatId, uploads]
+    () =>
+      uploads.filter(
+        (upload) =>
+          upload.target === 'chat' &&
+          !!upload.chatId &&
+          resolveLiveChatId(upload.chatId) === liveCurrentChatId
+      ),
+    [liveCurrentChatId, resolveLiveChatId, uploads]
   );
   const chatUploadsInFlight = useMemo(
     () =>
       uploads.some(
         (upload) =>
           upload.target === 'chat' &&
-          upload.chatId === currentChatId &&
+          !!upload.chatId &&
+          resolveLiveChatId(upload.chatId) === liveCurrentChatId &&
           upload.status !== 'error'
       ),
-    [currentChatId, uploads]
+    [liveCurrentChatId, resolveLiveChatId, uploads]
   );
   const fileUploads = useMemo(
     () => uploads.filter((upload) => upload.target === 'files'),
@@ -3878,6 +5099,29 @@ export default function WorkspacePage() {
   const userIsLatest =
     latestUserInfo.index >= 0 &&
     (latestAssistantInfo.index < 0 || latestAssistantInfo.index < latestUserInfo.index);
+  // The userIsLatest arm only covers the SEND WINDOW (POST persisted, run not
+  // yet inserted its assistant row) — so it must be time-bounded. Without the
+  // bound, a run that died before inserting any assistant row left the chat
+  // showing "Thinking…" forever, even on a reload days later (2026-08-01,
+  // chat 88d2fd22). A live run past the bound stays covered by hasLiveChatRun.
+  const latestUserSentRecently = (() => {
+    if (!userIsLatest) return false;
+    const at = Date.parse(String(latestUserMessage?.created_at ?? ''));
+    return Number.isNaN(at) ? true : Date.now() - at < 2 * 60_000;
+  })();
+  // The bound above is read at render time only — schedule one re-render at
+  // the deadline so a dead run's working line actually clears without any
+  // interaction (Codex round 8).
+  const [, setWorkingWindowExpired] = useState(0);
+  useEffect(() => {
+    if (!userIsLatest) return;
+    const at = Date.parse(String(latestUserMessage?.created_at ?? ''));
+    if (Number.isNaN(at)) return;
+    const remaining = at + 2 * 60_000 + 250 - Date.now();
+    if (remaining <= 0) return;
+    const id = setTimeout(() => setWorkingWindowExpired((t) => t + 1), remaining);
+    return () => clearTimeout(id);
+  }, [userIsLatest, latestUserMessage?.created_at]);
   // TS harness inserts the assistant row eagerly with empty content (so tools
   // can FK to it), so userIsLatest flips false instantly — anchor on the live
   // run state too, otherwise dots never appear in the send window.
@@ -3885,7 +5129,7 @@ export default function WorkspacePage() {
     Boolean(currentChatId) &&
     !latestAssistantInterrupted &&
     !latestAssistantHasContent &&
-    (userIsLatest || hasLiveChatRun);
+    (latestUserSentRecently || hasLiveChatRun);
   const isChatInterruptible = hasLiveChatRun;
   // Read by the inline-ask handler (registered once): a direct send while a
   // turn streams would cancel-and-replace the in-flight run (Codex P2 #790).
@@ -3961,6 +5205,25 @@ export default function WorkspacePage() {
   const sunnyAvatarByChatId = useMemo(
     () => buildSunnyAvatarMap(chatEntries.map((entry) => entry.chat)),
     [chatEntries],
+  );
+  // Avatar imagery for the review controls' author chips: agent turns render
+  // Sunny's face — instantly recognizable, where the initials chip read "SA"
+  // and the bare asterisk read as anonymous chrome; a collaborator gets their
+  // profile photo (initials fall back automatically), and local agents' brand
+  // marks come via the builders' default.
+  const resolvePendingEditAuthorVisual = useCallback(
+    (turn: FilePendingTurn) => {
+      const authorId = turn.authorId;
+      if (!authorId || authorId.startsWith('sunny:')) {
+        // imageRound:false — Sunny's PNG is a transparent-background star, so
+        // the `is-mark` treatment (uncropped, no chip disc) is the one that reads.
+        return { imageUrl: DEFAULT_SUNNY_AVATAR, imageRound: false };
+      }
+      if (authorId.startsWith('ai:')) return null; // builders default to the brand mark
+      const collaborator = collaboratorById.get(authorId);
+      return collaborator?.imageUrl ? { imageUrl: collaborator.imageUrl, imageRound: true } : null;
+    },
+    [collaboratorById],
   );
   const chatDetailsEntry = useMemo(
     () => chatEntries.find((entry) => entry.chat.id === chatDetailsChatId) ?? null,
@@ -4044,32 +5307,17 @@ export default function WorkspacePage() {
     // could resume: force-fetch the canonical persisted rows so useChat can
     // replace the frozen half-rendered bubble (a DONE stream can't be replayed).
     reloadHistory: useCallback(
-      (chatId: string) => ensureChatMessagesLoaded(chatId, { force: true }),
+      (chatId: string, opts?: { fromSequence?: number; findTurnStart?: boolean }) =>
+        ensureChatMessagesLoaded(chatId, {
+          force: true,
+          fromSequence: opts?.fromSequence,
+          findTurnStart: opts?.findTurnStart,
+        }),
       [ensureChatMessagesLoaded],
     ),
   });
   const sundialChatRef = useRef(sundialChat);
   sundialChatRef.current = sundialChat;
-  // Session-local "the run you watched just finished" cue for the transcript's
-  // quiet "Done" marker — reloaded transcripts shouldn't grow markers.
-  const completedRunChatId = useRunCompletionCue({
-    // Arm from the live useChat stream too: a collaborator-started run
-    // arrives via resumeStream() without ever updating the REST cache
-    // behind hasLiveChatRun (Codex P3).
-    hasLiveChatRun:
-      hasLiveChatRun ||
-      sundialChat.status === 'streaming' ||
-      sundialChat.status === 'submitted',
-    currentChatId,
-    isInterrupting,
-    latestAssistantInterrupted,
-    // The cached row (currentChatMessages) can lag the live reply, which is
-    // owned by useChat — a still-open SSE or a client transport error must
-    // also block the cue (Codex P2s): only a fully settled, non-errored
-    // stream reads as a normal finish.
-    latestReplyUnsettled:
-      latestAssistantMeta?.streaming === true || sundialChat.status !== 'idle',
-  });
   const currentChatIdRef = useRef(currentChatId);
   openChatTabForCurrentRef.current = (opts?: { side?: boolean }) => {
     if (currentChatId) openChatTabInPanes(currentChatId, opts);
@@ -4133,6 +5381,17 @@ export default function WorkspacePage() {
       [chatThreadsForCurrentProject],
     ),
     setChatStatusById,
+    // Terminal persisted state for the ACTIVE chat settles a live view whose
+    // SSE reader wedged on a half-open socket (it never errors, so useChat
+    // stays 'streaming' and the tab shows "working" until reload). Refs so
+    // the subscription reads the current chat + hook instance.
+    onAssistantSettled: useCallback(
+      (settledChatId: string, assistantRowId: string | null, rowSequence: number | null) => {
+        if (settledChatId !== currentChatIdRef.current) return;
+        sundialChatRef.current.settleFromPersistedRun(assistantRowId, rowSequence);
+      },
+      [],
+    ),
   });
 
   // Multi-user fan-in for the active chat: when another collaborator
@@ -4148,6 +5407,42 @@ export default function WorkspacePage() {
     appendForeignUserMessage: sundialChat.appendForeignUserMessage,
     resumeStream: sundialChat.resumeStream,
   });
+
+  // Local comment deliveries: the sidecar's chats-changed stands in for the
+  // cloud's chats + messages realtime — refresh the rail, and when the
+  // delivery hit the OPEN chat, pull the new rows into the transcript and
+  // reattach the run's stream (mirrors the cloud fan-in above).
+  useEffect(() => {
+    if (!localConfig || !projectId) return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const unsubscribe = localSidecar.subscribe(localConfig, projectId, (event) => {
+      if (event.type !== 'chats-changed') return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => void loadChatThreads(), 300);
+      const openChatId = currentChatRef.current?.id ?? null;
+      const eventChatId = (event as { chatId?: string }).chatId ?? null;
+      if (!openChatId || eventChatId !== openChatId) return;
+      void (async () => {
+        try {
+          const res = await apiFetch(`/api/workspace/messages?chatId=${encodeURIComponent(openChatId)}`);
+          if (!res.ok) return;
+          const { messages } = (await res.json()) as { messages?: ChatMessage[] };
+          for (const row of messages ?? []) {
+            if (row.role !== 'user') continue;
+            if ((row.metadata as Record<string, unknown> | null)?.source !== 'comment') continue;
+            sundialChatRef.current?.appendForeignUserMessage(row);
+          }
+          sundialChatRef.current?.resumeStream();
+        } catch {
+          // Best-effort; the rail refresh above still surfaces the delivery.
+        }
+      })();
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      unsubscribe();
+    };
+  }, [localConfig, projectId, loadChatThreads, apiFetch]);
 
   // Derived state
   const toolUseMap = useMemo(() => {
@@ -4290,7 +5585,8 @@ export default function WorkspacePage() {
     return map;
   }, [folderPaths, fileOrder]);
   // Drag-to-reorder within one parent: rewrite that parent's manual order from
-  // its current display order (folders first, then files — matching render).
+  // its current display order (folders and files interleaved per the stored
+  // order — matching render, where a file can sit above a folder).
   const handleReorderEntries = useCallback(
     (draggedPaths: string[], targetPath: string, position: 'before' | 'after') => {
       if (!projectId || draggedPaths.length === 0) return;
@@ -4300,46 +5596,66 @@ export default function WorkspacePage() {
       const fileNames = (parent === ROOT_ORDER_KEY ? rootFiles : filesByFolder[parent] ?? []).map(
         (file) => getFileName(file.path),
       );
-      const next = {
-        ...fileOrder,
-        [parent]: computeReorder(
-          [...folderNames, ...fileNames],
-          draggedPaths.map(getFileName),
-          getFileName(targetPath),
-          position,
-        ),
-      };
+      const names = computeReorder(
+        sortByManualOrder([...folderNames, ...fileNames], (name) => name, fileOrder[parent]),
+        draggedPaths.map(getFileName),
+        getFileName(targetPath),
+        position,
+      );
+      const next = mergeParentOrder(fileOrder, parent, names);
       setFileOrder(next);
+      // Optimistic: the cache paints instantly and carries an offline drag
+      // until the next load. (A path-share guest editing inside their subtree
+      // is refused the workspace-wide write and reverts on the next poll —
+      // one tree for the workspace beats a subtree view rewriting it.)
       writeFileOrder(projectId, next);
+      fileOrderGenRef.current += 1;
+      void apiFetch('/api/workspace/file-order', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId, parent, names }),
+      }).catch(() => null);
     },
-    [projectId, fileOrder, foldersByParent, filesByFolder, rootFiles],
+    [projectId, fileOrder, foldersByParent, filesByFolder, rootFiles, apiFetch],
   );
-  /** Flat list of file paths in visual render order (for shift+click range selection) */
+  /** Flat list of file paths in visual render order (for shift+click range
+   *  selection) — folders and files interleaved per fileOrder, matching the
+   *  tree's renderChildren. */
   const flatVisiblePaths = useMemo(() => {
     const paths: string[] = [];
-    // Folders first (matching render order), then root files
-    const addFolder = (folder: string) => {
-      if (!expandedFolders.has(folder)) return;
-      const childFolders = foldersByParent[folder] ?? [];
-      childFolders.forEach((cf) => addFolder(cf));
-      const files = filesByFolder[folder] ?? [];
-      files.forEach((f) => paths.push(f.path));
+    const walk = (parentKey: string, folders: string[], files: WorkspaceFileRow[]) => {
+      const children = sortByManualOrder(
+        [
+          ...folders.map((path) => ({ path, isFolder: true })),
+          ...files.map((file) => ({ path: file.path, isFolder: false })),
+        ],
+        (child) => getFileName(child.path),
+        fileOrder[parentKey],
+      );
+      for (const child of children) {
+        if (!child.isFolder) paths.push(child.path);
+        else if (expandedFolders.has(child.path))
+          walk(child.path, foldersByParent[child.path] ?? [], filesByFolder[child.path] ?? []);
+      }
     };
-    (foldersByParent['__root__'] ?? []).forEach((f) => addFolder(f));
-    rootFiles.forEach((f) => paths.push(f.path));
+    walk(ROOT_ORDER_KEY, foldersByParent.__root__ ?? [], rootFiles);
     return paths;
-  }, [rootFiles, foldersByParent, filesByFolder, expandedFolders]);
+  }, [rootFiles, foldersByParent, filesByFolder, expandedFolders, fileOrder]);
   const collabUser = useMemo(() => {
+    // presenceKey mirrors the Supabase presence channel key — the bridge that
+    // lets a clicked bubble find this client's caret in a doc's awareness.
     if (user) {
       return {
         name: user.fullName || user.username || 'You',
         color: pickColor(user.id),
+        presenceKey: `user:${user.id}`,
       };
     }
     if (anonId) {
       return {
         name: anonDisplayName(anonId),
         color: pickColor(`${ANON_AUTHOR_PREFIX}${anonId}`),
+        presenceKey: `anon:${anonId}`,
       };
     }
     return { name: 'Guest', color: pickColor('guest') };
@@ -4398,6 +5714,89 @@ export default function WorkspacePage() {
       : activeFrozenPaneMove && activeWorkspaceFile
         ? remapPath(activeWorkspaceFile.path, activeFrozenPaneMove.to, activeFrozenPaneMove.from)
         : activeWorkspaceFile?.path ?? '';
+
+  // ── Wiki-link anchor navigation ([[note#heading]], [[note#^id]]) ──────
+  // Cmd-click / hover-card open on a wiki link routes the RAW target here:
+  // resolve the path Obsidian-style, then scroll to the anchor — directly for
+  // the open file, or parked in a ref until the target file's editor reports
+  // ready (same pattern as pendingRevealLineRef for search results).
+  const pendingWikiAnchorRef = useRef<{ path: string; anchor: WikiAnchor } | null>(null);
+  const wikiAnchorMissNotice = useCallback(
+    (anchor: WikiAnchor) => {
+      showWorkspaceAppNotice(
+        'error',
+        anchor.heading ? `Heading “${anchor.heading}” not found` : `Block ^${anchor.blockId} not found`,
+      );
+    },
+    [showWorkspaceAppNotice],
+  );
+  const handleWikiNavigate = useCallback(
+    (rawTarget: string) => {
+      const { path, heading, headingPath, blockId } = parseWikiTarget(rawTarget);
+      const anchor: WikiAnchor | null =
+        heading || blockId ? { heading, headingPath, blockId } : null;
+      const targetPath = path ? resolveWorkspacePath(path, wikiLinkSuggestions) : selectedFilePath;
+      if (!targetPath) {
+        showWorkspaceAppNotice('error', `No file matching “${path}” in this workspace`);
+        return;
+      }
+      if (targetPath === selectedFilePath) {
+        if (anchor && !scrollEditorToAnchor(richEditorRef.current, anchor)) wikiAnchorMissNotice(anchor);
+        return;
+      }
+      pendingWikiAnchorRef.current = anchor ? { path: targetPath, anchor } : null;
+      setSelectedFilePath(targetPath);
+      // The selection alone isn't enough in the panes shell: a path with no
+      // open tab is pruned right back out (see the panes sync effect), so the
+      // jump would silently no-op. Claim a pane for the target like every
+      // other "open this file" path does.
+      if (!isMobile) {
+        claimPrimaryWithFile(targetPath);
+        setOpenLeftRail('project');
+      } else {
+        openCenterPanel('editor');
+      }
+    },
+    [
+      claimPrimaryWithFile,
+      isMobile,
+      openCenterPanel,
+      selectedFilePath,
+      showWorkspaceAppNotice,
+      wikiAnchorMissNotice,
+      wikiLinkSuggestions,
+    ],
+  );
+  /** Markdown text of a workspace note, for `[[note#` anchor autocomplete. */
+  const fetchWikiNoteText = useCallback(
+    async (path: string): Promise<string | null> => {
+      try {
+        const params = new URLSearchParams({ projectId, path });
+        const res = await apiFetch(`/api/workspace/file-content?${params.toString()}`);
+        if (!res.ok) return null;
+        const data = (await res.json().catch(() => null)) as { exists?: boolean; content?: string } | null;
+        return data?.exists ? String(data.content ?? '') : null;
+      } catch {
+        return null;
+      }
+    },
+    [apiFetch, projectId],
+  );
+
+  useEffect(() => {
+    const pending = pendingWikiAnchorRef.current;
+    if (!pending || !fileContentReady) return;
+    pendingWikiAnchorRef.current = null;
+    if (pending.path !== selectedFilePath) return;
+    if (scrollEditorToAnchor(richEditorRef.current, pending.anchor)) return;
+    // The Y.Doc can hydrate a beat after ready — retry once before reporting.
+    const timer = window.setTimeout(() => {
+      if (!scrollEditorToAnchor(richEditorRef.current, pending.anchor)) {
+        wikiAnchorMissNotice(pending.anchor);
+      }
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [fileContentReady, selectedFilePath, wikiAnchorMissNotice]);
 
   // Mirror the open file AND chat into the URL so it can be copied/shared
   // directly (2026-06-05 feedback). With both present, the link reopens the
@@ -4523,6 +5922,24 @@ export default function WorkspacePage() {
   // Edit/Suggest. The workspace-global mode is coerced to one this document
   // supports, so the editor's read-only state and the toolbar never reflect an
   // unsupported mode (e.g. View on a LaTeX file, or Suggesting in raw markdown).
+  // Per-file capability: path-share grants elevate the workspace baseline on
+  // their covered subtree — max(baseline, covering grant role), mirroring the
+  // server's canWritePath/canSuggestPath.
+  const activeFileCap = useMemo(
+    () =>
+      pathCapability(
+        { canWrite, canSuggest, canComment },
+        pathGrants,
+        activeWorkspaceFile?.path ?? null,
+        // Anonymous suggest grants get a read-only socket (PR #835 compose
+        // boundary) — their UI stays comment-only.
+        Boolean(user),
+      ),
+    [canWrite, canSuggest, canComment, pathGrants, activeWorkspaceFile?.path, user],
+  );
+  // Commenters (canSuggest without canWrite) get an editable editor locked to
+  // Suggesting — their typing lands as reviewable suggestions, GDocs-style.
+  const documentReadOnly = !activeFileCap.canWrite && !activeFileCap.canSuggest;
   const docEditModes = !activeIsMarkdown
     ? DOC_EDIT_MODES
     : showRawView
@@ -4530,7 +5947,7 @@ export default function WorkspacePage() {
       : MARKDOWN_DOC_EDIT_MODES;
   // Commenters are pinned to Suggesting (View where the surface has no
   // Suggesting, e.g. raw markdown) — they never get direct Edit.
-  const effectiveDocEditMode: WorkspaceEditMode = !canWrite
+  const effectiveDocEditMode: WorkspaceEditMode = !activeFileCap.canWrite
     ? docEditModes.includes('suggest')
       ? 'suggest'
       : 'view'
@@ -4542,17 +5959,17 @@ export default function WorkspacePage() {
   // opens, switch it to Editing so raw writes don't persist as suggestions.
   // (Editors only — commenters must never land in Editing.)
   useEffect(() => {
-    if (canWrite && showRawView && activeIsMarkdown && documentEditMode === 'suggest') {
+    if (activeFileCap.canWrite && showRawView && activeIsMarkdown && documentEditMode === 'suggest') {
       setDocumentEditMode('edit');
     }
-  }, [canWrite, showRawView, activeIsMarkdown, documentEditMode, setDocumentEditMode]);
+  }, [activeFileCap.canWrite, showRawView, activeIsMarkdown, documentEditMode, setDocumentEditMode]);
   // Pin commenters to Suggesting: the editors read the stored mode from
   // context (default 'edit'), and their socket token/UI must only suggest.
   useEffect(() => {
-    if (!canWrite && canSuggest && documentEditMode !== 'suggest') {
+    if (!activeFileCap.canWrite && activeFileCap.canSuggest && documentEditMode !== 'suggest') {
       setDocumentEditMode('suggest');
     }
-  }, [canWrite, canSuggest, documentEditMode, setDocumentEditMode]);
+  }, [activeFileCap.canWrite, activeFileCap.canSuggest, documentEditMode, setDocumentEditMode]);
   // Monaco-edited files (plain code and LaTeX) support inline comments
   // anchored to their Y.Text; `isCodeFile` covers `.tex` via its generic text
   // fallback.
@@ -4581,7 +5998,10 @@ export default function WorkspacePage() {
   useEffect(() => {
     if (activeTexFileKey) {
       latexViewModePinnedKeyRef.current = null;
-      setLatexViewMode('split');
+      // The embedded panel (?view=panel) shows ONE surface at a time, so a
+      // tex file lands on Source (the documented filePath=main.tex contract);
+      // agents steer to pdf. The full editor keeps its Split default.
+      setLatexViewMode(latchPanelView() ? 'source' : 'split');
     }
   }, [activeTexFileKey]);
   const previousLatexChatCollapseStateRef = useRef<LatexChatCollapseState>({
@@ -4611,13 +6031,59 @@ export default function WorkspacePage() {
     enabled: activeTexFile && !pendingOpenFileMove,
     fetchImpl: apiFetch,
   });
+  // The root whose diagnostics the user is navigating (handleLatexNavigate):
+  // opening an included child of a multi-root directory re-resolves as
+  // `ambiguous`, which would drop the compile state mid-navigation — keep that
+  // root as the target while it is still a candidate. Scoped to the navigated
+  // child (and the root itself): any other open file ignores the pin, so it
+  // can't leak onto unrelated ambiguous fragments.
+  const [latexNavPin, setLatexNavPin] = useState<{ root: string; child: string } | null>(null);
+  const activePath = activeWorkspaceFile?.path ?? null;
+  const latexPinnedRoot =
+    latexNavPin && (activePath === latexNavPin.child || activePath === latexNavPin.root)
+      ? latexNavPin.root
+      : null;
+  // Leaving both the pinned root and its child ends the navigation — drop the
+  // pin so returning to that child later re-resolves normally. A pinned root
+  // that no longer EXISTS (deleted by the user or an agent while the child
+  // stays open) goes too: nothing would falsify it otherwise, and every
+  // compile would keep posting the dead path.
+  useEffect(() => {
+    if (!latexNavPin) return;
+    const leftBothFiles = activePath !== latexNavPin.child && activePath !== latexNavPin.root;
+    if (leftBothFiles || !workspaceFileByPath.has(latexNavPin.root)) setLatexNavPin(null);
+  }, [activePath, latexNavPin, workspaceFileByPath]);
   const latexRootPath = latexCompileTarget(
     latexMainDocument,
-    activeTexFile ? activeWorkspaceFile?.path ?? null : null,
+    activeTexFile ? activePath : null,
+    latexPinnedRoot,
   );
   // Live editor source only describes the open file — only forward it when the
   // open file *is* the root. Otherwise compile the root from the doc store.
   const activeIsRoot = Boolean(latexRootPath && latexRootPath === activeWorkspaceFile?.path);
+  // Compile-log paths (root-dir-relative / sandbox-absolute) → workspace paths,
+  // so errors inside \input'd children navigate and mark the right file. Only
+  // .tex targets: opening anything else leaves the LaTeX surface (and its
+  // markers) behind, so those rows stay informational.
+  const resolveLatexLog = useCallback(
+    (file: string | null) =>
+      resolveLatexLogPath(file, latexRootPath, (p) => {
+        const type = workspaceFileByPath.get(p)?.type;
+        return type != null && type !== 'folder' && /\.tex$/i.test(p);
+      }),
+    [latexRootPath, workspaceFileByPath],
+  );
+  // Auto compile (§1.2): per-user pref (default on for cloud workspaces) and
+  // the tab's local-typing tracker. The tracker is one mutable object bumped
+  // per local Y.Doc transaction — never React state, so typing costs no extra
+  // page renders (the O(change) keystroke invariant).
+  const { autoCompile: latexAutoCompile, toggleAutoCompile: toggleLatexAutoCompile } = useLatexAutoCompilePref();
+  const latexLocalEditsRef = useRef<LocalEditTracker>({ version: 0, lastEditAt: 0 });
+  const noteLatexLocalEdit = useCallback(() => {
+    const tracker = latexLocalEditsRef.current;
+    tracker.version += 1;
+    tracker.lastEditAt = Date.now();
+  }, []);
   const latexCompile = useLatexCompile({
     projectId,
     chatId: currentChatId,
@@ -4625,17 +6091,48 @@ export default function WorkspacePage() {
     // the optimistic path and auto-compile artifacts there before the server
     // rename moves the old ones — colliding with the rename itself.
     texPath: activeTexFile && !pendingOpenFileMove ? latexRootPath : null,
-    canWrite,
+    // Per-path: path-share editors compile inside their FOLDER grant even
+    // while the workspace baseline is read-only (mirrors the route's
+    // canCreatePath — exact-file grants can't compile).
+    canWrite: latexRootPath ? canCreateWorkspacePath(latexRootPath) : canWrite,
     source: activeIsRoot ? viewerContent : null,
     getSource: activeIsRoot ? () => readEditorText() ?? viewerContent : undefined,
     compileWithoutSource: activeTexFile && Boolean(latexRootPath) && !activeIsRoot,
     fetchImpl: apiFetch,
     liveRefresh: !isLocalWorkspace,
+    resolveLogPath: resolveLatexLog,
+    initialCompileError:
+      onboardingTexIntent && latexRootPath === WELCOME_TEX_PATH
+        ? WELCOME_TEX_INITIAL_COMPILE_ERROR
+        : null,
+    // Cloud only: local projects already have the sidecar's own file-watch
+    // recompile loop, and their PDFs never ride liveRefresh.
+    autoCompile: latexAutoCompile && !isLocalWorkspace,
+    // Agent edits compile brain-side at turn end (agent-ts/src/latex/
+    // autocompile.ts) — the browser must not duplicate that or surface the
+    // transient failures its self-heal loop is about to fix. Any live run
+    // counts: the current chat's stream AND background chats (the hidden
+    // LaTeX fix chat included), whose runs land in chatStatusById. Also held
+    // while the root is re-resolving after a file switch: an auto compile
+    // fired then would build the WRONG root and seed the new one as clean.
+    holdAutoCompile:
+      sundialChatBusy ||
+      !latexMainDocument.resolved ||
+      Object.values(chatStatusById).some((s) => s === 'working' || s === 'starting'),
+    localEdits: latexLocalEditsRef.current,
+    // The open file's live text is the change clock — for a fragment too (the
+    // compile reads the fragment from the doc store, persisted ~1s behind).
+    editedSource: activeTexFile ? viewerContent : null,
+    editedPath: activeWorkspaceFile?.path ?? null,
   });
+  const latexMarkers = useMemo(
+    () => buildLatexMarkers(latexCompile.problems, activeTexFile ? activeWorkspaceFile?.path ?? null : null),
+    [latexCompile.problems, activeTexFile, activeWorkspaceFile?.path],
+  );
 
   // Local projects: no brain background-compiles .tex edits, so agent/external
   // writes (the sidecar only emits those — user typing is watcher-suppressed)
-  // trigger a debounced recompile. This is what makes "Fix with Sunny" refresh
+  // trigger a debounced recompile. This is what makes "Fix with Agent" refresh
   // the PDF locally, standing in for the cloud's Supabase liveRefresh.
   const latexRecompileRef = useRef(latexCompile.recompile);
   latexRecompileRef.current = latexCompile.recompile;
@@ -4675,10 +6172,10 @@ export default function WorkspacePage() {
   // URL). Gestures no-op when the index is absent (older/sandbox compiles).
   const [synctexIndex, setSynctexIndex] = useState<SyncTexIndex | null>(null);
   useEffect(() => {
-    if (!projectId || !latexRootPath || !latexCompile.pdfUrl) {
-      setSynctexIndex(null);
-      return;
-    }
+    // Cleared up front: the old index describes the previous PDF, so forward
+    // search must not jump by it while the new artifact downloads.
+    setSynctexIndex(null);
+    if (!projectId || !latexRootPath || !latexCompile.pdfUrl) return;
     const synctexPath = latexRootPath.replace(/\.tex$/i, '.synctex.gz');
     const controller = new AbortController();
     (async () => {
@@ -4688,14 +6185,11 @@ export default function WorkspacePage() {
           credentials: 'include',
           signal: controller.signal,
         });
-        if (!res.ok) {
-          setSynctexIndex(null);
-          return;
-        }
-        const buf = await res.arrayBuffer();
-        setSynctexIndex(await parseSyncTex(buf));
+        if (!res.ok) return;
+        const index = await parseSyncTex(await res.arrayBuffer());
+        if (!controller.signal.aborted) setSynctexIndex(index);
       } catch {
-        if (!controller.signal.aborted) setSynctexIndex(null);
+        // Index stays null — SyncTeX is best-effort.
       }
     })();
     return () => controller.abort();
@@ -4706,9 +6200,10 @@ export default function WorkspacePage() {
   // it into a tex-relative `\includegraphics{…}` reference.
   const handleLatexImageUpload = useCallback(
     async (file: File): Promise<string | null> => {
-      if (!projectId || !canWrite || !activeWorkspaceFile) return null;
+      if (!projectId || !activeWorkspaceFile) return null;
       const texPath = activeWorkspaceFile.path;
       const texDir = texPath.includes('/') ? texPath.slice(0, texPath.lastIndexOf('/')) : '';
+      if (!canUploadToFolder(texDir ? `${texDir}/images` : 'images')) return null;
       try {
         const result = await uploadImageFromEditor({
           projectId,
@@ -4724,7 +6219,7 @@ export default function WorkspacePage() {
         return null;
       }
     },
-    [projectId, canWrite, activeWorkspaceFile, existingPaths, localBinaryUpload],
+    [projectId, canUploadToFolder, activeWorkspaceFile, existingPaths, localBinaryUpload],
   );
   const activeCsvFile = useMemo(() => isCsvFile(activeWorkspaceFile), [activeWorkspaceFile]);
   // Drop the prior file's live suggestion set on switch; the new file's editor
@@ -4756,20 +6251,36 @@ export default function WorkspacePage() {
     [localConfig, projectId],
   );
 
-  // Identity for optimistically-rendered comments (before the server echoes the
-  // authoritative author back). Memoized so the comment callbacks stay stable.
+  // The commenting identity — the composer, optimistically-rendered comments,
+  // and "is this mine?" ownership all read it. It must be the SAME identity the
+  // server stamps on a sent comment, or the draft shows a stranger (a nameless
+  // "You") that turns into the real person the moment it posts. The id has to
+  // match too: withOptimistic binds the server echo by author id, and the
+  // author-only actions (edit, delete) gate on it.
   const commentCurrentUser = useMemo(
-    () => ({
-      // Use the effective (anon-aware) author id so the optimistic author
-      // matches the server echo (`anon:<id>`); otherwise withOptimistic can't
-      // bind the echo and an anon comment renders as a duplicate.
-      userId: effectiveCurrentUserId,
-      name: user?.fullName ?? user?.username ?? 'You',
-      username: user?.username ?? null,
-      imageUrl: user?.imageUrl ?? null,
-    }),
-    [effectiveCurrentUserId, user?.fullName, user?.username, user?.imageUrl],
+    () =>
+      resolveCommentIdentity({
+        userId: user?.id ?? null,
+        fullName: user?.fullName ?? null,
+        username: user?.username ?? null,
+        imageUrl: user?.imageUrl ?? null,
+        desktopProfile,
+        anonId,
+      }),
+    [user?.id, user?.fullName, user?.username, user?.imageUrl, desktopProfile, anonId],
   );
+
+  // PDF comments (dark launch): comment on the compiled preview, anchored to
+  // the LaTeX source through SyncTeX. Account-backed flag, Settings → Advanced;
+  // `savedFlags` is live state, so the toggle applies without a reload.
+  // `?pdfcomments=on|off` is a session-only escape hatch (autocomplete's URL
+  // pattern): in-memory for this page load, never localStorage or the account.
+  const [pdfCommentsUrlOverride, setPdfCommentsUrlOverride] = useState<boolean | null>(null);
+  useEffect(() => {
+    const value = new URLSearchParams(window.location.search).get('pdfcomments');
+    if (value === 'on' || value === 'off') setPdfCommentsUrlOverride(value === 'on');
+  }, []);
+  const pdfCommentsEnabled = pdfCommentsUrlOverride ?? savedFlags?.pdf_comments_enabled ?? false;
 
   const {
     commentLaneRowRef,
@@ -4790,6 +6301,8 @@ export default function WorkspacePage() {
     commentDocumentLabel,
     commentPanelMode,
     docCommentAnchorOffsets,
+    commentAnchorLines,
+    measuredCommentAnchorIds,
     draftCommentAnchorOffset,
     activeCommentThreadId,
     draftCommentSelection,
@@ -4829,10 +6342,12 @@ export default function WorkspacePage() {
     markdownEditor,
     // PDF-only LaTeX view hides the source pane (width 0), so the commentable
     // surface isn't on screen — gate comments off like raw markdown view.
-    showRawView: showRawView || (activeTexFile && latexViewMode === 'pdf'),
+    // With PDF comments on, the PDF itself is the commentable surface (the
+    // hidden Monaco instance still resolves anchors), so the gate lifts.
+    showRawView: showRawView || (activeTexFile && latexViewMode === 'pdf' && !pdfCommentsEnabled),
     hasRichViewer,
     showRichViewer,
-    canComment,
+    canComment: activeFileCap.canComment,
     isMobile,
     currentUser: commentCurrentUser,
     workspaceFileByPath,
@@ -4844,7 +6359,96 @@ export default function WorkspacePage() {
     onSelectFile: setSelectedFilePath,
     onOpenSpace: openSpaceFromCommentDeepLink,
     showWorkspaceAppNotice,
+    initialLoadEnabled: backgroundDataReady,
   });
+
+  // Loud claim nudge: an anon OWNER who is signed out is one lost link away
+  // from a lost workspace. Points at the Log in button; claim-on-login does
+  // the actual claiming. Session-dismissible; latch read after mount so the
+  // server render and first client render stay identical.
+  const [claimNudgeDismissed, setClaimNudgeDismissed] = useState(false);
+  useEffect(() => {
+    try {
+      if (sessionStorage.getItem('sundial:claim-nudge-dismissed') === '1') setClaimNudgeDismissed(true);
+    } catch {
+      /* storage denied — nudge shows, dismiss just won't persist */
+    }
+  }, []);
+  const dismissClaimNudge = useCallback(() => {
+    setClaimNudgeDismissed(true);
+    try {
+      sessionStorage.setItem('sundial:claim-nudge-dismissed', '1');
+    } catch {
+      /* per-render dismiss still holds */
+    }
+  }, []);
+
+  // Creation decided eligibility and encoded it in the URL. `filePath` lets
+  // the server preload this exact Y.Doc; `onboarding=tex` claims the primary
+  // pane without a checklist request or a file-download verification probe.
+  useEffect(() => {
+    if (!onboardingTexIntent || !filesLoaded || !workspaceFileByPath.has(WELCOME_TEX_PATH)) return;
+    if (localConfig || pathGrants.length > 0) return;
+    if (!canWrite || panelViewActive) return;
+    if (selectedFilePath !== WELCOME_TEX_PATH) {
+      setSelectedFilePath(WELCOME_TEX_PATH);
+      claimPrimaryWithFile(WELCOME_TEX_PATH);
+    }
+  }, [
+    onboardingTexIntent,
+    filesLoaded,
+    workspaceFileByPath,
+    localConfig,
+    pathGrants.length,
+    canWrite,
+    panelViewActive,
+    selectedFilePath,
+    claimPrimaryWithFile,
+  ]);
+
+  useEffect(() => {
+    const eligible =
+      onboardingTexIntent &&
+      filesLoaded &&
+      workspaceFileByPath.has(WELCOME_TEX_PATH) &&
+      canWrite &&
+      !panelViewActive &&
+      !readOnboardingLandingDone();
+    setShowOnboardingTexGuide(eligible);
+    if (eligible && onboardingGuideReportedRef.current !== projectId) {
+      onboardingGuideReportedRef.current = projectId;
+      track('onboarding_tex_guide_shown', { projectId });
+    }
+  }, [canWrite, filesLoaded, onboardingTexIntent, panelViewActive, projectId, workspaceFileByPath]);
+
+  const dismissOnboardingTexGuide = useCallback(() => {
+    markOnboardingLandingDone();
+    setShowOnboardingTexGuide(false);
+    track('onboarding_tex_guide_skipped', { projectId });
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!onboardingTexIntent || !filesLoaded || onboardingPerfReportedRef.current === projectId) return;
+    if (!workspaceFileByPath.has(WELCOME_TEX_PATH)) return;
+    onboardingPerfReportedRef.current = projectId;
+    const elapsedMs = Math.round(onboardingElapsedMs());
+    const navigationElapsedMs = Math.round(performance.now());
+    track('onboarding_workspace_visible', {
+      projectId,
+      elapsedMs,
+      budgetMs: WORKSPACE_VISIBLE_BUDGET_MS,
+      withinBudget: elapsedMs <= WORKSPACE_VISIBLE_BUDGET_MS,
+    });
+    // The known error is supplied synchronously to the compile controller in
+    // this same render, so this is also the diagnostic-visible milestone.
+    track('onboarding_diagnostic_visible', {
+      projectId,
+      elapsedMs: navigationElapsedMs,
+      budgetMs: STARTER_DIAGNOSTIC_BUDGET_MS,
+      withinBudget: navigationElapsedMs <= STARTER_DIAGNOSTIC_BUDGET_MS,
+    });
+    clearOnboardingCreationTiming();
+  }, [filesLoaded, onboardingTexIntent, projectId, workspaceFileByPath]);
 
   // Single invalidation token feeding the inline-diff hook. Combines every
   // upstream "you should refetch now" signal we have:
@@ -4854,13 +6458,22 @@ export default function WorkspacePage() {
   //    mirrors the chat panel's own auto-expand trigger so the inline
   //    overlay refreshes in the same tick the chat card pops in.
   const docEditsRealtimeKey = useDocEditsRealtimeKey(supabaseClient, projectId);
+  // Turn-edit payloads are cached by review id, and LOCAL ids (`applied-<n>`)
+  // repeat across projects — bind the cache to the open workspace so a second
+  // local project can't read the first one's diffs (Codex, PR #1104 round 20).
+  useEffect(() => {
+    setTurnEditsCacheWorkspace(projectId ?? null);
+  }, [projectId]);
+  // Local stand-in for the `doc_edits` Realtime channel — see the hook.
+  const localFileEventsKey = useLocalFileEventsKey(localConfig, projectId);
   const pendingEditsInvalidationToken = useMemo(
     () =>
       buildPendingEditsInvalidationToken({
         docEditsRealtimeKey,
         messages: liveChatMessagesForEdits,
+        localFileEventsKey,
       }),
-    [docEditsRealtimeKey, liveChatMessagesForEdits],
+    [docEditsRealtimeKey, liveChatMessagesForEdits, localFileEventsKey],
   );
   // Authoritative source for the "Edited in this response" composer chip: the
   // `doc_edits` table, surfaced via `/api/workspace/chat-turn-edits`. Reuses
@@ -5042,10 +6655,13 @@ export default function WorkspacePage() {
     latexCompile,
   ]);
 
+  // Not cloud-gated: local workspaces answer through the sidecar shim, so the
+  // suggestion gutter's author chip works on desktop too.
   const spaceFilePendingTurns = useFilePendingTurns(
-    cloudProjectId,
+    backgroundDataReady ? projectId : null,
     activeWorkspaceFile?.path ?? null,
     pendingEditsInvalidationToken,
+    apiFetch,
   );
   const spacePendingAdditions = useMemo(
     () =>
@@ -5053,8 +6669,88 @@ export default function WorkspacePage() {
         turns: spaceFilePendingTurns.turns,
         filePath: activeWorkspaceFile?.path,
         resolveAuthorLabel: resolvePendingEditAuthorLabel,
+        resolveAuthorVisual: resolvePendingEditAuthorVisual,
       }),
-    [spaceFilePendingTurns.turns, activeWorkspaceFile?.path, resolvePendingEditAuthorLabel],
+    [spaceFilePendingTurns.turns, activeWorkspaceFile?.path, resolvePendingEditAuthorLabel, resolvePendingEditAuthorVisual],
+  );
+  // Authorship lens (formatting bar): band the WHOLE document by who wrote each
+  // line, with "Author · when" in the margin. Data comes from /file-blame on
+  // toggle — off by default, it's a lens you reach for, not the reading state.
+  const [showAuthorship, setShowAuthorship] = useState(false);
+  const [blameLines, setBlameLines] = useState<FileBlameResponse['lines'] | null>(null);
+  // The sticky link token in force, re-read on every URL change: a second,
+  // narrower ?pshare= link for the same workspace must re-key the lens, or
+  // attribution fetched under the WIDER grant stays painted (Codex, PR #1104
+  // round 33). searchParams is the re-render signal for in-app navigation.
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- searchParams IS the dep: the token lives in the URL/sessionStorage, not in React state.
+  const blameShareToken = useMemo(() => currentPathShareToken(), [searchParams]);
+  useEffect(() => {
+    setShowAuthorship(false);
+    setBlameLines(null);
+  }, [activeWorkspaceFile?.path]);
+  useEffect(() => {
+    // A token change repaints from scratch — never leave the old grant's
+    // names/timestamps up while the new fetch runs.
+    setBlameLines(null);
+  }, [blameShareToken]);
+  useEffect(() => {
+    if (!showAuthorship || !cloudProjectId || !activeWorkspaceFile?.path) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await apiFetch(
+          `/api/workspace/file-blame?workspaceId=${encodeURIComponent(cloudProjectId)}&filePath=${encodeURIComponent(activeWorkspaceFile.path)}`,
+          { cache: 'no-store' },
+        );
+        const data = await readJsonResponse<FileBlameResponse & { error?: string }>(res);
+        if (!res.ok || !data) throw new Error(data?.error || `Failed to load authorship (${res.status})`);
+        // Authorized under the token in force when the fetch STARTED — a
+        // narrower link opening mid-flight must not paint this answer.
+        if (currentPathShareToken() !== blameShareToken) return;
+        if (!cancelled) setBlameLines(data.lines);
+      } catch {
+        if (!cancelled) setBlameLines([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // pendingEditsInvalidationToken: re-blame after new edits land while the lens is on.
+  }, [showAuthorship, cloudProjectId, activeWorkspaceFile?.path, apiFetch, pendingEditsInvalidationToken, blameShareToken]);
+  const handleJumpToTurnRef = useRef<(assistantMessageId: string, chatId: string | null) => void>(() => {});
+  const authorshipRanges = useMemo(
+    () =>
+      showAuthorship && blameLines
+        ? buildAuthorshipRanges(blameLines, {
+            resolveLabel: (authorId) => resolvePendingEditAuthorLabel({ authorId } as FilePendingTurn),
+            formatWhen: (createdAt) => (createdAt ? formatRelativeTime(createdAt) : null),
+            resolveVisual: (line) =>
+              resolvePendingEditAuthorVisual({ authorId: line.authorId, chatId: line.chatId } as FilePendingTurn),
+          }).map((range) => ({
+            ...range,
+            // The path the attributing EDIT was written at: after a move the
+            // turn's diff is still filed under the source path, so stamping the
+            // open file made the hover card miss it (Codex, PR #1104 round 30).
+            filePath: range.filePath ?? activeWorkspaceFile?.path ?? null,
+            // Same affordance as the suggestion chips: the margin annotation
+            // opens the turn that wrote these lines.
+            onJump: range.assistantMessageId
+              ? () => handleJumpToTurnRef.current(range.assistantMessageId!, range.chatId ?? null)
+              : undefined,
+          }))
+        : [],
+    [showAuthorship, blameLines, resolvePendingEditAuthorLabel, resolvePendingEditAuthorVisual],
+  );
+  // Who suggested each markdown line, for the review gutter's profile icon.
+  const spaceSuggestionAuthors = useMemo(
+    () =>
+      buildSuggestionAuthors({
+        turns: spaceFilePendingTurns.turns,
+        suggestionTurns: spaceFilePendingTurns.suggestionTurns,
+        resolveAuthorLabel: resolvePendingEditAuthorLabel,
+        resolveAuthorVisual: resolvePendingEditAuthorVisual,
+      }),
+    [spaceFilePendingTurns.turns, spaceFilePendingTurns.suggestionTurns, resolvePendingEditAuthorLabel, resolvePendingEditAuthorVisual],
   );
   // Keys are `${reviewId}:${chunkId}` for a single chunk, or `${reviewId}:*`
   // for a whole human suggestion run (one Accept/Reject for the paste). The
@@ -5143,6 +6839,7 @@ export default function WorkspacePage() {
     },
     [chatThreadsForCurrentProject, ensureChatMessagesLoaded, isMobile, openCenterPanel, setWorkspaceViewMode],
   );
+  handleJumpToTurnRef.current = handleJumpToTurn;
 
   // Deep link: `?turnId=…` scrolls to + pulses that assistant turn once the
   // chat is open. The transcript's stick-to-bottom pins to the newest message
@@ -5190,6 +6887,13 @@ export default function WorkspacePage() {
   // markdown document column instead of centering it. pl-12! outbids the
   // responsive px-* paddings on the same container.
   const docCentered = !(useDocAlignLeft() && activeIsMarkdown);
+  // Google Docs document style (document ⋯ menu): the markdown page is a
+  // white card on a gray desk with symmetric page margins — the pre-redesign
+  // look. The frame supplies the card; this shell supplies the desk.
+  // Independent of the desktop Tabs/No tabs arrangement (founder,
+  // 2026-08-05): the Docs chrome renders under the tab strip too — same as
+  // real Google Docs living inside a browser tab.
+  const docsPage = useDocStyle() === 'docs';
   // Code files anchor left instead of centering — only the markdown page card
   // centers. (LaTeX has its own full-bleed workbench, so mx-auto is moot there.)
   const codeAlignLeft = activeCodeFile && !activeTexFile;
@@ -5218,7 +6922,10 @@ export default function WorkspacePage() {
               'px-3 lg:px-6 pt-1.5 pb-3 lg:pb-4'
             : isTextSurface
               ? 'px-3 lg:px-6 py-3 lg:py-4'
-              : 'px-3 lg:px-6 py-4 lg:py-8';
+              : // Markdown: the frame inside already supplies the page's top
+                // margin, so this wrapper only pads the bottom — stacking both
+                // pushed the first line ~80px down the pane.
+                'px-3 lg:px-6 pt-1 pb-4 lg:pb-8';
   // Google-Docs-style comment rail: for desktop markdown the editor keeps a
   // constant width and stays centered when there are no comments; when the lane
   // opens, an animated rail slides in from the right (0 → 320px) and the editor
@@ -5229,41 +6936,13 @@ export default function WorkspacePage() {
   const mdCommentLane = commentsAvailableForActiveFile && activeIsMarkdown;
   const reserveCommentLane = mdCommentLane || showInlineCommentLane;
   // LaTeX keeps its full-bleed, full-height split layout even when the lane is
-  // open — the rail joins the workbench row instead of narrowing the page.
+  // open — the rail joins the split itself instead of narrowing the page.
   const laneNarrowsContent = reserveCommentLane && !activeTexFile;
   // Outline lane (wireframe right panel). Headings are derived from the rendered
   // `.tiptap` DOM — not the markdown source — so each item's index matches the
   // Nth heading element the click handler scrolls to. Comments win when both
   // lanes are open.
   const [outlineHeadings, setOutlineHeadings] = useState<TocHeading[]>([]);
-  // Status pill: live word/char counts for the open markdown doc. Anchored
-  // inside the primary doc pane (never fixed to the window — the old pill
-  // overlaid chats and empty states).
-  const [docStats, setDocStats] = useState<{ words: number; chars: number } | null>(null);
-  useEffect(() => {
-    if (!activeIsMarkdown || !markdownEditor || markdownEditor.isDestroyed) {
-      setDocStats(null);
-      return;
-    }
-    const compute = () => {
-      const text = markdownEditor.state.doc.textContent;
-      setDocStats({
-        words: text.trim() ? text.trim().split(/\s+/).length : 0,
-        chars: text.length,
-      });
-    };
-    compute();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const onUpdate = () => {
-      clearTimeout(timer);
-      timer = setTimeout(compute, 500);
-    };
-    markdownEditor.on('update', onUpdate);
-    return () => {
-      clearTimeout(timer);
-      markdownEditor.off('update', onUpdate);
-    };
-  }, [activeIsMarkdown, markdownEditor]);
   const outlineFlashRef = useRef<{ el: HTMLElement; timer: ReturnType<typeof setTimeout> } | null>(null);
   const outlineLaneOpen = rightDockView === 'outline' && activeIsMarkdown && !primaryChatActive;
   useEffect(() => {
@@ -5337,43 +7016,118 @@ export default function WorkspacePage() {
     onStartCommentDraft: openCommentDraft,
     onReportCommentAnchors: reportCommentAnchors,
   };
+  // Watching is a property of the DOC (any chat whose watch covers it). The
+  // panel only reports it — watches are managed from the chat.
+  const watchedDocPath = activeWorkspaceFile?.path ?? null;
+  const docWatcher = watchedDocPath
+    ? chatThreadsForCurrentProject.find(
+        (t) =>
+          t.chat.comment_watch_path === '*' ||
+          t.chat.comment_watch_path === watchedDocPath ||
+          // A cloud rename leaves the stored path stale while deliveries keep
+          // matching on the file id — the badge follows the id (Codex P2).
+          (Boolean(t.chat.comment_watch_file_id) && t.chat.comment_watch_file_id === activeWorkspaceFileId),
+      )?.chat ?? null
+    : null;
   // The comment lane column, shared by the markdown and code editor branches.
-  // Markdown animates its width 0↔320; code uses a static rail.
+  // Markdown toggles its width 0↔320 with NO transition: animating the width
+  // rewraps the doc continuously, so the anchor offsets measured pre-open go
+  // stale and the cards visibly chase their anchors down the lane (the
+  // "comments appear at the top then jump to the bottom" founder bug). An
+  // instant open reflows once, and the lane measures that final layout
+  // synchronously before paint (see the anchor-offset effect).
+  // `-ml-8` closes half the dead space between the document text and the first
+  // card: the doc column's rightmost 56px are page padding (empty), so pulling
+  // the lane 32px into it only tightens the gutter — the cards keep their own
+  // width, and the lane's right edge (and the scrollbar beside it) doesn't
+  // move. Applied in both lane states, so opening/closing still doesn't shift
+  // the document.
   const commentLaneColumn = reserveCommentLane ? (
     <div
-      className={
+      // Docs style: NO -ml-8 pull — the sheet ends at a real border there,
+      // so tucking the cards 32px into it overlapped the page edge; the
+      // "empty page padding" the pull exploits only exists in the flat style.
+      // Nor in a narrow pane: the page padding is pane-relative and shrinks
+      // below the 32px pull, which would both overlap the text and skew the
+      // doc 16px right. The clamp is a step on the row width (% of the
+      // containing block): 0 below 1000px, the full 2rem above — minus the open
+      // 320px lane the frame is then ≥ 660px, where its normal padding is back
+      // above 32px.
+      className={mdCommentLane ? 'shrink-0 overflow-hidden' : 'shrink-0'}
+      // min(320px, 40%): in a narrow pane (chat + doc side by side) a fixed
+      // 320px lane starved the document down to a sliver — the lane yields
+      // first, the doc keeps ≥60% of the row. Wide panes still get the full
+      // 320 (the panel's own max-w follows this width).
+      style={
         mdCommentLane
-          ? 'shrink-0 overflow-hidden transition-[width] duration-200 ease-out'
-          : 'shrink-0'
+          ? {
+              width: showInlineCommentLane ? 'min(320px, 40%)' : 0,
+              marginLeft: docsPage ? undefined : 'calc(-1 * clamp(0px, (100% - 1000px) * 1000, 2rem))',
+            }
+          : undefined
       }
-      style={mdCommentLane ? { width: showInlineCommentLane ? 320 : 0 } : undefined}
       aria-hidden={!showInlineCommentLane}
     >
       {showInlineCommentLane ? (
         <DocCommentsPanel
+          // Live run state for thread "Agent is working" badges: realtime/live
+          // status for cloud chats, the sidecar's `running` flag for local
+          // ones (v17+); null = unknown → the panel's reply-derived fallback.
+          chatActivity={(chatId) => {
+            if (chatId === currentChatId && hasLiveChatRun) return 'working';
+            const status = chatStatusById[chatId];
+            if (status) return status === 'working' || status === 'starting' ? 'working' : 'idle';
+            const local = chatThreadsForCurrentProject.find((t) => t.chat.id === chatId)?.chat as
+              | { running?: boolean; answering?: boolean }
+              | undefined;
+            if (typeof local?.running === 'boolean') {
+              if (local.running) return 'working';
+              // Settled, but a started run may still owe the thread its answer
+              // (v21+, and it spans the retry gaps). A SHARED row, so every
+              // watcher agrees. Absent, false, stopped, or never-ran all mean
+              // plain 'idle' — nothing is coming, so the badge clears.
+              return local.answering ? 'answering' : 'idle';
+            }
+            return null;
+          }}
           mode={commentPanelMode}
           documentLabel={commentDocumentLabel}
           threads={displayedCommentThreads}
           resolvedThreads={displayedResolvedThreads}
           threadAnchorOffsets={docCommentAnchorOffsets}
+          measuredAnchorIds={measuredCommentAnchorIds}
           draftAnchorOffset={draftCommentAnchorOffset}
           activeThreadId={activeCommentThreadId}
           draftSelection={draftCommentSelection}
           draftBody={draftCommentBody}
           replyRestore={commentReplyRestore}
-          currentUser={{
-            name: user?.fullName ?? user?.username ?? 'You',
-            imageUrl: user?.imageUrl ?? null,
-          }}
-          currentUserId={user?.id ?? null}
+          currentUser={commentCurrentUser}
+          // The identity the server attributes a comment to — anon and desktop
+          // (sd_) authors own their comments too, so the author-only actions
+          // (edit, delete) must key off the same id the optimistic author uses.
+          currentUserId={commentCurrentUser.userId}
           canComment={canCommentOnActiveFile}
-          canResolve={canWrite}
+          // Per-file: each card gates Resolve/Delete on ITS file's write
+          // capability (All-comments cards span files; the comments routes
+          // authorize per path), so a path-share editor acts on their granted
+          // file even while workspace-level canWrite is false.
+          canResolve={canWriteWorkspacePath}
           loading={displayedCommentsLoading}
           error={displayedCommentsError}
           busyAction={commentBusyAction}
           onModeChange={handleCommentModeChange}
           onSelectThread={selectCommentThread}
           onOpenWorkspaceThread={openWorkspaceCommentThread}
+          // A thread that summoned an agent carries its chat — open it beside
+          // the doc, NARROW (the even split crushed the document), via the
+          // pane-grow arming above. openChatById lives further down; the ref is
+          // the same switch.
+          onOpenThreadChat={(chatId) => {
+            narrowChatPaneArmedRef.current = editorPanesRef.current.map((pane) => pane.id).join('|');
+            void openChatByIdRef.current(chatId, { sidePanel: true });
+          }}
+          commentWatchScope={docWatcher ? (docWatcher.comment_watch_path === '*' ? 'workspace' : 'doc') : null}
+          mentionPeople={commentMentionPeople}
           onClose={closeCommentLane}
           onCreateComment={createComment}
           onCancelDraft={cancelCommentDraft}
@@ -5406,7 +7160,14 @@ export default function WorkspacePage() {
         );
         return thread?.chat.title?.trim() || 'New chat';
       }
-      if (diffIdOfTab(tab) !== null) return 'Diff';
+      if (diffIdOfTab(tab) !== null) return 'Turn edits';
+      if (isReviewTab(tab)) {
+        const scopedChatId = reviewChatIdOfTab(tab);
+        if (!scopedChatId) return 'Review';
+        const thread = chatThreadsForCurrentProject.find((t) => t.chat.id === scopedChatId);
+        return `Edits · ${thread?.chat.title?.trim() || 'chat'}`;
+      }
+      if (isLauncherTab(tab)) return 'New tab';
       return formatFileName(getFileName(tab));
     },
     [chatThreadsForCurrentProject],
@@ -5451,10 +7212,13 @@ export default function WorkspacePage() {
     activeWorkspaceFile.type !== 'folder' &&
     !isBinaryFile(activeWorkspaceFile) &&
     !activeCodeFile;
-  const showOffline =
-    isEditableFileOpen &&
-    collabStatus !== 'local' &&
-    (collabStatus === 'disconnected' || (collabStatus === 'connecting' && connectingGraceElapsed));
+  const effectiveCollabStatus = isLocalWorkspace ? localSocketStatus : collabStatus;
+  const showOffline = deriveShowOffline({
+    isLocalWorkspace,
+    status: effectiveCollabStatus,
+    isEditableFileOpen,
+    connectingGraceElapsed,
+  });
 
   useWorkspaceActiveFileEffects({
     projectId,
@@ -5464,8 +7228,10 @@ export default function WorkspacePage() {
     activeWorkspaceFileResetKey,
     activeWorkspaceFileType,
     fileContentReady,
-    isEditableFileOpen,
-    collabStatus,
+    // These two only feed the connecting-grace timer: local tracks the sidecar
+    // socket (file open or not — a dead sidecar takes chats down too).
+    isEditableFileOpen: isLocalWorkspace || isEditableFileOpen,
+    collabStatus: effectiveCollabStatus,
     activePreviewFile,
     binaryPreviewNonce,
     richEditorRef,
@@ -5520,11 +7286,15 @@ export default function WorkspacePage() {
   const buildDraftName = useCallback((type: DraftEntry['type'], parentPath: string | null) => {
     const baseName = type === 'folder' ? 'New Folder' : 'untitled';
     const ext = type === 'folder' ? '' : '.md';
+    // Case-INSENSITIVELY taken: on a local workspace's disk (macOS/Windows)
+    // `untitled.md` IS `Untitled.md`, and the sidecar refuses to create one
+    // over the other — a generated name must never land on that refusal.
+    const taken = new Set([...existingPaths].map((entry) => entry.toLowerCase()));
     let name = `${baseName}${ext}`;
     let path = parentPath ? `${parentPath}/${name}` : name;
-    if (!existingPaths.has(path)) return name;
+    if (!taken.has(path.toLowerCase())) return name;
     let index = 2;
-    while (existingPaths.has(path)) {
+    while (taken.has(path.toLowerCase())) {
       name = `${baseName}-${index}${ext}`;
       path = parentPath ? `${parentPath}/${name}` : name;
       index += 1;
@@ -5532,14 +7302,26 @@ export default function WorkspacePage() {
     return name;
   }, [existingPaths]);
 
-  const beginDraft = useCallback((type: DraftEntry['type']) => {
-    if (!canWrite) return;
-    if (draftEntry) return;
-    const parentPath = activeWorkspaceFile
+  // The sidebar's create target (drafts, the Files header ＋, its Upload):
+  // a rail focused into a folder creates THERE — it's what the tree shows —
+  // else next to the active file, else the root.
+  const sidebarCreateParent =
+    focusedSidebarFolder ??
+    (activeWorkspaceFile
       ? activeWorkspaceFile.type === 'folder'
         ? activeWorkspaceFile.path
         : getFolderPath(activeWorkspaceFile.path)
-      : null;
+      : null);
+
+  const beginDraft = useCallback((type: DraftEntry['type']) => {
+    if (draftEntry) return;
+    const parentPath = sidebarCreateParent;
+    // Per-folder capability: a path-share editor creates inside their
+    // granted subtree even while workspace-wide canWrite is false.
+    if (!canUploadToFolder(parentPath)) return;
+    // The draft input renders in the section BODY — with Files collapsed the
+    // header ＋ would otherwise start an invisible draft (a no-op to the user).
+    setSidebarSections((prev) => expandSection(prev, 'files'));
     const name = buildDraftName(type, parentPath);
     setDraftEntry({
       id: `draft-${draftIdRef.current++}`,
@@ -5550,29 +7332,25 @@ export default function WorkspacePage() {
     if (parentPath) {
       setExpandedFolders((prev) => new Set(prev).add(parentPath));
     }
-  }, [activeWorkspaceFile, buildDraftName, canWrite, draftEntry]);
+  }, [buildDraftName, canUploadToFolder, draftEntry, sidebarCreateParent]);
 
   const commitDraft = useCallback(async () => {
-    if (!canWrite) return;
     if (!draftEntry || !projectId) return;
-    // Consume the launcher's new-tab intent up front — a canceled or failed
-    // create must not leak it into a later unrelated create.
-    const appendTab = draftAppendTabRef.current;
-    draftAppendTabRef.current = false;
     if (cancelDraftRef.current) {
       cancelDraftRef.current = false;
       return;
     }
-    let name = sanitizeFilename(draftEntry.name.trim());
-    if (!name) {
+    // Slashes in the draft name create nested folders (VS Code/Obsidian).
+    const rawPath = resolveDraftPath(draftEntry.name, draftEntry.type, draftEntry.parentPath);
+    if (!rawPath) {
       setDraftEntry(null);
       return;
     }
-    if (draftEntry.type === 'text' && !name.includes('.')) {
-      name = `${name}.md`;
-    }
-    const rawPath = draftEntry.parentPath ? `${draftEntry.parentPath}/${name}` : name;
     const finalPath = ensureUniquePath(rawPath, existingPaths);
+    if (!canWriteWorkspacePath(finalPath)) {
+      setDraftEntry(null);
+      return;
+    }
 
     const res = await apiFetch('/api/workspace/files', {
       method: 'POST',
@@ -5580,33 +7358,129 @@ export default function WorkspacePage() {
       body: JSON.stringify({ projectId, path: finalPath, type: draftEntry.type }),
     });
     if (!res.ok) {
+      // A refused create used to vanish without a word — the draft row just
+      // disappeared and nothing appeared in the tree. Say why (a local disk
+      // rejects a name that differs only in case from an existing file).
       setDraftEntry(null);
+      const message = ((await res.json().catch(() => null)) as { error?: string } | null)?.error;
+      showWorkspaceAppNotice('error', message || 'Could not create that file');
       return;
     }
     const payload = (await res.json()) as { file: WorkspaceFileRow };
     mutateWorkspaceFiles((prev) => [...prev, payload.file]);
     setDraftEntry(null);
     filesChannelRef.current?.postMessage({ type: 'refresh' });
+    // Reveal the new entry: expand every ancestor folder (a slash path can
+    // mint them on the fly) and a new folder itself.
+    setExpandedFolders((prev) => {
+      const next = new Set(prev);
+      const path = payload.file.path;
+      for (let i = path.indexOf('/'); i !== -1; i = path.indexOf('/', i + 1)) {
+        next.add(path.slice(0, i));
+      }
+      if (payload.file.type === 'folder') next.add(path);
+      return next;
+    });
     if (payload.file.type !== 'folder') {
       setSelectedFilePath(payload.file.path);
       // Explicit create SHOWS the file — claim the primary pane even over an
-      // active chat tab (the sync mirror alone treats it as background). The
-      // tab-strip launcher opts into append (a new tab, not a replace).
-      if (!isMobile) claimPrimaryWithFile(payload.file.path, { append: appendTab });
+      // active chat tab (the sync mirror alone treats it as background).
+      if (!isMobile) claimPrimaryWithFile(payload.file.path, { append: false });
       setWorkspaceViewMode('space');
-    } else {
-      setExpandedFolders((prev) => new Set(prev).add(payload.file.path));
     }
-  }, [canWrite, claimPrimaryWithFile, draftEntry, existingPaths, isMobile, projectId, setWorkspaceViewMode]);
+  }, [canWriteWorkspacePath, claimPrimaryWithFile, draftEntry, existingPaths, isMobile, projectId, setWorkspaceViewMode, showWorkspaceAppNotice]);
 
   const cancelDraft = useCallback(() => {
     cancelDraftRef.current = true;
-    draftAppendTabRef.current = false;
     setDraftEntry(null);
   }, []);
 
+  // ⌘N: create the file NOW under a generated name and open it as a tab —
+  // VS Code's new-file, not a rename box revealed in a rail that may be
+  // collapsed (in which case the old flow looked like nothing happened).
+  // Deliberately no auto-rename: the caret belongs in the document, and a
+  // focused name field would swallow the first thing the user types.
+  // The folder a pane-scoped create lands in: the pane's file (for a launcher
+  // tab, the file it was opened BESIDE), else the primary selection. Shared by
+  // createFileAndOpen and the New-tab chooser's gating so they can't disagree
+  // on whether a create is possible (path-share editors have folder grants
+  // without workspace-wide canWrite).
+  const createParentForPane = useCallback(
+    (pane: EditorPane | undefined) => {
+      const paneActive = pane
+        ? isLauncherTab(pane.active)
+          ? [...pane.tabs].reverse().find((t) => !isSpecialTab(t)) ?? null
+          : pane.active
+        : null;
+      const contextFile =
+        paneActive && !isChatTab(paneActive)
+          ? workspaceFileByPath.get(paneActive) ?? null
+          : activeWorkspaceFile;
+      return contextFile
+        ? contextFile.type === 'folder'
+          ? contextFile.path
+          : getFolderPath(contextFile.path)
+        : null;
+    },
+    [activeWorkspaceFile, workspaceFileByPath],
+  );
+
+  const createFileAndOpen = useCallback(async (paneId?: string) => {
+    if (!projectId) return;
+    // Folder context follows the TARGET pane: a split pane's ＋ creates next
+    // to that pane's file, not next to the primary selection.
+    const parentPath = createParentForPane(
+      paneId ? editorPanesRef.current.find((p) => p.id === paneId) : undefined,
+    );
+    if (!canUploadToFolder(parentPath)) return;
+    const name = buildDraftName('text', parentPath);
+    const finalPath = ensureUniquePath(parentPath ? `${parentPath}/${name}` : name, existingPaths);
+    if (!canWriteWorkspacePath(finalPath)) return;
+    const res = await apiFetch('/api/workspace/files', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId, path: finalPath, type: 'text' }),
+    });
+    if (!res.ok) {
+      const message = ((await res.json().catch(() => null)) as { error?: string } | null)?.error;
+      showWorkspaceAppNotice('error', message || 'Could not create that file');
+      return;
+    }
+    const payload = (await res.json()) as { file: WorkspaceFileRow };
+    mutateWorkspaceFiles((prev) => [...prev, payload.file]);
+    filesChannelRef.current?.postMessage({ type: 'refresh' });
+    if (paneId && paneId !== PRIMARY_PANE_ID && editorPanesRef.current.some((p) => p.id === paneId)) {
+      // A split pane's own ＋: the doc belongs to THAT pane; the primary
+      // selection (composer context) stays put, like secondary tab clicks.
+      setEditorPanes((prev) => {
+        // The pane can close during the create await — the file EXISTS, so
+        // never drop it on the floor: fall back to the primary pane.
+        const alive = prev.some((p) => p.id === paneId);
+        if (!alive) queueMicrotask(() => setSelectedFilePath(payload.file.path));
+        return openPaneTab(prev, alive ? paneId : PRIMARY_PANE_ID, payload.file.path);
+      });
+    } else {
+      setSelectedFilePath(payload.file.path);
+      if (!isMobile) claimPrimaryWithFile(payload.file.path, { append: true });
+    }
+    setWorkspaceViewMode('space');
+  }, [
+    apiFetch,
+    buildDraftName,
+    canUploadToFolder,
+    canWriteWorkspacePath,
+    claimPrimaryWithFile,
+    createParentForPane,
+    existingPaths,
+    isMobile,
+    mutateWorkspaceFiles,
+    projectId,
+    setWorkspaceViewMode,
+    showWorkspaceAppNotice,
+  ]);
+
   const beginRename = useCallback((path: string, source: RenameEntry['source'], opts?: { fileId?: string; clickEvent?: React.MouseEvent; paneId?: string }) => {
-    if (!canWrite) return;
+    if (!canWriteWorkspacePath(path)) return;
     const name = getFileName(path);
     // For header renames, only strip .md (the "document" extension);
     // keep other extensions (e.g. .json, .py) visible so they aren't lost.
@@ -5624,11 +7498,11 @@ export default function WorkspacePage() {
     }
 
     setRenameEntry({ path, name: displayName, source, fileId: opts?.fileId, paneId: opts?.paneId });
-  }, [canWrite]);
+  }, [canWriteWorkspacePath]);
 
   const commitRename = async () => {
-    if (!canWrite) return;
     if (!renameEntry) return;
+    if (!canWriteWorkspacePath(renameEntry.path)) return;
     const sourcePath = renameEntry.path;
     const sourceFile = workspaceFileByPath.get(sourcePath);
     const hasChildren = workspaceFiles.some((file) => file.path.startsWith(`${sourcePath}/`));
@@ -5676,6 +7550,9 @@ export default function WorkspacePage() {
   // and a partial restore is worse than none. Huge subtrees are skipped too.
   const deletedHistoryRef = useRef<DeletedEntry[]>([]);
   const [hasDeletedHistory, setHasDeletedHistory] = useState(false);
+  // Bumped once per processed delete batch (after the undo-eligibility
+  // decision) — e2e specs wait on it instead of racing the DELETE response.
+  const [deleteSeq, setDeleteSeq] = useState(0);
 
   // Pane-state transitions are pure (lib/workspace/editor-panes); these
   // handlers apply them and forward a primary-active hand-off into
@@ -5712,6 +7589,43 @@ export default function WorkspacePage() {
       setEditorPanes((prev) => {
         const res = transition(prev);
         const acp = pickChatPane(res.panes);
+        // Every pane transition re-points ⌘W at the acted-on tab's pane (a
+        // split lands the tab in a NEW pane id), else the acted-on pane —
+        // body/edge drops fire no pointer event inside the destination. The
+        // same file can be ACTIVE in two panes, so a bare match-by-tab can
+        // hit a bystander copy: prefer the acted-on pane showing the tab,
+        // then the pane the tab BECAME active in, then any holder, then the
+        // pane. Computed HERE, on the committed result — the ref-snapshot
+        // prediction above sees a different pane id (nextPaneId() runs per
+        // transition call). Stamped via microtask: on a double-invoked
+        // updater the committed invocation's microtask runs last.
+        const showsTab = (p: EditorPane) => p.active === opts?.preferTab;
+        const focusPane = opts?.preferTab
+          ? (opts.preferPaneId
+              ? res.panes.find((p) => p.id === opts.preferPaneId && showsTab(p))
+              : undefined) ??
+            res.panes.find(
+              (p) => showsTab(p) && prev.find((b) => b.id === p.id)?.active !== opts.preferTab,
+            ) ??
+            res.panes.find(showsTab) ??
+            (opts.preferPaneId ? res.panes.find((p) => p.id === opts.preferPaneId) : undefined)
+          : opts?.preferPaneId
+            ? res.panes.find((p) => p.id === opts.preferPaneId)
+            : undefined;
+        // A pane that collapsed under the transition (its last tab closed or
+        // dragged away) can't hold the focus: it falls to the primary — the
+        // pane that ADOPTED a collapsed primary's content — so ⌘W and the
+        // rail's focused-pane targeting never chase a dead id.
+        const nextFocusId = focusPane
+          ? focusPane.id
+          : res.panes.some((p) => p.id === lastFocusedPaneIdRef.current)
+            ? null
+            : res.panes[0].id;
+        if (nextFocusId) {
+          queueMicrotask(() => {
+            lastFocusedPaneIdRef.current = nextFocusId;
+          });
+        }
         return acp ? enforceSingleActiveChat(res.panes, acp.id) : res.panes;
       });
       const activeChatPane = pickChatPane(result.panes);
@@ -5741,7 +7655,7 @@ export default function WorkspacePage() {
   );
 
   const deletePaths = useCallback(async (paths: string[]) => {
-    if (!canWrite) return;
+    if (paths.length === 0 || !paths.every((path) => canWriteWorkspacePath(path))) return;
     if (!projectId) return;
     if (paths.length === 0) return;
 
@@ -5794,6 +7708,7 @@ export default function WorkspacePage() {
       deletedHistoryRef.current = [];
       setHasDeletedHistory(false);
     }
+    setDeleteSeq((s) => s + 1);
     mutateWorkspaceFiles((prev) =>
       prev.filter((file) => !succeeded.some((p) => file.path === p || file.path.startsWith(`${p}/`))),
     );
@@ -5812,10 +7727,17 @@ export default function WorkspacePage() {
     setSelectedPaths(new Set());
     setOpenMenuPath(null);
     filesChannelRef.current?.postMessage({ type: 'refresh' });
-  }, [applyPaneTransition, canWrite, projectId, selectedFilePath]);
+  }, [applyPaneTransition, canWriteWorkspacePath, projectId, selectedFilePath]);
 
   const restoreLastDeletedPaths = useCallback(async () => {
-    if (!canWrite || !projectId) return;
+    if (!projectId) return;
+    // No per-path pre-gate here: an entry was only ever pushed after passing
+    // the delete's own gate, and for a grant-elevated member the delete
+    // itself RETIRES the grant — the restore rails re-authorize server-side
+    // via the own-delete verification, which the vanished grant would
+    // wrongly block from the client.
+    const next = deletedHistoryRef.current[deletedHistoryRef.current.length - 1];
+    if (!next) return;
     const entry = deletedHistoryRef.current.pop();
     setHasDeletedHistory(deletedHistoryRef.current.length > 0);
     if (!entry) return;
@@ -5852,7 +7774,8 @@ export default function WorkspacePage() {
         const res = await apiFetch('/api/workspace/files', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ projectId, path, type: 'folder' }),
+          // Restore rail: keep deferred path shares alive across delete+undo.
+          body: JSON.stringify({ projectId, path, type: 'folder', preservePathShares: true }),
         }).catch(() => null);
         // Mark a folder only on a successful create — a file racing onto this
         // path conflicts, and descendants must then stay blocked (non-folder).
@@ -5881,7 +7804,7 @@ export default function WorkspacePage() {
       if (parent) setExpandedFolders((prev) => new Set(prev).add(parent));
       setSelectedPaths(new Set([top]));
     }
-  }, [canWrite, projectId, reloadFiles]);
+  }, [projectId, reloadFiles]);
 
   const deletePath = useCallback(
     (path: string) => deletePaths([path]),
@@ -5942,7 +7865,9 @@ export default function WorkspacePage() {
             path: params.get('path') ?? undefined,
             folderPath: params.get('folderPath') ?? undefined,
           })
-        : `/api/workspace/files/download?${params.toString()}`;
+        : // Anchor navigations can't carry headers — path-share guests need
+          // the token in the URL (the server accepts ?pshare=).
+          appendPathShareTokenToUrl(`/api/workspace/files/download?${params.toString()}`);
     anchor.download = fileName;
     document.body.appendChild(anchor);
     anchor.click();
@@ -6044,11 +7969,14 @@ export default function WorkspacePage() {
   // Handle file/folder click
   const handleFileClick = useCallback((file: WorkspaceFileRow) => {
     if (file.type === 'folder') return;
-    setSelectedFilePath(file.path);
     // Explicit open: wireframe replace-on-open. The selectedFilePath mirror
     // deliberately never displaces an active chat tab, so the click itself
-    // must claim the pane (withdrawing the chat reveal intent with it).
-    if (!isMobile) claimPrimaryWithFile(file.path);
+    // must claim the pane (withdrawing the chat reveal intent with it) — and
+    // the claim, which knows WHICH pane took the file, owns the selection.
+    // Setting it here too pulled the primary onto a file opened in a side
+    // pane, so a single rail click changed both panes.
+    if (isMobile) setSelectedFilePath(file.path);
+    else claimPrimaryWithFile(file.path);
     setWorkspaceViewMode('space');
     // Opening a file means "show me the editor". The center diff viewer would
     // otherwise keep precedence while Sync stays in the (now multi-section)
@@ -6059,37 +7987,237 @@ export default function WorkspacePage() {
     }
   }, [claimPrimaryWithFile, isMobile, setWorkspaceViewMode]);
 
+  const prefetchWorkspaceFile = useCallback((file: WorkspaceFileRow) => {
+    if (!workspaceCollabSocket || file.type === 'folder') return;
+    const docName = `${workspaceCollabSocket.docNamePrefix ?? ''}${file.path}`;
+    prefetchProvider(
+      workspaceCollabSocket.socket,
+      docName,
+      file.id,
+      workspaceCollabSocket.getToken,
+    );
+    if (!isMarkdownFile(file)) preloadMonaco();
+  }, [workspaceCollabSocket]);
+
+  // ---- Panel surface switching (?view=panel: one surface at a time) -------
+  // Every target maps to an EXISTING single-surface action; nothing here adds
+  // a pane. Shared by the human's floating switcher and the agent's /g/show
+  // broadcasts (usePanelControl below).
+  // The file the panel last SHOWED. The chat tab can replace the file tab
+  // and clear the selection, so without this the doc button falls through to
+  // the workspace default instead of returning to the document the human was
+  // just reading.
+  const panelLastFilePathRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (panelViewActive && selectedFilePath) panelLastFilePathRef.current = selectedFilePath;
+  }, [panelViewActive, selectedFilePath]);
+  const showPanelSurface = useCallback(
+    (surface: PanelNavTarget, fileOverride?: WorkspaceFileRow) => {
+      if (surface === 'files') {
+        setOpenLeftRail('project');
+        return;
+      }
+      setOpenLeftRail(null);
+      if (surface === 'review') {
+        // The SAME ReviewPanel the right dock hosts, rendered full-width in
+        // panel view. (The all-scope review TAB renders null: unscoped tabs
+        // are no longer creatable, which showed as a blank surface.)
+        openRightDock('history');
+        return;
+      }
+      closeRightDock();
+      if (surface === 'chat') {
+        openChatTabForCurrentRef.current();
+        return;
+      }
+      // doc / source / split / pdf: make sure the FILE holds the pane (the
+      // chat tab may) before driving the LaTeX view mode. A /g/show command
+      // carrying its own path passes that file in — selectedFilePath is still
+      // the PREVIOUS render's selection here, so reading it would reopen the
+      // stale file over the one the command just scheduled. A chat-primary
+      // panel can have CLEARED the selection, so fall back to the last file
+      // tab still open in the panes — otherwise the doc button silently does
+      // nothing, which is a dead end in the one-surface layout.
+      const lastPaneFile = [...editorPanesRef.current[0].tabs]
+        .reverse()
+        .find((tab) => tab && !isSpecialTab(tab));
+      const lastShown = panelLastFilePathRef.current;
+      const file =
+        fileOverride ??
+        // Source from an open compiled PDF: jump to its .tex twin.
+        (surface === 'source' && selectedFilePath?.endsWith('.pdf')
+          ? workspaceFileByPath.get(selectedFilePath.replace(/\.pdf$/, '.tex'))
+          : undefined) ??
+        (selectedFilePath ? workspaceFileByPath.get(selectedFilePath) : undefined) ??
+        (lastShown ? workspaceFileByPath.get(lastShown) : undefined) ??
+        (lastPaneFile ? workspaceFileByPath.get(lastPaneFile) : undefined) ??
+        // Chat-only pane and nothing ever shown (a chat-default arrival): the
+        // doc button still has to land SOMEWHERE — the workspace default doc.
+        pickDefaultDocument(workspaceFiles) ??
+        undefined;
+      if (file && file.type !== 'folder') handleFileClick(file);
+      if (surface === 'source' || surface === 'pdf') {
+        handleLatexViewModeChange(surface);
+      }
+    },
+    [closeRightDock, handleFileClick, handleLatexViewModeChange, openRightDock, selectedFilePath, workspaceFileByPath, workspaceFiles],
+  );
+  usePanelControl({
+    enabled: panelViewActive,
+    projectId,
+    supabaseClient,
+    onCommand: (command) =>
+      applyPanelCommand(command, workspaceFileByPath, handleFileClick, showPanelSurface),
+  });
+  // Embedded panel: ONE pane ever renders. Chat-aside docking (a deep link
+  // claiming primary, the chat reveal) and restored splits collapse to the
+  // primary pane; their tabs stay reachable as background tabs behind the
+  // switcher's surfaces. Identity-stable when already single (no loop).
+  useEffect(() => {
+    if (!panelViewActive) return;
+    setEditorPanes((prev) => collapseToPrimaryPane(prev));
+  }, [editorPanes, panelViewActive]);
+  const panelActiveSurface: PanelNavTarget =
+    openLeftRail === 'project'
+      ? 'files'
+      : rightDockView === 'history'
+        ? 'review'
+        : primaryChatActive
+          ? 'chat'
+          : primaryReviewActive
+            ? 'review'
+            : activeTexFile
+              ? (latexViewMode === 'split' ? 'source' : latexViewMode)
+              : activeWorkspaceFile?.path.endsWith('.pdf')
+                ? 'pdf'
+                : 'doc';
+  // A compiled PDF opened as the panel surface: its source twin (same path,
+  // .tex) gets a Source entry in the switcher, so the human can jump from
+  // output to source without the file tree. (Re-applied after the
+  // feat/pdf-comments merge resolved #1554's hunks away, 2026-08-27.)
+  const activePdfTexTwin =
+    panelViewActive && activeWorkspaceFile?.path.endsWith('.pdf')
+      ? workspaceFileByPath.get(activeWorkspaceFile.path.replace(/\.pdf$/, '.tex'))
+      : undefined;
+  const panelSurfaces = useMemo<Array<{ id: PanelNavTarget; label: string }>>(
+    () => [
+      { id: 'files', label: 'Files' },
+      ...(activeTexFile || activePdfTexTwin
+        ? ([
+            { id: 'source', label: 'Source' },
+            { id: 'pdf', label: 'PDF' },
+          ] as Array<{ id: PanelNavTarget; label: string }>)
+        : [{ id: 'doc', label: 'Doc' } as { id: PanelNavTarget; label: string }]),
+      { id: 'chat', label: 'Chat' },
+      // Review = the edits surface the (shed) right dock would host. Home
+      // stays a top-corner button, not a surface (founder 2026-08-26).
+      { id: 'review', label: 'Review' },
+    ],
+    [activePdfTexTwin, activeTexFile],
+  );
+
+  // Bubble-click jump: open the file the peer broadcast in presence, then ask
+  // that file's editor to center their live awareness caret. Local mode (and
+  // clients that predate openFilePath) broadcast no path — the current file is
+  // tried instead, where the awareness match still finds a same-doc peer.
+  const [peerReveal, setPeerReveal] = useState<(RevealPeerRequest & { path: string }) | null>(null);
+  const peerRevealSeqRef = useRef(0);
+  const jumpToCollaborator = useCallback(
+    (badge: { id: string; name: string; color?: string | null }) => {
+      const presenceKey = isLocalWorkspace
+        ? null // local badge ids are name|color composites, not presence keys
+        : badge.id.includes(':')
+          ? badge.id
+          : `user:${badge.id}`;
+      const metas = presenceKey ? workspacePresenceState[presenceKey] ?? [] : [];
+      const openPath = [...metas].reverse().find((meta) => meta?.openFilePath)?.openFilePath ?? null;
+      // Local mode: awareness (not Supabase presence) knows the peer's doc —
+      // strip the socket's docName prefix back to a workspace path.
+      const localPeerDocName = isLocalWorkspace
+        ? localCollabPeers.find((peer) => peer.key === badge.id)?.docName ?? null
+        : null;
+      const localPrefix = workspaceCollabSocket?.docNamePrefix ?? '';
+      const localPeerPath =
+        localPeerDocName && localPrefix && localPeerDocName.startsWith(localPrefix)
+          ? localPeerDocName.slice(localPrefix.length)
+          : localPeerDocName;
+      const path = (isLocalWorkspace ? localPeerPath : openPath) ?? selectedFilePath;
+      if (!path) return;
+      if (path !== selectedFilePath) {
+        const file = workspaceFileByPath.get(path);
+        if (!file) return; // peer is in a file this client can't see
+        handleFileClick(file);
+      }
+      setPeerReveal({
+        seq: ++peerRevealSeqRef.current,
+        presenceKey,
+        name: badge.name,
+        color: badge.color ?? null,
+        path,
+      });
+    },
+    [
+      isLocalWorkspace,
+      workspacePresenceState,
+      selectedFilePath,
+      workspaceFileByPath,
+      handleFileClick,
+      localCollabPeers,
+      workspaceCollabSocket,
+    ],
+  );
+  // A reveal request is one-shot: the editor reports delivery (or give-up) so
+  // a later remount of the same file can't replay the scroll…
+  const handlePeerRevealDone = useCallback((seq: number) => {
+    setPeerReveal((prev) => (prev && prev.seq === seq ? null : prev));
+  }, []);
+  // …and navigating off the target file cancels an undelivered request (the
+  // click itself lands on the target, so this only fires on real navigation).
+  useEffect(() => {
+    if (peerReveal && selectedFilePath !== peerReveal.path) setPeerReveal(null);
+  }, [peerReveal, selectedFilePath]);
+
   // ---- Editor pane/tab actions (Obsidian-style tabs + drag-to-split) ----
 
   const handlePaneTabActivate = useCallback(
     (paneId: string, path: string) => {
+      lastFocusedPaneIdRef.current = paneId;
       if (isChatTab(path)) {
         const chatId = chatIdOfTab(path)!;
         setEditorPanes((prev) => enforceSingleActiveChat(openPaneTab(prev, paneId, path), paneId));
         void openChatByIdRef.current(chatId);
         return;
       }
-      if (paneId !== PRIMARY_PANE_ID) {
+      // Non-file surfaces (the New-tab chooser, a review timeline, a turn's
+      // diff): not workspace paths — just activate them. Without this the
+      // primary-pane branch below would look them up as file paths, find
+      // nothing, and return, leaving the tab permanently un-reactivatable. (On
+      // the primary this leaves selectedFilePath as the background file,
+      // exactly like chat tabs do.)
+      if (isSpecialTab(path)) {
         setEditorPanes((prev) => openPaneTab(prev, paneId, path));
         return;
       }
-      const file = workspaceFileByPath.get(path);
-      if (file) {
-        handleFileClick(file);
-        return;
-      }
-      // The tab was optimistically remapped by an in-flight move while a
-      // stale reload restored the old server paths. Keep the SELECTION on the
-      // optimistic path (selecting the old row would strand the tab there
-      // after the rename commits); activeWorkspaceFile and the collab room
-      // resolve through pendingPaneMoves until the reload settles.
-      const move = pendingPaneMoves.find((m) => isPathWithin(path, m.to));
-      if (!move || !workspaceFileByPath.get(remapPath(path, move.to, move.from))) return;
-      setSelectedFilePath(path);
+      // A file tab activates in the pane it was CLICKED in — always, and in
+      // that pane only. Routing the primary's tabs through the rail open path
+      // (handleFileClick → claimPrimaryWithFile) re-picked the pane by
+      // heuristic: with a chat active in the primary, clicking one of its file
+      // tabs swapped ANOTHER pane's document and left the clicked tab inert
+      // ("some tabs became completely unclickable" — the onboarding report).
+      // The primary's selection follows its own active tab (its editor chrome
+      // renders selectedFilePath), including a path only pendingPaneMoves can
+      // resolve while an in-flight move settles.
+      applyPaneTransition(
+        (prev) => ({
+          panes: openPaneTab(prev, paneId, path),
+          primaryActive: paneId === PRIMARY_PANE_ID ? path : undefined,
+        }),
+        { preferPaneId: paneId, preferTab: path },
+      );
       setWorkspaceViewMode('space');
       setSelectedCommit(null);
     },
-    [handleFileClick, pendingPaneMoves, setWorkspaceViewMode, workspaceFileByPath],
+    [applyPaneTransition, setWorkspaceViewMode],
   );
 
   const handlePaneTabClose = useCallback(
@@ -6097,6 +8225,24 @@ export default function WorkspacePage() {
       void applyPaneTransition((prev) => closePaneTab(prev, paneId, path), { preferPaneId: paneId }),
     [applyPaneTransition],
   );
+
+  // Desktop ⌘W: the shell's menu dispatches this instead of closing the
+  // window — close the focused pane's active tab through the normal path.
+  // Gated on inDesktopShell (the any-OS shell flag), not isDesktopApp
+  // (Windows/Linux shells intercept Ctrl+W too) and not desktopTabs: the
+  // native File ▸ Close Tab / ⌘W menu keeps dispatching this with the top
+  // bar hidden, where closing the focused pane's active surface still means
+  // "close the displayed file/chat".
+  useEffect(() => {
+    if (!inDesktopShell) return;
+    const onCloseTab = () => {
+      const panes = editorPanesRef.current;
+      const pane = panes.find((p) => p.id === lastFocusedPaneIdRef.current) ?? panes[0];
+      if (pane?.active) handlePaneTabClose(pane.id, pane.active);
+    };
+    window.addEventListener('sundial:close-tab', onCloseTab);
+    return () => window.removeEventListener('sundial:close-tab', onCloseTab);
+  }, [inDesktopShell, handlePaneTabClose]);
 
   // The chat header's X: close the chat TAB wherever it lives (desktop);
   // mobile still closes the legacy column.
@@ -6133,6 +8279,25 @@ export default function WorkspacePage() {
       handleTabDragChange(false);
     },
     [applyPaneTransition, handleTabDragChange],
+  );
+
+  // Tab right-click ▸ Split right: the tab duplicates into a NEW pane beside
+  // its own (rail-source, so a pane's sole tab splits too — VS Code
+  // semantics; the drag-to-edge split keeps its move semantics). No
+  // preferPaneId: the source pane still shows the tab, and applyPaneTransition's
+  // became-active rule is what lands focus on the new pane.
+  const handleTabSplitRight = useCallback(
+    (paneId: string, path: string) => {
+      // Files only: duplicating a chat tab would trip the single-live-chat
+      // demotion (a fresh pane showing nothing), and diff/launcher tabs are
+      // one-shot surfaces.
+      if (isSpecialTab(path)) return;
+      applyPaneTransition(
+        (prev) => splitWithTab(prev, { paneId: RAIL_PANE_ID, path }, paneId, 'right'),
+        { preferTab: path },
+      );
+    },
+    [applyPaneTransition],
   );
 
   const handleOpenInNewTab = useCallback(
@@ -6195,12 +8360,21 @@ export default function WorkspacePage() {
   // Inverse SyncTeX: resolve a file (relative to the compiled root's directory)
   // to a workspace path, then open it at the matched line (handles already-open
   // vs remount-then-reveal).
+  // First-time teaching card for the double-click jump: the gesture silently
+  // scrolls the editor, which reads as "the app moved me" to a newcomer. Shown
+  // once per browser, on the first inverse jump that actually resolves.
+  const [showSynctexTip, setShowSynctexTip] = useState(false);
+  const dismissSynctexTip = useCallback(() => {
+    setShowSynctexTip(false);
+    try {
+      localStorage.setItem('sundial:synctex-tip-seen', '1');
+    } catch {
+      /* storage denied: the in-session dismissal still holds */
+    }
+  }, []);
   const handleSynctexInverse = useCallback(
     (file: string, line: number) => {
-      const rootDir = latexRootPath && latexRootPath.includes('/')
-        ? latexRootPath.slice(0, latexRootPath.lastIndexOf('/'))
-        : '';
-      const candidates = [file, rootDir ? `${rootDir}/${file}` : ''].filter(Boolean);
+      const candidates = [pathFromRoot(latexRootPath ?? '', file), file];
       let resolved = candidates.find((p) => workspaceFileByPath.has(p));
       if (!resolved) {
         const base = file.slice(file.lastIndexOf('/') + 1);
@@ -6211,36 +8385,150 @@ export default function WorkspacePage() {
           }
         }
       }
-      if (resolved) openFileAtLine({ path: resolved, line });
+      if (!resolved) return;
+      openFileAtLine({ path: resolved, line });
+      try {
+        if (localStorage.getItem('sundial:synctex-tip-seen') !== '1') setShowSynctexTip(true);
+      } catch {
+        /* storage denied: skip the tip rather than re-showing it forever */
+      }
     },
     [latexRootPath, workspaceFileByPath, openFileAtLine],
   );
 
+  // PDF comments (pdf_comments_enabled): each open thread's source line (from
+  // the Monaco anchor pass) projected onto the PDF via SyncTeX forward search.
+  // The PDF is a projection — comments stay anchored in source, so recompiles,
+  // the Overleaf mirror, and Sunny's comment trigger all work unchanged.
+  const pdfCommentMarkers = useMemo<PdfCommentMarker[] | null>(() => {
+    if (!pdfCommentsEnabled || !synctexIndex || !activeTexFile || !activeWorkspaceFile) return null;
+    const rel = pathRelativeToRoot(latexRootPath ?? activeWorkspaceFile.path, activeWorkspaceFile.path);
+    const markers: PdfCommentMarker[] = [];
+    for (const thread of openCommentThreads) {
+      const line = commentAnchorLines[thread.id];
+      if (!line) continue;
+      const hit = synctexIndex.forward(rel, line);
+      if (!hit) continue;
+      markers.push({
+        id: thread.id,
+        page: hit.page,
+        yPt: hit.y,
+        active: thread.id === activeCommentThreadId,
+      });
+    }
+    return markers.length > 0 ? markers : null;
+  }, [pdfCommentsEnabled, synctexIndex, activeTexFile, activeWorkspaceFile, latexRootPath, openCommentThreads, commentAnchorLines, activeCommentThreadId]);
+
+  // A PDF text selection confirmed as a comment: SyncTeX inverse resolves the
+  // page point to a source line, the matcher narrows it to the selected span,
+  // and the normal draft flow takes over (Yjs anchor + quote, same as Monaco's
+  // own Comment action). A hit into another source file (an \input'd child
+  // while the root is open) falls back to jump-to-source.
+  const handlePdfCommentSelection = useCallback(
+    (sel: PdfCommentSelection) => {
+      if (!synctexIndex || !activeWorkspaceFile) return;
+      const hit = synctexIndex.inverse(sel.page, sel.xPt, sel.yPt);
+      if (!hit) return;
+      const targetPath = pathFromRoot(latexRootPath ?? activeWorkspaceFile.path, hit.file);
+      const handle = textEditorRef.current;
+      if (targetPath === activeWorkspaceFile.path && handle?.buildCommentSelectionFromOffsets) {
+        const range = matchPdfSelectionToSource(handle.getText(), hit.line, sel.text);
+        if (range) {
+          const selection = handle.buildCommentSelectionFromOffsets(range.from, range.to);
+          if (selection) {
+            openCommentDraft(selection);
+            return;
+          }
+        }
+      }
+      handleSynctexInverse(hit.file, hit.line);
+    },
+    [synctexIndex, activeWorkspaceFile, latexRootPath, openCommentDraft, handleSynctexInverse],
+  );
+
+  // Compile-error row click: `file` is the resolved workspace path (root or an
+  // included child) — open it if needed, then reveal + flash the line.
+  const handleLatexNavigate = useCallback(
+    (line: number, file?: string | null) => {
+      if (file) {
+        // A root that is momentarily re-resolving must not DROP the pin — the
+        // stale-pin effect below already retires it once the user leaves both
+        // files, and clearing it here would hand the compile to the child.
+        if (latexRootPath) setLatexNavPin({ root: latexRootPath, child: file });
+        openFileAtLine({ path: file, line });
+      } else if (activeIsRoot) textEditorRef.current?.revealLine?.(line);
+    },
+    [activeIsRoot, latexRootPath, openFileAtLine],
+  );
+
+  // Forward SyncTeX (§4.2): cursor line → PDF point. The jump is always
+  // explicit (the editor's "Show in PDF" / Ctrl+Alt+J), so it opens a collapsed
+  // pane, flashes the target, and reports a hint when it can't resolve.
+  const [synctexJump, setSynctexJump] = useState<SyncTexJump | null>(null);
+  const forwardSyncTex = useCallback(
+    (line: number | null | undefined): string | null => {
+      if (!synctexIndex) return 'Compile first';
+      const path = activeWorkspaceFile?.path;
+      if (!line || !path) return null;
+      const hit = synctexIndex.forward(pathRelativeToRoot(latexRootPath ?? '', path), line);
+      if (!hit) return 'No PDF position for this line';
+      if (latexViewMode === 'source') handleLatexViewModeChange('split');
+      setSynctexJump({ ...hit, nonce: Date.now() });
+      return null;
+    },
+    [synctexIndex, activeWorkspaceFile?.path, latexRootPath, latexViewMode, handleLatexViewModeChange],
+  );
+
+  // Monaco actions have no surface for feedback, so the hint lands in the
+  // LaTeX toolbar and clears itself. Carries a nonce: repeating the same hint
+  // must restart the timer, not be swallowed as an identical state value.
+  const [synctexHint, setSynctexHint] = useState<{ text: string; nonce: number } | null>(null);
+  const handleSynctexForward = useCallback(() => {
+    const text = forwardSyncTex(textEditorRef.current?.getCursorLine?.());
+    setSynctexHint(text ? { text, nonce: Date.now() } : null);
+  }, [forwardSyncTex]);
+  useEffect(() => {
+    if (!synctexHint) return;
+    const t = setTimeout(() => setSynctexHint(null), 2000);
+    return () => clearTimeout(t);
+  }, [synctexHint]);
+
+  // Where an explicitly opened tab lands — a file, a turn's diff, the review
+  // timeline: beside the chat while the chat holds the primary pane (the
+  // slide-in split), otherwise claiming the primary tab. Web (no-tabs) shell:
+  // the tab claims the primary and chat docks right instead.
+  const openPaneTabBesideChat = useCallback(
+    (tab: string) => {
+      if (isMobile) return;
+      if (desktopTabs && isChatTab(editorPanesRef.current[0].active)) {
+        setEditorPanes((prev) => openPaneToSide(prev, tab));
+      } else {
+        claimPrimaryWithFile(tab);
+      }
+      // Additive: the surface opens beside any open chat (no need to re-open it).
+      setWorkspaceViewMode('space');
+    },
+    [claimPrimaryWithFile, desktopTabs, isMobile, setWorkspaceViewMode],
+  );
   const openEditedFileInlinePath = useCallback((path: string) => {
     setPendingEditedFilePath(null);
     setSelectedFilePath(path);
-    if (!isMobile) {
-      setOpenLeftRail('project');
-      // An explicit open from the chat must actually SHOW the doc: while the
-      // chat holds the primary pane it opens beside it (the slide-in split);
-      // otherwise it claims the primary tab like any explicit open. Web
-      // (no-tabs) shell: doc claims the primary, chat docks right instead.
-      if (desktopTabs && isChatTab(editorPanesRef.current[0].active)) {
-        setEditorPanes((prev) => openPaneToSide(prev, path));
-      } else {
-        claimPrimaryWithFile(path);
-      }
-    }
-    // Additive: the editor opens beside any open chat (no need to re-open it).
-    setWorkspaceViewMode('space');
+    if (!isMobile) setOpenLeftRail('project');
+    // Placement is the shared rule (openPaneTabBesideChat); the rest is what
+    // makes this a FILE open — selection, the rail, the mobile panel. The
+    // opener no-ops on mobile (no panes), so set the view mode here too.
+    openPaneTabBesideChat(path);
     if (isMobile) {
+      setWorkspaceViewMode('space');
       setMobilePanel(null);
     }
-  }, [claimPrimaryWithFile, desktopTabs, isMobile, setWorkspaceViewMode]);
+  }, [isMobile, openPaneTabBesideChat, setWorkspaceViewMode]);
 
   const handleOpenEditedFileInline = useCallback((path: string) => {
     const file = workspaceFileByPath.get(path);
     if (!file || file.type === 'folder' || file.type === 'proposal') {
+      // Not in the map yet (a just-created Sunny file before the list reload
+      // lands) — remember it and open it when the reload arrives.
       setPendingEditedFilePath(path);
       void reloadFiles(false);
       return;
@@ -6252,15 +8540,43 @@ export default function WorkspacePage() {
     setWorkspaceViewMode('chat');
   }, [setWorkspaceViewMode]);
 
-  const handleOpenDiffFile = useCallback(
-    (assistantMessageId: string) => {
-      if (isMobile) return;
-      // Open the source the turn changed, not a compile artifact it emitted.
-      const targetPath = firstEditableTurnEditPath(getCachedTurnEdits(assistantMessageId));
-      if (!targetPath) return;
-      handleOpenEditedFileInline(targetPath);
-    },
-    [handleOpenEditedFileInline, isMobile],
+  // Opening a file from a chat surface (edit card, diff tab) keeps the chat
+  // BESIDE it — claiming the whole pane lost the conversation you were reading
+  // (2026-08-06 founder feedback, reversing the 2026-08-01 file-only open).
+  const handleOpenFileFromEditCard = handleOpenEditedFileInline;
+
+  // Closes the file view back to chat-only. Lives on the no-tabs window's
+  // top-LEFT corner (macOS convention, founder) — the old top-right header ×
+  // was removed on founder feedback.
+  const closeActiveFileView = useCallback(() => {
+    if (!isMobile) {
+      // ONE transition that keeps closing visible file tabs until none remain
+      // — iterating outside the updater misses panes closeTab PROMOTES into
+      // new ids (closing the primary renames a secondary to 'primary', so a
+      // stale pane list left the promoted document open — Codex on #1039).
+      applyPaneTransition((prev) => {
+        let panes = prev;
+        let primaryActive: string | undefined;
+        for (let guard = 0; guard < 64; guard += 1) {
+          const pane = panes.find((p) => p.active !== '' && !isSpecialTab(p.active));
+          if (!pane) break;
+          const res = closePaneTab(panes, pane.id, pane.active);
+          panes = res.panes;
+          primaryActive = res.primaryActive ?? primaryActive;
+        }
+        return { panes, primaryActive };
+      });
+    }
+    setWorkspaceViewMode('chat');
+  }, [applyPaneTransition, isMobile, setWorkspaceViewMode]);
+
+  const handleOpenTurnDiff = useCallback(
+    (assistantMessageId: string) => openPaneTabBesideChat(diffTab(assistantMessageId)),
+    [openPaneTabBesideChat],
+  );
+  const handleOpenChatEdits = useCallback(
+    (chatId: string) => openPaneTabBesideChat(reviewTab(chatId)),
+    [openPaneTabBesideChat],
   );
 
   useWorkspaceFileEditingEffects({
@@ -6306,6 +8622,8 @@ export default function WorkspacePage() {
                 <div
                   key={file.id}
                   onClick={() => handleFileClick(file)}
+                  onPointerEnter={() => prefetchWorkspaceFile(file)}
+                  onPointerDown={() => prefetchWorkspaceFile(file)}
                   className={`flex cursor-pointer items-center gap-3 rounded-xl px-3 py-2.5 text-sm ${getSidebarListItemStateClasses(isSelected)}`}
                 >
                   <WorkspaceEntryIcon
@@ -6333,17 +8651,11 @@ export default function WorkspacePage() {
   }, []);
 
   // Dismiss the new-chat / assistant-picker menu on an outside click or Escape.
-  // The menu lives inside one of the two picker wrappers (top bar / chat header),
-  // so a click in either is "inside" and must not close it.
   useEffect(() => {
     if (!showAssistantPicker) return;
     const onPointerDown = (event: MouseEvent) => {
       const target = event.target as Node;
-      if (
-        assistantPickerRef.current?.contains(target) ||
-        chatHeaderPickerRef.current?.contains(target)
-      )
-        return;
+      if (assistantPickerRef.current?.contains(target)) return;
       closeAssistantPicker();
     };
     const onKey = (event: KeyboardEvent) => {
@@ -6366,7 +8678,8 @@ export default function WorkspacePage() {
         index,
         focusComposer = false,
         sidePanel = false,
-      }: { index?: number; focusComposer?: boolean; sidePanel?: boolean } = {}
+        appendTab = false,
+      }: { index?: number; focusComposer?: boolean; sidePanel?: boolean; appendTab?: boolean } = {}
     ) => {
       if (typeof index === 'number') {
         setSelectedChatIndex(index);
@@ -6395,7 +8708,7 @@ export default function WorkspacePage() {
         setWorkspaceViewMode('chat');
         setMobilePanel(null);
       } else {
-        openCenterPanel('chat', { chatId, side: sidePanel });
+        openCenterPanel('chat', { chatId, side: sidePanel, append: appendTab });
       }
     },
     [clearUnreadForChat, ensureChatMessagesLoaded, isMobile, openCenterPanel, setWorkspaceViewMode]
@@ -6423,11 +8736,11 @@ export default function WorkspacePage() {
     [handleJumpToTurn],
   );
 
-  const replaceDraftChat = useCallback((draftId: string, realThread: ChatThread) => {
-    draftPromotionsRef.current[draftId] = realThread.chat.id;
-    // The draft's pane tab follows the promotion — same tab, real id.
-    const fromTab = chatTab(draftId);
-    const toTab = chatTab(realThread.chat.id);
+  // A chat's pane tab follows its id swap (promotion and demotion) — same
+  // tab, new id.
+  const retargetChatTab = useCallback((fromId: string, toId: string) => {
+    const fromTab = chatTab(fromId);
+    const toTab = chatTab(toId);
     setEditorPanes((prev) =>
       prev.some((p) => p.tabs.includes(fromTab))
         ? prev.map((p) => ({
@@ -6437,6 +8750,12 @@ export default function WorkspacePage() {
           }))
         : prev,
     );
+  }, []);
+
+  const replaceDraftChat = useCallback((draftId: string, realThread: ChatThread) => {
+    draftPromotionsRef.current[draftId] = realThread.chat.id;
+    chatLineageIdRef.current[realThread.chat.id] = chatLineageIdRef.current[draftId] ?? draftId;
+    retargetChatTab(draftId, realThread.chat.id);
     setChatThreads((prev) => {
       const draftEntry = prev.find((thread) => thread.chat.id === draftId);
       const realAlreadyPresent = prev.some(
@@ -6453,6 +8772,9 @@ export default function WorkspacePage() {
           // Keep the draft's folder scope if the server dropped it (a
           // pre-migration DB) so the chat doesn't vanish from a focused rail.
           folder_scope: realThread.chat.folder_scope ?? draftEntry?.chat.folder_scope ?? null,
+          // A rename that raced the promotion POST lives only on the draft
+          // thread — keep it visible; renameChat PATCHes it onto the real row.
+          title: realThread.chat.title ?? draftEntry?.chat.title ?? null,
         },
       };
       if (draftEntry && realAlreadyPresent) {
@@ -6470,17 +8792,11 @@ export default function WorkspacePage() {
         ? { type: 'direct', chatId: realThread.chat.id }
         : prev
     );
-    // Swapping the draft id for the real one remounts the composer (its key is
-    // the chatId). If the user was typing in it — e.g. they just opened this
-    // chat via "New chat" — re-assert focus so the remount doesn't dump focus
-    // on <body>. Guarded on current focus so we never steal it from the editor.
-    if (currentChatRef.current?.id === draftId && typeof document !== 'undefined') {
-      const composer = chatInputRef.current;
-      if (composer && (document.activeElement === composer || composer.contains(document.activeElement))) {
-        setShouldFocusChatInput(true);
-      }
-    }
-    moveStoredMessageDraft(draftId, realThread.chat.id, currentChatRef.current?.id === draftId);
+    // The composer is keyed by the chat's LINEAGE id (chatLineageIdRef), so
+    // this id swap keeps the same instance mounted: focus, text, and caret all
+    // survive mid-typing promotion. No notify — a draft-version bump would
+    // force the remount the lineage key exists to prevent.
+    moveStoredMessageDraft(draftId, realThread.chat.id, false);
     setAttachmentsByChatId((prev) => {
       if (!(draftId in prev)) return prev;
       const draftAttachments = prev[draftId] ?? [];
@@ -6506,7 +8822,7 @@ export default function WorkspacePage() {
         ? { ...rest, [realThread.chat.id]: [...(rest[realThread.chat.id] ?? []), ...draftSnippets] }
         : rest;
     });
-  }, [moveStoredMessageDraft]);
+  }, [moveStoredMessageDraft, retargetChatTab]);
 
   const promoteDraftChat = useCallback(
     async (
@@ -6528,6 +8844,12 @@ export default function WorkspacePage() {
       if (existing) {
         return await existing;
       }
+      // Retry paths (send, settings) don't re-pass folderScope — the draft row
+      // itself carries it, so a failed first promotion can't drop the scope.
+      // Same for a rename made while still a draft: the title rides along.
+      const draftChat = chatThreadsRef.current.find((thread) => thread.chat.id === draftId)?.chat;
+      const effectiveFolderScope = folderScope ?? draftChat?.folder_scope ?? undefined;
+      const draftTitle = draftChat?.title ?? null;
       const promotion = (async () => {
         try {
           const createRes = await apiFetch('/api/workspace/chats', {
@@ -6538,7 +8860,8 @@ export default function WorkspacePage() {
               assistantId: apiAssistantId,
               model: modelOverride ?? normalizeChatModelRef(preferredChatModel),
               ...(harnessOverride ? { harness: harnessOverride } : {}),
-              ...(folderScope ? { folderScope } : {}),
+              ...(effectiveFolderScope ? { folderScope: effectiveFolderScope } : {}),
+              ...(draftTitle ? { title: draftTitle } : {}),
             }),
           });
           if (!createRes.ok) return null;
@@ -6562,12 +8885,29 @@ export default function WorkspacePage() {
     [canWrite, preferredChatModel, projectId, replaceDraftChat, user?.id]
   );
 
-  // Create a local-only draft chat (persist immediately for prewarm)
+  // Create a local-only draft chat. Nothing is persisted here: the row reaches
+  // the DB only once a message is drafted (first typed character promotes, see
+  // handleComposerDraftChange) or sent (promoteDraftChat in the send path).
   const startDraftChat = useCallback(
     (
       _assistantId: string | null,
       _assistantInfo: unknown,
-      opts?: { model?: string; appendTab?: boolean; sideTab?: boolean; folderScope?: string }
+      opts?: {
+        model?: string;
+        appendTab?: boolean;
+        sideTab?: boolean;
+        paneId?: string;
+        folderScope?: string;
+        /** Force the draft's engine (the picker's "New chat with this agent"),
+         *  overriding the install default. */
+        harness?: ChatHarness;
+        /** Add to the rail without stealing selection/tab/focus (draft rehydration). */
+        background?: boolean;
+        /** Select the draft but do NOT give it a pane tab — the chat column is
+         *  closed (file-first arrival) and must not slide in over the document.
+         *  It opens ready the moment the user opens chat from the rail. */
+        deferTab?: boolean;
+      }
     ) => {
       if (projectId) {
         setChatsProjectId(projectId);
@@ -6578,7 +8918,11 @@ export default function WorkspacePage() {
       // the probe is in flight (undefined) the draft carries NO harness: the
       // sidecar stamps its stored default at promotion, which the optimistic
       // guess must not override.
-      const draftHarness = isLocalWorkspace ? localEnginesRef.current.defaultHarness ?? null : null;
+      // An explicit "New chat with this agent" pick is stamped verbatim (even
+      // the cloud agent); an inferred install default goes through
+      // stampableHarness so the implicit cloud fallback stays off the row.
+      const draftHarness =
+        opts?.harness ?? (isLocalWorkspace ? stampableHarness(localEnginesRef.current.defaultHarness) : null);
       const effectiveModel = draftHarness
         ? coerceModelForHarness(draftHarness, normalizeChatModelRef(opts?.model ?? preferredChatModel))
         : normalizeChatModelRef(opts?.model ?? preferredChatModel);
@@ -6605,17 +8949,235 @@ export default function WorkspacePage() {
       };
       setChatThreads((prev) => {
         const next = [...prev, draftThread];
-        setSelectedChatIndex(next.length - 1);
+        if (!opts?.background) setSelectedChatIndex(next.length - 1);
         return next;
       });
-      setSelectedChatSurface({ type: 'direct', chatId: draftId });
-      if (!isMobile) openChatTabInPanes(draftId, { append: opts?.appendTab, side: opts?.sideTab });
-      setShouldFocusChatInput(true);
-      closeAssistantPicker();
-      void promoteDraftChat(draftId, null, effectiveModel, draftHarness ?? undefined, opts?.folderScope);
+      if (!opts?.background) {
+        setSelectedChatSurface({ type: 'direct', chatId: draftId });
+        if (!isMobile && !opts?.deferTab) {
+          openChatTabInPanes(draftId, { append: opts?.appendTab, side: opts?.sideTab, paneId: opts?.paneId });
+        }
+        if (!opts?.deferTab) setShouldFocusChatInput(true);
+        closeAssistantPicker();
+      }
       return draftId;
     },
-    [closeAssistantPicker, isMobile, openChatTabInPanes, preferredChatModel, projectId, promoteDraftChat]
+    [closeAssistantPicker, isMobile, openChatTabInPanes, preferredChatModel, projectId]
+  );
+
+  // First typed character → the draft becomes a real row (a chat may exist in
+  // the DB only while a message is drafted or sent); fully backspacing a
+  // typed-only chat deletes the row again (demoteTypedChatIfEmpty).
+  const demoteTypedChatIfEmptyRef = useRef<(realId: string) => void>(() => {});
+  // In-flight demote DELETE per real chat id — a send that races one awaits it
+  // so it never dispatches a message into a row that is being deleted.
+  const pendingChatDemotionByIdRef = useRef<Map<string, Promise<boolean>>>(new Map());
+  // Promotion-failure cooldown: a failing server gets one retry per window,
+  // not one per keystroke.
+  const draftPromotionFailedAtRef = useRef<Map<string, number>>(new Map());
+
+  // Promote with the DRAFT's own settings (model coerced for its engine at
+  // creation, harness when the draft carries one) — same as the send path. A
+  // promotion that stamped preferredChatModel instead could persist a model
+  // the chat's engine can't run.
+  const promoteDraftWithItsSettings = useCallback(
+    async (draftId: string) => {
+      const draft = chatThreadsRef.current.find((t) => t.chat.id === draftId)?.chat;
+      return promoteDraftChat(
+        draftId,
+        null,
+        draft ? normalizeChatModelRef(draft.model) : undefined,
+        draft?.harness ? parseChatHarness(draft.harness) : undefined,
+      );
+    },
+    [promoteDraftChat],
+  );
+  promoteDraftWithSettingsRef.current = promoteDraftWithItsSettings;
+
+  const promoteTypedDraft = useCallback(
+    (draftId: string) => {
+      const failedAt = draftPromotionFailedAtRef.current.get(draftId);
+      if (failedAt && Date.now() - failedAt < 5_000) return;
+      void (async () => {
+        const realThread = await promoteDraftWithItsSettings(draftId);
+        if (!realThread) {
+          draftPromotionFailedAtRef.current.set(draftId, Date.now());
+          return;
+        }
+        draftPromotionFailedAtRef.current.delete(draftId);
+        // Local workspaces never arm: the sidecar has no chat DELETE, so a
+        // demote could only fail-retry forever. Their rows keep the old
+        // keep-on-empty behavior.
+        if (isLocalWorkspace) return;
+        armTypedEmpty(realThread.chat.id);
+        // Backspaced to empty while the promotion was in flight — take the
+        // row back out.
+        if (!messageInputByChatIdRef.current[realThread.chat.id]) {
+          demoteTypedChatIfEmptyRef.current(realThread.chat.id);
+        }
+      })();
+    },
+    [armTypedEmpty, isLocalWorkspace, promoteDraftWithItsSettings],
+  );
+
+  // Reverse of replaceDraftChat: the empty row was deleted, so the open chat
+  // surface becomes a local draft again — same tab and settings, new draft id.
+  const demoteChatToDraft = useCallback(
+    (realId: string) => {
+      const draftId = `${DRAFT_CHAT_PREFIX}${crypto.randomUUID()}`;
+      chatLineageIdRef.current[draftId] = chatLineageIdRef.current[realId] ?? realId;
+      retargetChatTab(realId, draftId);
+      const prior = chatThreadsRef.current.find((t) => t.chat.id === realId);
+      const draftNow = new Date().toISOString();
+      const draftThread: ChatThread = {
+        chat: {
+          ...(prior?.chat ?? {
+            model: normalizeChatModelRef(preferredChatModel),
+            last_message_at: draftNow,
+            archived_at: null,
+            created_at: draftNow,
+          }),
+          id: draftId,
+          title: null,
+          preview_text: null,
+          unread_count: 0,
+        },
+      };
+      setChatThreads((prev) => {
+        const index = prev.findIndex((t) => t.chat.id === realId);
+        if (index === -1) return [...prev, draftThread];
+        const next = [...prev];
+        next[index] = draftThread;
+        return next;
+      });
+      setSelectedChatSurface((prev) =>
+        prev.type === 'direct' && prev.chatId === realId ? { type: 'direct', chatId: draftId } : prev
+      );
+      // Same lineage-keyed swap as replaceDraftChat — the composer instance
+      // (and its focus/caret) stays mounted through the id change.
+      moveStoredMessageDraft(realId, draftId, false);
+      const moveKey = <T,>(prev: Record<string, T[]>): Record<string, T[]> => {
+        if (!(realId in prev)) return prev;
+        const { [realId]: moved, ...rest } = prev;
+        return moved && moved.length > 0 ? { ...rest, [draftId]: moved } : rest;
+      };
+      setAttachmentsByChatId(moveKey);
+      setContextSnippetsByChatId(moveKey);
+      setChatMessagesById(moveKey);
+      // Retire the promotion PROMISE cache for the deleted row (a stale
+      // closure must never PATCH/send against it), but REPOINT the id map at
+      // the replacement draft: resolveLiveChatId chains from the original
+      // draft id (e.g. an upload still keyed to it) must land here, not on a
+      // retired id.
+      for (const [dId, rId] of Object.entries(draftPromotionsRef.current)) {
+        if (rId === realId) {
+          draftPromotionsRef.current[dId] = draftId;
+          draftPromotionByIdRef.current.delete(dId);
+        }
+      }
+      demotedDraftByRealIdRef.current[realId] = draftId;
+      return draftId;
+    },
+    [moveStoredMessageDraft, preferredChatModel, retargetChatTab],
+  );
+
+  const demoteTypedChatIfEmpty = useCallback(
+    async (realId: string) => {
+      if (!typedEmptyChatIdsRef.current.has(realId)) return;
+      if (pendingChatDemotionByIdRef.current.has(realId)) return;
+      // Typed again before we ran — still drafted, keep the row.
+      if (messageInputByChatIdRef.current[realId]) return;
+      // A watch PATCH is mid-flight (/watch clears the composer right after
+      // dispatching it) — deleting now would race it. Stay armed; a later
+      // empty transition re-checks against the settled watch state.
+      if (commentWatchPendingRef.current.has(realId)) return;
+      // A rename, pin, or comment watch is explicit investment in this chat —
+      // clearing a text box must never destroy it. Disarm instead of deleting.
+      // The thread may still be keyed by the DRAFT id (chatThreadsRef syncs on
+      // the render after replaceDraftChat, and the promotion continuation can
+      // demote before that) — fall back through the promotion map so a rename
+      // made mid-promotion is never missed.
+      const draftIdForReal = Object.entries(draftPromotionsRef.current).find(
+        ([, rId]) => rId === realId
+      )?.[0];
+      const chat =
+        chatThreadsRef.current.find((t) => t.chat.id === realId)?.chat ??
+        (draftIdForReal
+          ? chatThreadsRef.current.find((t) => t.chat.id === draftIdForReal)?.chat
+          : undefined);
+      if (
+        chat?.title ||
+        chat?.pinned ||
+        chat?.pinned_at ||
+        chat?.is_pinned ||
+        chat?.comment_watch_path ||
+        chat?.comment_watch_file_id ||
+        (chat?.transport_types ?? []).length > 0
+      ) {
+        disarmTypedEmpty(realId);
+        return;
+      }
+      const demotion = (async () => {
+        let res: Response;
+        try {
+          res = await apiFetch(`/api/workspace/chats?chatId=${encodeURIComponent(realId)}`, {
+            method: 'DELETE',
+          });
+        } catch {
+          // Transient failure — stay armed so the next empty transition retries.
+          return false;
+        }
+        if (res.status === 409) {
+          // A message landed first — the chat legitimately exists now.
+          disarmTypedEmpty(realId);
+          return false;
+        }
+        // Any other error is treated as transient — stay armed and retry on
+        // the next empty transition. (Notably NOT 404-as-deleted: on local
+        // workspaces this call reaches the sidecar, where a missing DELETE
+        // route would 404 and wrongly demote a chat that still exists.)
+        if (!res.ok) return false;
+        disarmTypedEmpty(realId);
+        const draftId = demoteChatToDraft(realId);
+        // Typing raced the DELETE — the text moved to the new draft id, which
+        // must promote again.
+        if (messageInputByChatIdRef.current[draftId]) promoteTypedDraft(draftId);
+        return true;
+      })();
+      pendingChatDemotionByIdRef.current.set(realId, demotion);
+      try {
+        await demotion;
+      } finally {
+        pendingChatDemotionByIdRef.current.delete(realId);
+      }
+    },
+    [apiFetch, demoteChatToDraft, disarmTypedEmpty, promoteTypedDraft],
+  );
+  demoteTypedChatIfEmptyRef.current = (realId) => void demoteTypedChatIfEmpty(realId);
+
+  // Composer keystrokes drive the draft⇄row lifecycle: the first character
+  // creates the row, emptying a typed-only chat removes it.
+  // The composer can report under a stale id mid-swap (its remount races both
+  // promotion and demotion): resolve to the live id, or a backspace-to-empty
+  // in that window gets undone by the remount's restored text, and retyped
+  // text lands under a deleted chat.
+  const handleComposerDraftChange = useCallback(
+    (chatId: string, text: string) => {
+      const effectiveId = resolveLiveChatId(chatId);
+      if (effectiveId !== chatId) {
+        // Keep the stale-mounted composer's slot in sync without persisting
+        // under a dead id.
+        if (text) messageInputByChatIdRef.current[chatId] = text;
+        else delete messageInputByChatIdRef.current[chatId];
+      }
+      setStoredMessageDraft(effectiveId, text);
+      if (text) {
+        if (isDraftChatId(effectiveId)) promoteTypedDraft(effectiveId);
+      } else if (typedEmptyChatIdsRef.current.has(effectiveId)) {
+        void demoteTypedChatIfEmpty(effectiveId);
+      }
+    },
+    [demoteTypedChatIfEmpty, promoteTypedDraft, resolveLiveChatId, setStoredMessageDraft],
   );
 
   const startAssistantChat = useCallback(
@@ -6627,13 +9189,20 @@ export default function WorkspacePage() {
         model: modelOverride,
         keepMode = false,
         appendTab = false,
+        sideTab = false,
+        paneId,
         folderScope,
+        harness,
       }: {
         forceNew?: boolean;
         model?: string;
         keepMode?: boolean;
         appendTab?: boolean;
+        /** Split beside a visible document instead of replacing it. */
+        sideTab?: boolean;
+        paneId?: string;
         folderScope?: string;
+        harness?: ChatHarness;
       } = {}
     ) => {
       if (!isChatMode && !keepMode) {
@@ -6648,7 +9217,7 @@ export default function WorkspacePage() {
       const effectiveModel = normalizeChatModelRef(
         modelOverride ?? savedDefaultModel ?? preferredChatModel
       );
-      return startDraftChat(assistantId, assistantInfo ?? null, { model: effectiveModel, appendTab, folderScope });
+      return startDraftChat(assistantId, assistantInfo ?? null, { model: effectiveModel, appendTab, sideTab, paneId, folderScope, harness });
     },
     [
       activateDirectChat,
@@ -6664,22 +9233,22 @@ export default function WorkspacePage() {
   startAssistantChatRef.current = startAssistantChat;
 
   // "New chat in this folder": the chat is stored scoped to the folder
-  // (chats.folder_scope — the rail's folder-focus filter reads it) and the
-  // composer opens pre-scoped so the first message carries the context.
+  // (chats.folder_scope — the rail's folder-focus filter reads it). The scope
+  // is shown as a chip in the composer; it used to be typed into the draft as
+  // "Working in `folder/`: ", which put chrome inside the user's own message.
   const startChatInFolder = useCallback(
     (folder: string) => {
-      openCenterPanel('chat');
+      openCenterPanel('chat', { side: true });
       // '' = a root section's "New chat here" (multi-root primary): the whole
       // project is the scope, so start a plain unscoped chat.
       void startAssistantChat(null, null, {
         forceNew: true,
         keepMode: true,
+        sideTab: true,
         ...(folder ? { folderScope: folder } : {}),
-      }).then((draftId) => {
-        if (draftId && folder) setStoredMessageDraft(draftId, `Working in \`${folder}/\`: `, true);
       });
     },
-    [openCenterPanel, setStoredMessageDraft, startAssistantChat]
+    [openCenterPanel, startAssistantChat]
   );
 
   // "Add folder…" (desktop local projects): the shell's native picker returns
@@ -6737,18 +9306,146 @@ export default function WorkspacePage() {
     [localConfig, projectId, reloadFiles, showWorkspaceAppNotice],
   );
 
-  // A workspace with no open chats lands on a dead composer ("Add an
-  // assistant…") — start a fresh chat instead so it always opens ready to send.
+  // Rehydrate locally-persisted composer drafts once the chat list is in.
+  // A restored drafted chat that holds nothing else (direct, transportless,
+  // untitled, unpinned, no preview ⇒ no messages) re-arms the typed-empty
+  // cleanup, so backspacing it to empty still deletes the row even across a
+  // reload. A stored DRAFT-id entry is a draft whose promotion never landed
+  // (offline session) — resurrect it as a fresh local draft. Entries whose
+  // chat is missing are left alone: the list may be partial after a failed
+  // load, and pruning on that would wipe the user's saved drafts.
+  const draftsHydratedProjectRef = useRef<string | null>(null);
   const autoDraftProjectRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!chatsLoaded || chatsProjectId !== projectId || !canWrite) return;
+    if (!projectId || !chatsLoaded || chatsProjectId !== projectId) return;
+    // One-shot per (identity scope, project): if Clerk resolves the user AFTER
+    // the chat list loaded, the key changes and hydration re-runs against the
+    // signed-in keys — an anon-scoped first pass must not mark the user's
+    // drafts as done. (Restores are idempotent: existing composer text wins.)
+    const hydrationKey = `${draftStorageScope}:${projectId}`;
+    if (draftsHydratedProjectRef.current === hydrationKey) return;
+    draftsHydratedProjectRef.current = hydrationKey;
+    let stored: Record<string, unknown>;
+    try {
+      stored = JSON.parse(
+        chatDraftStorageKey ? window.localStorage.getItem(chatDraftStorageKey) ?? '{}' : '{}'
+      );
+    } catch {
+      return;
+    }
+    const isEmptyTypedChat = (chat: ChatRow) =>
+      getChatKind(chat) === 'direct' &&
+      (chat.transport_types ?? []).length === 0 &&
+      !chat.preview_text &&
+      !chat.archived_at &&
+      !chat.title &&
+      !chat.pinned &&
+      !chat.pinned_at &&
+      !chat.is_pinned &&
+      !chat.comment_watch_path &&
+      !chat.comment_watch_file_id;
+    let restored = false;
+    let restoredForeground = false;
+    // Pass 1: real chats — restore their text and re-arm the empty cleanup.
+    for (const [chatId, text] of Object.entries(stored)) {
+      if (typeof text !== 'string' || !text || isDraftChatId(chatId)) continue;
+      const chat = chatThreadsRef.current.find((t) => t.chat.id === chatId)?.chat;
+      if (!chat) continue;
+      if (!messageInputByChatIdRef.current[chatId]) {
+        messageInputByChatIdRef.current[chatId] = text;
+        restored = true;
+      }
+      if (!isLocalWorkspace && isEmptyTypedChat(chat)) armTypedEmpty(chatId);
+    }
+    // Pass 2: orphan DRAFT-id entries. The unload may have raced the
+    // draft→real move, so the promoted row sits empty while the text is
+    // still keyed by the dead draft id — adopt such a row (newest first)
+    // rather than hiding the text in a background draft; resurrect a
+    // background draft only when no empty typed row is left to adopt.
+    for (const [chatId, text] of Object.entries(stored)) {
+      if (typeof text !== 'string' || !text || !isDraftChatId(chatId)) continue;
+      const adoptable = chatThreadsRef.current
+        .filter(
+          (t) =>
+            !isDraftChatId(t.chat.id) &&
+            isEmptyTypedChat(t.chat) &&
+            !messageInputByChatIdRef.current[t.chat.id]
+        )
+        .sort((a, b) => (b.chat.created_at ?? '').localeCompare(a.chat.created_at ?? ''))[0]?.chat.id;
+      if (adoptable) {
+        setStoredMessageDraft(adoptable, text);
+        if (!isLocalWorkspace) armTypedEmpty(adoptable);
+      } else {
+        // With nothing else on the rail the restored draft becomes the
+        // VISIBLE one and stands in for the auto-draft below — background
+        // mode there would hide the saved text behind a fresh empty draft.
+        const foreground = !restoredForeground && !chatThreadsRef.current.some((t) => !t.chat.archived_at);
+        const newId = startDraftChat(null, null, { background: !foreground });
+        if (foreground) {
+          restoredForeground = true;
+          autoDraftProjectRef.current = projectId;
+        }
+        setStoredMessageDraft(newId, text);
+      }
+      persistChatDraft(chatId, '');
+      restored = true;
+    }
+    // Pass 3: pending-cleanup markers — a DELETE interrupted by a reload or a
+    // failed request left the row behind with no stored draft to re-arm it.
+    // Re-arm and finish the cleanup now (the server still 409s if anything
+    // landed in the meantime).
+    if (!isLocalWorkspace && typeof window !== 'undefined') {
+      let markers: unknown[] = [];
+      try {
+        markers = JSON.parse(
+          typedEmptyStorageKey ? window.localStorage.getItem(typedEmptyStorageKey) ?? '[]' : '[]'
+        );
+      } catch {
+        markers = [];
+      }
+      for (const chatId of markers) {
+        if (typeof chatId !== 'string' || isDraftChatId(chatId)) continue;
+        const chat = chatThreadsRef.current.find((t) => t.chat.id === chatId)?.chat;
+        if (!chat || !isEmptyTypedChat(chat)) {
+          persistTypedEmptyMarker(chatId, false);
+          continue;
+        }
+        armTypedEmpty(chatId);
+        if (!messageInputByChatIdRef.current[chatId]) void demoteTypedChatIfEmpty(chatId);
+      }
+    }
+    if (restored) setMessageDraftVersion((prev) => prev + 1);
+  }, [armTypedEmpty, chatDraftStorageKey, chatsLoaded, chatsProjectId, demoteTypedChatIfEmpty, draftStorageScope, isLocalWorkspace, persistChatDraft, persistTypedEmptyMarker, projectId, setStoredMessageDraft, startDraftChat, typedEmptyStorageKey]);
+
+  // A workspace with no open chats lands on a dead composer ("Add an
+  // assistant…") — start a fresh chat instead so it always opens ready to
+  // send. (autoDraftProjectRef is declared above the hydration effect, which
+  // claims it when a restored orphan draft already fills this role.)
+  useEffect(() => {
+    // canWrite starts optimistically TRUE and resolves with the files
+    // payload — without the filesLoaded gate, a read-only visitor whose chat
+    // list loads first gets a full-width draft chat opened OVER the shared
+    // document the arrival just placed ("file flashes, then chat").
+    if (!filesLoaded || !chatsLoaded || chatsProjectId !== projectId || !canWrite) return;
     if (autoDraftProjectRef.current === projectId) return;
-    if (chatThreadsForCurrentProject.some((thread) => !thread.chat.archived_at)) return;
+    // Un-imported external sessions are read-only rows, not open chats —
+    // unless the arrival explicitly targets one (stored last-chat or ?chatId=
+    // deep link), in which case the transcript keeps the selection.
+    const activeThreads = chatThreadsForCurrentProject.filter((thread) => !thread.chat.archived_at);
+    const storedChatId = window.localStorage.getItem(`sundial:last-chat:${projectId}`);
+    if (
+      activeThreads.some((thread) => !getExternalSession(thread.chat) || thread.chat.id === storedChatId) ||
+      findIndexByIdRef(activeThreads, deepLinkedChatId, (thread) => thread.chat.id) >= 0
+    ) return;
     autoDraftProjectRef.current = projectId;
     // sideTab: a deep-linked doc keeps the primary pane — the auto-draft
-    // docks aside; with nothing open it still lands full-width.
-    startDraftChat(null, null, { sideTab: true });
-  }, [canWrite, chatsLoaded, chatsProjectId, chatThreadsForCurrentProject, projectId, startDraftChat]);
+    // docks aside; with nothing open it still lands full-width. deferTab: on
+    // the file-first arrival the chat column is deliberately closed, so the
+    // draft is selected and ready but takes no pane — a chat column sliding in
+    // over the document once the chat list loads is exactly the post-load
+    // pane switch the file-first landing exists to remove.
+    startDraftChat(null, null, { sideTab: true, deferTab: !openPanelsRef.current.includes('chat') });
+  }, [canWrite, chatsLoaded, chatsProjectId, chatThreadsForCurrentProject, deepLinkedChatId, filesLoaded, projectId, startDraftChat]);
 
   const cueAssistantPicker = useCallback(() => {
     if (assistantPickerCueTimeoutRef.current !== null) {
@@ -6920,6 +9617,14 @@ export default function WorkspacePage() {
             : thread
         )
       );
+      // An unpromoted draft has no row to PATCH — the title rides along at
+      // promotion instead (promoteDraftChat sends it). A rename that raced an
+      // in-flight promotion lands on the real row once it resolves.
+      if (isDraftChatId(chatId)) {
+        const promoted = await draftPromotionByIdRef.current.get(chatId);
+        if (!promoted) return;
+        chatId = promoted.chat.id;
+      }
       const res = await apiFetch('/api/workspace/chats', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -6940,15 +9645,23 @@ export default function WorkspacePage() {
     [canWrite]
   );
 
+  // Archiving needs write access, NOT an identity: the route accepts anon
+  // callers and local projects have no Clerk user at all. Gating this on
+  // `user?.id` is what made "Archive chat" a no-op on the desktop app.
   const toggleChatArchive = useCallback(
     async (chatId: string, archived: boolean) => {
-      if (!canWrite || !user?.id) return;
+      if (!canManageChat(canWrite, chatId)) return;
       const res = await apiFetch('/api/workspace/chats', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chatId, archived }),
       });
-      if (!res.ok) return;
+      if (!res.ok) {
+        // Never fail silently here: a dead menu item reads as a broken app.
+        const payload = (await res.json().catch(() => null)) as { error?: string } | null;
+        showWorkspaceAppNotice('error', payload?.error || `Could not ${archived ? 'archive' : 'unarchive'} the chat`);
+        return;
+      }
       const payload = (await res.json()) as { chat?: ChatRow };
       if (payload.chat) {
         setChatThreads((prev) =>
@@ -6960,7 +9673,36 @@ export default function WorkspacePage() {
         );
       }
     },
-    [canWrite, user?.id]
+    [apiFetch, canWrite, showWorkspaceAppNotice]
+  );
+
+  // Explicit, confirmed "Delete chat": the chat AND its transcript go. The row
+  // leaves the rail immediately; the pane-prune effect closes its tabs, and the
+  // hand-off below keeps a live surface under the user instead of a blank one.
+  const deleteChat = useCallback(
+    async (chatId: string) => {
+      if (!canManageChat(canWrite, chatId)) return;
+      const res = await apiFetch(
+        `/api/workspace/chats?chatId=${encodeURIComponent(chatId)}&mode=purge`,
+        { method: 'DELETE' },
+      );
+      if (!res.ok) {
+        const payload = (await res.json().catch(() => null)) as { error?: string } | null;
+        showWorkspaceAppNotice('error', payload?.error || 'Could not delete the chat');
+        return;
+      }
+      const wasOpen = currentChatIdRef.current === chatId;
+      setChatThreads((prev) => prev.filter((thread) => thread.chat.id !== chatId));
+      if (!wasOpen) return;
+      // Land on the rail's next ACTIVE chat (archived ones live in Settings);
+      // with none left, open a fresh draft so the composer is never dead.
+      const next = chatThreadsRef.current
+        .filter((thread) => thread.chat.id !== chatId && !thread.chat.archived_at)
+        .sort((a, b) => getChatActivityTime(b.chat) - getChatActivityTime(a.chat))[0];
+      if (next) activateDirectChat(next.chat.id);
+      else startDraftChat(null, null);
+    },
+    [activateDirectChat, apiFetch, canWrite, showWorkspaceAppNotice, startDraftChat]
   );
 
   const toggleChatPin = useCallback(
@@ -7002,6 +9744,14 @@ export default function WorkspacePage() {
     const chatId = currentChatId;
     setInterruptingChatIds((prev) => ({ ...prev, [chatId]: true }));
     clearInterruptError(chatId);
+    // LOCAL only: a send stuck in 'submitted' (the sidecar POST never answered
+    // — no proxy timeout exists on that hop) has no server run to settle, so
+    // abort the client transport too, or the chat stays interruptible forever
+    // and every Enter is silently ignored. Freeing that socket also lets the
+    // interrupt POST out of the starved pool. Cloud keeps the reader attached:
+    // its 'submitted' also spans healthy pre-first-token thinking, and its
+    // settle/auto-resume recovery is exactly what an abort would disarm.
+    if (localConfig && sundialChatRef.current?.status === 'submitted') sundialChatRef.current.stop();
     optimisticStartingUntilByChatIdRef.current.delete(chatId);
     setChatStatusById((prev) => {
       if (prev[chatId] !== 'starting') return prev;
@@ -7010,21 +9760,34 @@ export default function WorkspacePage() {
       return next;
     });
     try {
-      const res = await apiFetch('/api/agent/interrupt', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chatId }),
-      });
+      // Bounded: the escape hatch must not itself wedge on a starved pool —
+      // finally always re-arms the button and a failure hits the banner below.
+      const res = await fetchWithDeadline(
+        apiFetch,
+        '/api/agent/interrupt',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chatId }),
+        },
+        10_000,
+      );
+      const payload = (await res.json().catch(() => ({}))) as { error?: string; active?: boolean };
       if (!res.ok) {
-        const payload = (await res.json().catch(() => ({}))) as { error?: string };
         throw new Error(payload?.error || `Stop failed (${res.status})`);
       }
+      // The brain had no such run to cancel (`active:false`) — it already
+      // finished, or a deploy moved it. Reporting success would leave the chat
+      // pinned on "working" with nothing left to end it, so re-check the turn
+      // against persisted rows: a terminal row settles the view, a live run is
+      // left alone.
+      if (payload?.active === false) sundialChatRef.current?.settleIfTerminal();
     } catch (error) {
       // Surface it. A swallowed interrupt looks identical to "nothing happened"
       // — exactly the anon-401 bug that hid here for so long.
       setInterruptErrorByChatId((prev) => ({
         ...prev,
-        [chatId]: error instanceof Error ? error.message : 'Could not stop Sunny',
+        [chatId]: error instanceof Error ? error.message : 'Could not stop Sundial Agent',
       }));
     } finally {
       setInterruptingChatIds((prev) => {
@@ -7034,7 +9797,7 @@ export default function WorkspacePage() {
         return next;
       });
     }
-  }, [clearInterruptError, currentChatId, interruptingChatIds]);
+  }, [apiFetch, clearInterruptError, currentChatId, interruptingChatIds, localConfig]);
 
   // Send message handler
   const handleSendMessage = async (
@@ -7059,6 +9822,22 @@ export default function WorkspacePage() {
     ) {
       return;
     }
+    // A demote DELETE may be in flight for this chat (type → clear → retype →
+    // send inside one round-trip). Settle it first: if the row was deleted,
+    // the surface already swapped to a fresh draft carrying this text — this
+    // send would target the dead id, so replay it against the replacement
+    // draft instead of dropping the user's Enter.
+    const pendingDemotion = pendingChatDemotionByIdRef.current.get(currentChat.id);
+    if (pendingDemotion && (await pendingDemotion.catch(() => false))) {
+      const demotedTo = demotedDraftByRealIdRef.current[currentChat.id];
+      for (let i = 0; i < 40 && currentChatRef.current?.id !== demotedTo; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      if (demotedTo && currentChatRef.current?.id === demotedTo) {
+        handleSendMessageRef.current?.(contentOverride ?? undefined, opts);
+      }
+      return;
+    }
     // Sending needs a billable (signed-in) account: an anon web sender has no
     // payer, so the credit gate would block the run with signin_required and
     // strand the message behind a never-resolving typing indicator. Intercept
@@ -7071,38 +9850,51 @@ export default function WorkspacePage() {
     // user's own local login), so it never gates on sign-in. If the engine
     // probe is still in flight, ask the sidecar directly instead of guessing:
     // a wrong guess either nags sign-in on an engine chat or persists a Sunny
-    // message that then dies on credentials_missing. Only DRAFTS inherit the
-    // install default (promotion stamps it); a persisted chat with no harness
-    // is a legacy row the sidecar runs as Sunny.
-    let chatEngine = currentChat.harness
+    // message that then dies on credentials_missing. Drafts inherit the
+    // install default (promotion stamps it) and so do empty rows (the sidecar
+    // adopts them, mirrored above); a null-harness chat WITH messages is a
+    // legacy row the sidecar keeps running as Sunny.
+    const inheritsInstallDefault =
+      isLocalWorkspace && (isDraftChatId(currentChat.id) || (currentChat.message_count ?? 0) === 0);
+    let chatEngine: ChatHarness | undefined = currentChat.harness
       ? parseChatHarness(currentChat.harness)
-      : isDraftChatId(currentChat.id)
+      : inheritsInstallDefault
         ? localEnginesRef.current.defaultHarness
         : ('vercel' as const);
     if (isLocalWorkspace && chatEngine === undefined && localConfig) {
       chatEngine = await localSidecar
         .localEngines(localConfig)
-        .then(({ defaultHarness }) => (defaultHarness === null ? null : parseChatHarness(defaultHarness)))
-        .catch(() => null);
+        .then(({ defaultHarness }) => parseChatHarness(defaultHarness))
+        .catch(() => undefined);
     }
     const localEngineChat = isLocalWorkspace && (chatEngine === 'claude' || chatEngine === 'openai');
-    if (!localEngineChat && (clerkAuthRef.current.isLoaded || clerkNeverLoads()) && !clerkAuthRef.current.isSignedIn) {
+    if (
+      !localEngineChat &&
+      (clerkAuthRef.current.isLoaded || clerkNeverLoads()) &&
+      !clerkAuthRef.current.isSignedIn &&
+      // Anonymous free-taste runs left: send instead of nagging — the server
+      // gate is the authority and serves it (or answers signin_required,
+      // which the transport surfaces honestly, if this count went stale).
+      !((anonRunsRemainingRef.current ?? 0) > 0)
+    ) {
       // Cloud workspaces opened in the packaged app have no localConfig, but
       // the loopback sidecar still holds the sd_ credentials that authenticate
       // every /api call — resolve it globally or every send would nag sign-in.
       const config = localConfig ?? (await resolveSidecarConfig());
       const desktopCredentials = config ? await desktopCredentialsUsable(config) : false;
       if (!desktopCredentials) {
-        stashPendingDraft(projectId, rawContent);
-        openSignIn({ redirectUrl: buildReturnPath({}) });
+        // Never hand off to sign-in unannounced: in the desktop shell that
+        // handoff throws the system browser in front of the app. Explain the
+        // cloud-account requirement first and let the user opt in — the typed
+        // text rides on the prompt and is only stashed for the post-auth
+        // reload if they go through with it (a cancelled send must not
+        // resurrect its text on some later sign-in).
+        setCloudSignInPrompt({ redirectUrl: buildReturnPath({}), draft: rawContent });
         return;
       }
     }
-    // Sending without an explicit engine choice IS the choice — the first-run
-    // card stops nagging and new chats keep this chat's engine.
-    if (isLocalWorkspace && localEnginesRef.current.defaultHarness === null) {
-      chooseLocalDefaultEngine(parseChatHarness(currentChat.harness));
-    }
+    // First time a local engine actually runs something: say so once, inline.
+    if (localEngineChat && chatEngine) noteLocalEngineUse(chatEngine);
     // A new turn supersedes any stale "couldn't stop" banner from before.
     clearInterruptError(currentChat.id);
     const snippetBlock = formatSnippetBlock(snippets);
@@ -7122,7 +9914,9 @@ export default function WorkspacePage() {
     // If this is a draft chat, persist it to the database first.
     // No user?.id gate — anon visitors on anon-owned workspaces need to
     // promote too. promoteDraftChat's own gates handle the rest.
+    let promotedThisSend = false;
     if (isDraftChatId(chat.id) && projectId && canWrite) {
+      promotedThisSend = true;
       const draftId = chat.id;
       // Promote with the draft's own model, not preferredChatModel (which may
       // have drifted to another open chat).
@@ -7130,9 +9924,9 @@ export default function WorkspacePage() {
         draftId,
         null,
         normalizeChatModelRef(chat.model),
-        // Only a draft that KNOWS its engine overrides — a pre-probe draft
-        // has none and defers to the sidecar's stored default.
-        isLocalWorkspace && chat.harness ? parseChatHarness(chat.harness) : undefined,
+        // Only a draft that KNOWS its engine overrides — a pre-probe local
+        // draft has none and defers to the sidecar's stored default.
+        chat.harness ? parseChatHarness(chat.harness) : undefined,
       );
       if (!realThread) return;
       chat = realThread.chat;
@@ -7162,12 +9956,26 @@ export default function WorkspacePage() {
     // SSE for the streamed reply. useChat owns the message state and
     // adds the user message synchronously, so we don't run a separate
     // optimistic pass here.
-    if (!sundialChatRef.current || chat.id !== currentChatId) {
+    // A fast FIRST Enter races its own draft's promotion: `chat` is already
+    // the promoted row while this render's currentChatId is still the draft
+    // id and the chat sender hasn't mounted. That's the same chat, not a
+    // swap — wait for the id swap instead of silently dropping the send.
+    if (chat.id !== currentChatId && currentChatId && draftPromotionsRef.current[currentChatId] === chat.id) {
+      for (let i = 0; i < 40 && (currentChatRef.current?.id !== chat.id || !sundialChatRef.current); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    if (!sundialChatRef.current || chat.id !== (currentChatRef.current?.id ?? currentChatId)) {
       // Defensive: chat swap raced ahead of the send. Restore status and
       // let the next send (with the right chatId) take over.
       restoreChatStatus();
       return;
     }
+
+    // A real send is happening — the typed-empty cleanup must never delete
+    // this chat now. Remember whether it WAS armed: a send that fails before
+    // persisting anything re-arms below, or the empty row would be orphaned.
+    const wasArmedTypedEmpty = disarmTypedEmpty(chat.id);
 
     // Clear composer + attachments + snippets before the await so the UI
     // feels instant — matches what the old optimistic flow gave us. A
@@ -7212,6 +10020,9 @@ export default function WorkspacePage() {
     // rebinds both refs, and the message belongs to the chat it was typed in.
     const chatSender = sundialChatRef.current;
     const editMode = chatEditModeRef.current;
+    // Reported to callers that need to know the send actually landed (the
+    // LaTeX fix flow gates its resolution-eligible attempt on it).
+    let sent = false;
     let openFilePath = effectiveOpenFilePath;
     const inFlightMove = openFileMoveRef.current;
     if (openFilePath && inFlightMove && openFilePath === inFlightMove.current) {
@@ -7232,10 +10043,22 @@ export default function WorkspacePage() {
         hasAttachments: attachments.length > 0,
         sendMode: 'fullsend',
       });
+      sent = true;
     } catch (err) {
       restoreChatStatus();
       if (attachments.length > 0) {
         setAttachmentsByChatId((prev) => ({ ...prev, [chat.id]: attachments }));
+      }
+      // The message may never have been persisted — re-arm the typed-empty
+      // cleanup and let the server decide: if the row really is still empty
+      // it comes back out; if the message DID land, the DELETE 409s. A row
+      // this very send created (attachment-only draft, restored draft,
+      // inline ask) was never armed by typing, so arm it here too.
+      if ((wasArmedTypedEmpty || promotedThisSend) && !isLocalWorkspace) {
+        armTypedEmpty(chat.id);
+        if (!messageInputByChatIdRef.current[chat.id]) {
+          void demoteTypedChatIfEmpty(chat.id);
+        }
       }
       console.warn('[handleSendMessage] sundialChat.send failed', err);
     }
@@ -7245,6 +10068,7 @@ export default function WorkspacePage() {
         void loadAgentStatuses();
       }, 300);
     }
+    return sent;
   };
 
   // Persist per-chat settings (model and/or harness). Applies the optimistic
@@ -7276,8 +10100,15 @@ export default function WorkspacePage() {
     pendingChatSettingsByIdRef.current.set(chatId, settled);
     let targetChatId = chatId;
     try {
+      // An unpromoted draft has no row to PATCH — and must not get one for a
+      // mere settings pick (rows exist only once a message is drafted or
+      // sent). The draft thread carries the settings; promotion stamps both
+      // model and harness through the create POST.
+      if (isDraftChatId(targetChatId) && !draftPromotionByIdRef.current.has(targetChatId)) {
+        return;
+      }
       if (isDraftChatId(targetChatId)) {
-        // Drafts persist in the background the moment they're created; await
+        // The draft is already promoting (typing raced this click); await
         // (or retry) the promotion so the PATCH lands on the real row, which is
         // where the runner reads chats.model / chats.harness from. A failed
         // promotion is a failure: fall through to the revert so the UI doesn't
@@ -7337,6 +10168,18 @@ export default function WorkspacePage() {
   // current one differs.
   const handleSelectChatHarness = async (nextHarness: ChatHarness) => {
     if (!currentChatId || nextHarness === currentChatHarness) return;
+    // An explicit pick outranks detection for FUTURE chats too — nobody wants
+    // to re-pick every chat. This chat is switched by the PATCH below. Other
+    // empty chats follow only once the sidecar acks: stamping ahead of (or
+    // despite) a failed POST would let a send skip the sign-in gate while the
+    // sidecar still runs them as Sunny.
+    if (isLocalWorkspace && localConfig) {
+      setLocalEngines((prev) => ({ ...prev, defaultHarness: nextHarness }));
+      void localSidecar
+        .setDefaultHarness(localConfig, nextHarness)
+        .then(() => adoptDefaultHarnessLocally(nextHarness))
+        .catch(() => {});
+    }
     const nextModel = coerceModelForHarness(nextHarness, currentChatModel);
     await patchChatSettings(
       currentChatId,
@@ -7345,11 +10188,79 @@ export default function WorkspacePage() {
     );
   };
 
-  // First-run engine onboarding (local projects): the pick becomes the
-  // install default AND applies to the open (draft) chat immediately.
-  const handleChooseLocalEngine = (harness: ChatHarness) => {
-    chooseLocalDefaultEngine(harness);
-    void handleSelectChatHarness(harness);
+  // A chat's engine is fixed once it has messages (history and local session
+  // lineage belong to that engine), so the picker's locked rows offer the only
+  // move that works instead of refusing the click: a fresh chat on that agent.
+  const startChatWithHarness = (nextHarness: ChatHarness) => {
+    openCenterPanel('chat');
+    void startAssistantChat(null, null, { forceNew: true, keepMode: true, harness: nextHarness });
+  };
+
+  // Comment listening: a chat with chats.comment_watch_path set receives every
+  // new human doc comment on that path ('*' = whole workspace) as a message.
+  const setCommentWatch = async (chatId: string, path: string | null) => {
+    // Watching from a row-less draft is explicit investment in the chat —
+    // promote first so the PATCH has a row to land on (the watch then also
+    // guards the chat against typed-empty cleanup).
+    if (isDraftChatId(chatId)) {
+      const promoted = await promoteDraftWithItsSettings(chatId);
+      if (!promoted) return;
+      chatId = promoted.chat.id;
+      // Armed so a failed watch PATCH doesn't leak the empty row; a landed
+      // watch is kept by the comment_watch guard.
+      if (!isLocalWorkspace) armTypedEmpty(chatId);
+    }
+    // Seed the confirmed map NOW, before this call's optimistic apply — the
+    // first toggle for a chat is the only moment the thread state still holds
+    // the server's value. Seeding lazily inside the queued callback would read
+    // a later call's optimistic state instead (a superseded predecessor never
+    // rolls back or seeds), leaving a failed retry to "revert" to the wrong
+    // side while the server keeps waking the agent.
+    if (!commentWatchConfirmedRef.current.has(chatId)) {
+      commentWatchConfirmedRef.current.set(
+        chatId,
+        chatThreadsForCurrentProject.find((t) => t.chat.id === chatId)?.chat.comment_watch_path ?? null,
+      );
+    }
+    const apply = (value: string | null) =>
+      setChatThreads((prev) =>
+        prev.map((t) => (t.chat.id === chatId ? { ...t, chat: { ...t.chat, comment_watch_path: value } } : t))
+      );
+    apply(path);
+    // Toggling faster than the round-trip must not let an older PATCH land
+    // last: requests are CHAINED per chat (server order = click order) and a
+    // superseded one neither rolls back nor reconciles — a hidden watch left
+    // enabled behind a "stopped" chip would wake the agent and spend credits.
+    const seq = (commentWatchSeqRef.current.get(chatId) ?? 0) + 1;
+    commentWatchSeqRef.current.set(chatId, seq);
+    commentWatchPendingRef.current.set(chatId, (commentWatchPendingRef.current.get(chatId) ?? 0) + 1);
+    const chained = (commentWatchQueueRef.current.get(chatId) ?? Promise.resolve()).then(async () => {
+      if (commentWatchSeqRef.current.get(chatId) !== seq) return; // superseded
+      // Read the confirmed value HERE — after our predecessors settled — so a
+      // rapid stop→start reverts to what the server actually holds, not to an
+      // optimistic value captured before the earlier request answered. The map
+      // is always populated: seeded above on the chat's first toggle, updated
+      // by every successful PATCH after.
+      const confirmed = commentWatchConfirmedRef.current.get(chatId) ?? null;
+      try {
+        const res = await apiFetch('/api/workspace/chats', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chatId, commentWatchPath: path }),
+        });
+        if (res.ok) commentWatchConfirmedRef.current.set(chatId, path);
+        else if (commentWatchSeqRef.current.get(chatId) === seq) apply(confirmed);
+      } catch {
+        // A network-layer rejection must roll the optimistic chip back too.
+        if (commentWatchSeqRef.current.get(chatId) === seq) apply(confirmed);
+      }
+    }).finally(() => {
+      const remaining = (commentWatchPendingRef.current.get(chatId) ?? 1) - 1;
+      if (remaining <= 0) commentWatchPendingRef.current.delete(chatId);
+      else commentWatchPendingRef.current.set(chatId, remaining);
+    });
+    commentWatchQueueRef.current.set(chatId, chained);
+    await chained;
   };
 
   const handleChatAction = (sendTrigger: SendTrigger = 'button', contentOverride?: string) => {
@@ -7371,29 +10282,360 @@ export default function WorkspacePage() {
   handleSendMessageRef.current = handleSendMessage;
   const scrollChatToBottomRef = useRef<(() => void) | null>(null);
 
-  // "Fix with Sunny" (§1.10) / auto-fix (§1.11) / Cmd+Enter (§1.5): hand the
-  // failing root + trimmed error tail to the current chat as a normal turn. No
-  // new agent endpoint — Sunny edits the .tex and self-heals as usual.
+  // "Fix with Agent" (§1.10) / auto-fix (§1.11) / Cmd+Enter (§1.5): hand the
+  // failing root + trimmed error tail to the project's ONE dedicated fix chat
+  // (kind='latex_fix', created on first use) as a normal turn — never to
+  // whatever chat happens to be open. No new agent endpoint — Sunny edits the
+  // .tex and self-heals as usual.
   const [fixInFlight, setFixInFlight] = useState(false);
+  const [latexFixChatId, setLatexFixChatId] = useState<string | null>(null);
+  // Why the last Fix could not run — the compile status popover surfaces it,
+  // with a Sign in CTA for the 'signin' kind (anon out of free runs, or a
+  // signed-out editor).
+  const [latexFixBlocked, setLatexFixBlocked] = useState<LatexFixBlocked | null>(null);
+  // The send is fire-and-forget, so "busy" outlives the POST: hold the Fix
+  // affordances until the fix chat's run settles, or a second click would
+  // cancel-and-replace the repair mid-flight. Run liveness reads like the
+  // rail badges do — realtime status for cloud chats, the sidecar's `running`
+  // flag for local ones — and a short grace covers the gap between the POST
+  // returning and the first liveness signal.
+  const [latexFixGraceUntil, setLatexFixGraceUntil] = useState<number | null>(null);
+  const latexFixChatStatus = latexFixChatId ? chatStatusById[latexFixChatId] : undefined;
+  const latexFixThread = latexFixChatId
+    ? (chatThreadsForCurrentProject.find((t) => t.chat.id === latexFixChatId)?.chat as
+        | { running?: boolean; answering?: boolean }
+        | undefined)
+    : undefined;
+  // After a no-start (blocked/error), the already-persisted user row's
+  // realtime INSERT can still flip this chat to 'starting' with no run ever
+  // coming — suppress that phantom until the next successful send. A real
+  // run shows as 'working' / running and is never suppressed.
+  const latexFixSuppressStartingRef = useRef<string | null>(null);
+  const latexFixStartingSuppressed =
+    latexFixChatId != null && latexFixSuppressStartingRef.current === latexFixChatId;
+  // `answering` covers the local gap where a started run still owes its
+  // reply while `running` reads false — same treatment as the comment badges.
+  const latexFixRealRun =
+    latexFixChatStatus === 'working' || Boolean(latexFixThread?.running) || Boolean(latexFixThread?.answering);
+  const latexFixRunLive =
+    latexFixRealRun || (latexFixChatStatus === 'starting' && !latexFixStartingSuppressed);
+  // Seeded-'starting' bookkeeping: the seed guarantees an instant hold on a
+  // brand-new fix chat (the realtime subscription can lag the chat-list
+  // commit); grace expiry retires a seed no feed ever advanced, so a surface
+  // without that feed (local) can never stick busy forever.
+  const latexFixSeededRef = useRef<string | null>(null);
+  const clearLatexFixSeed = useCallback(() => {
+    const seeded = latexFixSeededRef.current;
+    if (!seeded) return;
+    latexFixSeededRef.current = null;
+    setChatStatusById((prev) => (prev[seeded] === 'starting' ? { ...prev, [seeded]: 'idle' } : prev));
+  }, []);
+  // A real signal makes the seed obsolete the moment it appears — without
+  // this, a local run observed via `running` leaves the seeded 'starting'
+  // behind, and nothing on that surface ever overwrites it after the run.
+  useEffect(() => {
+    if (!latexFixRealRun) return;
+    clearLatexFixSeed();
+    if (latexFixPendingStartRef.current) {
+      latexFixPendingStartRef.current = false;
+      latexFixStartedRef.current();
+    }
+  }, [latexFixRealRun, clearLatexFixSeed]);
+  // Failsafe: a hidden chat's terminal Realtime event can be missed (tab
+  // sleep mid-run) and nothing else reconciles the map for non-open chats —
+  // a live status that never transitions releases the hold after 5 minutes.
+  // Covers 'starting' too (a realtime echo can re-seed it after the grace),
+  // or a stuck one would hold Fix and auto-fix hostage with no way out.
+  // Compile-fix runs are short; a genuine marathon merely becomes re-fixable.
+  useEffect(() => {
+    if (!latexFixChatId) return;
+    const status = latexFixChatStatus;
+    if (status !== 'working' && status !== 'starting') return;
+    const chatId = latexFixChatId;
+    const timer = setTimeout(() => {
+      setChatStatusById((prev) => (prev[chatId] === status ? { ...prev, [chatId]: 'idle' } : prev));
+    }, 5 * 60_000);
+    return () => clearTimeout(timer);
+  }, [latexFixChatId, latexFixChatStatus]);
+  useEffect(() => {
+    if (latexFixGraceUntil == null) return;
+    // Only a REAL signal retires the grace — the seeded 'starting' must not
+    // cancel the very timer that exists to retire the seed.
+    if (latexFixRealRun) return setLatexFixGraceUntil(null);
+    const timer = setTimeout(() => {
+      setLatexFixGraceUntil(null);
+      clearLatexFixSeed();
+    }, Math.max(0, latexFixGraceUntil - Date.now()));
+    return () => clearTimeout(timer);
+  }, [latexFixGraceUntil, latexFixRealRun, clearLatexFixSeed]);
+  const latexFixBusy = fixInFlight || latexFixRunLive || latexFixGraceUntil != null;
+  const latexFixBusyRef = useRef(latexFixBusy);
+  latexFixBusyRef.current = latexFixBusy;
+  // Rapid Fix clicks share the in-flight find-or-create — never two creates.
+  const latexFixEnsureRef = useRef<Promise<string | null> | null>(null);
+  const ensureLatexFixChatId = useCallback(() => {
+    return (latexFixEnsureRef.current ??= ensureLatexFixChat({
+      threads: chatThreadsForCurrentProject,
+      refreshThreads: loadChatThreads,
+      createChat: async () => {
+        try {
+          const res = await apiFetch('/api/workspace/chats', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectId, kind: LATEX_FIX_CHAT_KIND, title: LATEX_FIX_CHAT_TITLE, model: LATEX_FIX_CHAT_MODEL }),
+          });
+          if (!res.ok) return null;
+          const payload = (await res.json()) as { chat?: { chat?: { id?: string } } };
+          return payload.chat?.chat?.id ?? null;
+        } catch {
+          return null;
+        }
+      },
+      archiveChat: async (chatId) => {
+        await apiFetch('/api/workspace/chats', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chatId, archived: true }),
+        });
+      },
+      // A fix chat from before the fast-model pin still runs the workspace
+      // default; pin it to the fast fix model on reuse (fire-and-forget).
+      setChatModel: async (chatId) => {
+        await apiFetch('/api/workspace/chats', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chatId, model: LATEX_FIX_CHAT_MODEL }),
+        });
+      },
+    }).finally(() => {
+      latexFixEnsureRef.current = null;
+    }));
+  }, [apiFetch, chatThreadsForCurrentProject, loadChatThreads, projectId]);
+  const latexFixClickedRef = useRef<() => void>(() => {});
+  const latexFixStartedRef = useRef<() => void>(() => {});
+  // Armed by the visible-chat send; the run's liveness signal (below) commits
+  // the resolution-eligible attempt at the acceptance boundary.
+  const latexFixPendingStartRef = useRef(false);
   const handleLatexFix = useCallback(() => {
     if (!activeWorkspaceFile) return;
     const target = latexRootPath ?? activeWorkspaceFile.path;
+    // Capture the failure at click time — the compile state can move on while
+    // the fix chat is found/created. When the open file IS the failing root,
+    // its live text rides along so the fix turn can Edit without a Read
+    // round trip (a visible chunk of the fix latency).
+    const fixSource = target === activeWorkspaceFile.path ? readEditorText() : null;
+    const prompt = buildCompileFixPrompt(target, latexCompile.errorLines, latexCompile.logText, fixSource);
+    if (latexFixBusyRef.current) return; // a second send would cancel-and-replace the running repair
+    latexFixClickedRef.current();
     setFixInFlight(true);
-    handleSendMessageRef.current?.(
-      buildCompileFixPrompt(target, latexCompile.errorLines, latexCompile.logText),
-    );
-  }, [activeWorkspaceFile, latexRootPath, latexCompile.errorLines, latexCompile.logText]);
-  const canLatexFix = Boolean(currentChat) && canWrite;
-
-  // Clear the "Auto-fixing…" indicator once the fix turn finishes streaming
-  // (busy → idle), so the toolbar/bottom bar return to their resting state.
-  const chatBusy =
-    sundialChat.status === 'streaming' || sundialChat.status === 'submitted';
-  const prevChatBusyRef = useRef(false);
-  useEffect(() => {
-    if (prevChatBusyRef.current && !chatBusy) setFixInFlight(false);
-    prevChatBusyRef.current = chatBusy;
-  }, [chatBusy]);
+    setLatexFixBlocked(null);
+    void (async () => {
+      try {
+        // Same pre-send auth gate as the composer, checked BEFORE creating
+        // the chat or persisting anything, so an unsigned editor gets the
+        // message instead of a dead prompt row in a hidden chat. Local is
+        // harness-aware like the composer: a Claude/Codex engine chat runs on
+        // the user's own local login and never gates; a local Sunny chat
+        // needs usable sd_ credentials.
+        if (localConfig) {
+          const fixThread = chatThreadsForCurrentProject.find(
+            (t) => (t.chat as { kind?: string | null }).kind === LATEX_FIX_CHAT_KIND && !t.chat.archived_at,
+          );
+          const fixHarness = fixThread?.chat.harness
+            ? parseChatHarness(fixThread.chat.harness)
+            : localEnginesRef.current.defaultHarness;
+          if (fixHarness !== 'claude' && fixHarness !== 'openai') {
+            const desktopCredentials = await desktopCredentialsUsable(localConfig);
+            if (!desktopCredentials)
+              return setLatexFixBlocked({ kind: 'signin', message: 'Sign in to let the agent fix this.' });
+          }
+        } else if (
+          (clerkAuthRef.current.isLoaded || clerkNeverLoads()) &&
+          !clerkAuthRef.current.isSignedIn &&
+          // Anonymous free-taste runs left: attempt the fix — the server gate
+          // is the authority and serves it, exactly like the composer.
+          !((anonRunsRemainingRef.current ?? 0) > 0)
+        ) {
+          const config = await resolveSidecarConfig();
+          const desktopCredentials = config ? await desktopCredentialsUsable(config) : false;
+          if (!desktopCredentials)
+            return setLatexFixBlocked({ kind: 'signin', message: 'Sign in to let the agent fix this.' });
+        }
+        const fixChatId = await ensureLatexFixChatId();
+        if (!fixChatId)
+          return setLatexFixBlocked({ kind: 'error', message: 'Could not open the fix chat.' });
+        setLatexFixChatId(fixChatId);
+        if (currentChatRef.current?.id === fixChatId && sundialChatRef.current) {
+          // The fix chat IS the open chat: send through the live transport so
+          // the turn shows in the visible transcript (the realtime hook skips
+          // own INSERTs, assuming own sends ride useChat). Same grace hold as
+          // the hidden path — the async send can pause (engine probe, model
+          // PATCH) before any liveness signal exists.
+          latexFixSuppressStartingRef.current = null;
+          setLatexFixGraceUntil(Date.now() + 8_000);
+          // The send promise resolves only after the whole streamed turn, so
+          // the attempt is committed when the run's liveness signal lands
+          // (latexFixRealRun effect) — the transport's acceptance boundary —
+          // and disarmed if the send reports it never landed.
+          latexFixPendingStartRef.current = true;
+          void Promise.resolve(handleSendMessageRef.current?.(prompt, { standalone: true })).then(
+            (sent) => {
+              if (!sent) latexFixPendingStartRef.current = false;
+            },
+          );
+          return;
+        }
+        // Instant hold before the POST: the run's first events can beat the
+        // realtime subscription to a chat React only just learned about.
+        setChatStatusById((prev) => (prev[fixChatId] ? prev : { ...prev, [fixChatId]: 'starting' }));
+        latexFixSeededRef.current = fixChatId;
+        // Fire-and-forget into the dedicated fix chat — no chat swap, no pane
+        // churn; the user stays in their document and their open conversation.
+        // The rail's running indicator is the feedback, and the fix lands as
+        // inline suggestions. Explicit suggest mode: this send bypasses the
+        // composer, so it must not inherit anything looser.
+        const res = await apiFetch('/api/workspace/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chatId: fixChatId, content: prompt, clientId: crypto.randomUUID(), editMode: 'suggest' }),
+        });
+        const payload = (await res.json().catch(() => ({}))) as {
+          agentStart?: { ok?: boolean; status?: string; reason?: string; rescued?: boolean };
+        };
+        // This path bypasses the composer's sign-in gate, so a blocked or
+        // failed start must surface here — a silent no-op reads as "Fix is
+        // broken", and holding busy for a run that never started sticks the
+        // button forever.
+        const noStart = () => {
+          latexFixSuppressStartingRef.current = fixChatId;
+          clearLatexFixSeed();
+        };
+        if (!res.ok) {
+          noStart();
+          return setLatexFixBlocked({ kind: 'error', message: 'Fix failed to send. Try again.' });
+        }
+        const start = payload.agentStart;
+        if (start?.status === 'blocked') {
+          noStart();
+          return setLatexFixBlocked(
+            start.reason === 'signin_required' || start.reason === 'credentials_missing'
+              ? { kind: 'signin', message: 'Sign in to let the agent fix this.' }
+              : start.reason === 'out_of_credits'
+                ? { kind: 'signin', message: 'Out of free agent runs. Sign in to keep fixing.' }
+                : { kind: 'error', message: 'The agent could not start. Try again.' },
+          );
+        }
+        if (start && (start.ok === false || start.status === 'error')) {
+          noStart();
+          return setLatexFixBlocked({ kind: 'error', message: 'The agent could not start. Try again.' });
+        }
+        latexFixSuppressStartingRef.current = null; // a real run is coming
+        latexFixStartedRef.current();
+        // Hold busy until the run's liveness signal lands. A rescued turn
+        // (deploy checkpoint: the sweep answers it later, under a fresh
+        // stream) gets a much longer leash — re-arming early would let the
+        // next click cancel-and-replace the repair still owed.
+        setLatexFixGraceUntil(Date.now() + (start?.rescued ? 90_000 : 8_000));
+      } catch {
+        clearLatexFixSeed();
+        setLatexFixBlocked({ kind: 'error', message: 'Fix failed to send. Try again.' });
+      } finally {
+        setFixInFlight(false);
+      }
+    })();
+  }, [activeWorkspaceFile, latexRootPath, latexCompile.errorLines, latexCompile.logText, readEditorText, ensureLatexFixChatId, apiFetch, clearLatexFixSeed, localConfig, chatThreadsForCurrentProject]);
+  const canLatexFix = canWrite;
+  const handleGuidedLatexFix = useCallback(() => {
+    if (showOnboardingTexGuide) {
+      markOnboardingLandingDone();
+      setShowOnboardingTexGuide(false);
+      track('onboarding_tex_guide_completed', { projectId });
+    }
+    handleLatexFix();
+  }, [handleLatexFix, projectId, showOnboardingTexGuide]);
+  const {
+    autoFix: latexAutoFix,
+    toggleAutoFix: toggleLatexAutoFix,
+    fixAttention: latexFixAttention,
+    suggestAutoFix: latexSuggestAutoFix,
+    resolveAutoFixSuggestion: resolveLatexAutoFixSuggestion,
+    noteFixRequested: noteLatexFixRequested,
+  } = useLatexAutoFix({
+    compileError: latexCompile.compileError,
+    errorLines: latexCompile.errorLines,
+    compiling: latexCompile.compiling,
+    canFix: canLatexFix && !latexFixBusy,
+    onFix: handleLatexFix,
+    texPath: activeTexFile ? latexRootPath : null,
+    fixBusy: latexFixBusy,
+    localEdits: latexLocalEditsRef.current,
+  });
+  const {
+    onFixClicked: trackLatexFixClicked,
+    onFixStarted: trackLatexFixStarted,
+    onAutoFixSuggestionOutcome: trackLatexAutoFixSuggestion,
+  } = useLatexAnalytics({
+    projectId,
+    texPath: activeTexFile ? latexRootPath : null,
+    texFileCount: texFileSignature ? texFileSignature.split('|').length : 0,
+    workspaceCreatedAt: projectCreatedAt,
+    compileError: latexCompile.compileError,
+    compiling: latexCompile.compiling,
+    canFix: canLatexFix,
+    autoFix: latexAutoFix,
+    autoFixSuggested: latexSuggestAutoFix,
+  });
+  latexFixClickedRef.current = () => trackLatexFixClicked(latexAutoFix);
+  latexFixStartedRef.current = () => {
+    trackLatexFixStarted(latexAutoFix);
+    // Arms the one-time "enable auto-fix?" offer for when this run goes green.
+    // Bound to the run's acceptance boundary, not the click: a failed send
+    // followed by a manual green must not claim "Fixed."
+    noteLatexFixRequested();
+  };
+  const handleLatexAutoFixSuggestion = useCallback(
+    (accepted: boolean) => {
+      resolveLatexAutoFixSuggestion(accepted);
+      trackLatexAutoFixSuggestion(accepted);
+    },
+    [resolveLatexAutoFixSuggestion, trackLatexAutoFixSuggestion],
+  );
+  // A blocked Fix's Sign in CTA (status popover). Comes back to this workspace
+  // after Clerk, like every other in-workspace sign-in entry.
+  const handleLatexFixSignIn = useCallback(() => {
+    setLatexFixBlocked(null);
+    openSignIn({ redirectUrl: buildReturnPath({}) });
+  }, [openSignIn]);
+  // One prop block for every seat of the compile cluster (mobile toolbar,
+  // Source-view toolbar, PDF pane header) — spelled once so the three can't
+  // drift. Compile-permission mirrors the route's canCreatePath: folder edit
+  // grants compile, exact-file grants don't (the button would only ever 403).
+  const canCompileLatex = canCreateWorkspacePath(latexRootPath);
+  const latexCompileProps = {
+    viewMode: latexViewMode,
+    onViewModeChange: handleLatexViewModeChange,
+    // Panel layout: the bottom surface switcher owns Source/PDF; the
+    // toolbar's own Source/Split/PDF group would be a second navigation.
+    hideViewSwitch: panelViewActive,
+    compile: latexCompile,
+    canCompile: canCompileLatex,
+    // The blocked chip names the reason the button is disabled; signed-out
+    // visitors also get the sign-in CTA (signing in is what unblocks them —
+    // for a signed-in read-only collaborator it wouldn't, so no CTA).
+    compileBlockedLabel: canCompileLatex ? null : isClerkSignedIn ? 'Read-only access' : 'Sign in to compile',
+    onCompileBlockedClick: !canCompileLatex && !isClerkSignedIn ? handleLatexFixSignIn : undefined,
+    mainDocument: latexMainDocument,
+    onFix: handleGuidedLatexFix,
+    canFix: canLatexFix,
+    fixInFlight: latexFixBusy,
+    fixAttention: latexFixAttention,
+    onboardingHint:
+      showOnboardingTexGuide && onboardingTexIntent && latexRootPath === WELCOME_TEX_PATH,
+    onDismissOnboardingHint: dismissOnboardingTexGuide,
+    fixBlocked: latexFixBlocked,
+    onSignInForFix: handleLatexFixSignIn,
+    onNavigateToLine: handleLatexNavigate,
+  };
 
   // Cmd/Ctrl+Enter inside the LaTeX editor asks Sunny to fix the current compile
   // errors (§1.5). Scoped to the Monaco DOM so it never steals the chat box's
@@ -7406,25 +10648,35 @@ export default function WorkspacePage() {
       const target = event.target as HTMLElement | null;
       if (!target?.closest('.monaco-editor')) return;
       event.preventDefault();
-      handleLatexFix();
+      handleGuidedLatexFix();
     };
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [activeTexFile, canLatexFix, latexCompile.compileError, handleLatexFix]);
+  }, [activeTexFile, canLatexFix, latexCompile.compileError, handleGuidedLatexFix]);
 
   const handleInterruptLoop = useCallback(() => {
     void handleInterruptChat();
   }, [handleInterruptChat]);
 
+  // beginDraft gates per target folder (path-share editors create inside
+  // their granted subtree without workspace-wide canWrite).
   const handleCreateFile = useCallback(() => {
-    if (!canWrite) return;
     beginDraft('text');
-  }, [beginDraft, canWrite]);
+  }, [beginDraft]);
 
   const handleCreateFolder = useCallback(() => {
-    if (!canWrite) return;
     beginDraft('folder');
-  }, [beginDraft, canWrite]);
+  }, [beginDraft]);
+
+  // ⌘T — Obsidian-style: a real "New tab" tab whose body asks what to put in
+  // it (create / open / chat / connect). The tab is transient — whatever opens
+  // next in its pane consumes it in place (openTab/replaceActiveTab).
+  const openLauncherTab = useCallback(() => {
+    const panes = editorPanesRef.current;
+    const paneId = panes.find((p) => p.id === lastFocusedPaneIdRef.current)?.id ?? PRIMARY_PANE_ID;
+    lastFocusedPaneIdRef.current = paneId;
+    setEditorPanes((prev) => openPaneTab(prev, paneId, LAUNCHER_TAB));
+  }, []);
 
   // Command-palette actions: only commands the page already exposes elsewhere,
   // each reusing that surface's handler (and its gating).
@@ -7435,8 +10687,11 @@ export default function WorkspacePage() {
         id: 'new-file',
         label: 'New file',
         keywords: 'create document',
-        // The draft input lives in the files tree — reveal it first (same as
-        // the tab strip's ＋ launcher).
+        // ⌘N only ever fires in the desktop shell (browsers reserve it), so
+        // the hint would be a lie on the web. The tree's draft input: name
+        // and place the file before it exists. (⌘T's create-straight-away
+        // path lives on the New-tab panel now.)
+        shortcut: desktopTabs ? formatShortcut('Mod+N', macShortcuts) : undefined,
         run: () => {
           setOpenLeftRail('project');
           setSidebarSections((prev) => expandSection(prev, 'files'));
@@ -7457,11 +10712,22 @@ export default function WorkspacePage() {
         id: 'new-chat',
         label: 'New chat',
         keywords: 'sunny conversation',
+        shortcut: formatShortcut('Mod+Shift+J', macShortcuts),
         run: () => {
           openCenterPanel('chat');
           void startAssistantChat(null, null, { forceNew: true, keepMode: true });
         },
       });
+      // The rail's New-chat surfaces no longer host this (sidepanel 0.1) —
+      // the ⌘T chooser is its home now, same gating the rail entry had.
+      if (!isLocalWorkspace) {
+        actions.push({
+          id: 'connect-local-agent',
+          label: 'Connect local agent',
+          keywords: 'claude code codex bridge attach',
+          run: () => void openLocalAgentModal(),
+        });
+      }
     }
     if (!isMobile) {
       actions.push({
@@ -7476,11 +10742,17 @@ export default function WorkspacePage() {
         keywords: 'review dock edits versions timeline',
         run: () => (rightDockView === 'history' ? closeRightDock() : openRightDock('history')),
       });
+      actions.push({
+        id: 'keyboard-shortcuts',
+        label: 'Keyboard shortcuts',
+        keywords: 'keys hotkeys bindings help',
+        run: () => openSettingsTab('shortcuts'),
+      });
     }
     if (canWrite && activeWorkspaceFile && !documentReadOnly && docEditModes.includes('suggest')) {
       actions.push({
         id: 'toggle-edit-mode',
-        label: effectiveDocEditMode === 'suggest' ? 'Switch to Editing' : 'Switch to Suggesting',
+        label: effectiveDocEditMode === 'suggest' ? 'Switch to Edit' : 'Switch to Suggest',
         keywords: 'edit suggest mode',
         run: () => setDocumentEditMode(effectiveDocEditMode === 'suggest' ? 'edit' : 'suggest'),
       });
@@ -7498,15 +10770,22 @@ export default function WorkspacePage() {
     activeWorkspaceFile,
     canWrite,
     closeRightDock,
+    createFileAndOpen,
     docEditModes,
     documentReadOnly,
     downloadWorkspaceZip,
     effectiveDocEditMode,
+    desktopTabs,
     handleCreateFile,
     handleCreateFolder,
+    isLocalWorkspace,
     isMobile,
+    macShortcuts,
     openCenterPanel,
+    openLocalAgentModal,
     openRightDock,
+    openPaneTabBesideChat,
+    openSettingsTab,
     projectId,
     rightDockView,
     setDocumentEditMode,
@@ -7521,24 +10800,62 @@ export default function WorkspacePage() {
     return selectedFilePath ? [selectedFilePath, ...paths] : paths;
   }, [editorPanes, selectedFilePath]);
 
-  // Cmd/Ctrl+N → new file, desktop shell only: browsers reserve the shortcut
-  // for a new window, so binding it there could never fire. Opens the file
-  // rail first — the draft input lives in the tree and must be visible.
+  // Palette chats: rail order, rail display titles ("New chat" placeholder for
+  // untitled). rankChats drops the archived ones — those live in Settings.
+  const paletteChats = useMemo(
+    () =>
+      chatEntries.map((entry) => ({
+        id: entry.chat.id,
+        title: usesGroupChatPresentation(entry.chat.chat_kind, entry.chat)
+          ? buildGroupChatDisplayName(entry.chat)
+          : entry.chat.title?.trim() || 'New chat',
+        archived: entry.isArchived,
+      })),
+    [chatEntries],
+  );
+
+  // Desktop shell only: browsers reserve ⌘N/⌘T for new windows/tabs, so
+  // binding them there could never fire.
+  //   ⌘N → create a document and open it in the editor (VS Code).
+  //   ⌘T → an empty tab that asks what to open (Obsidian).
+  // Gated on desktopTabs, not isDesktopApp: the latter is the macOS
+  // traffic-light signal, so binding on it left a Windows desktop user
+  // without ⌘N/⌘T for no reason.
   useEffect(() => {
-    if (!isDesktopApp) return;
+    if (!desktopTabs) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
-      if (event.key.toLowerCase() !== 'n') return;
-      event.preventDefault();
-      setOpenLeftRail('project');
-      handleCreateFile();
+      const key = event.key.toLowerCase();
+      if (key === 'n') {
+        // Pressed while a chooser tab is focused, the create fills THAT pane
+        // (same targeting as ⌘O) — the bare call would use the primary
+        // selection's context and strand a secondary pane's New tab.
+        event.preventDefault();
+        const panes = editorPanesRef.current;
+        const pane = panes.find((p) => p.id === lastFocusedPaneIdRef.current) ?? panes[0];
+        void createFileAndOpen(pane && isLauncherTab(pane.active) ? pane.id : undefined);
+      } else if (key === 't') {
+        event.preventDefault();
+        openLauncherTab();
+      } else if (key === 'o') {
+        // ⌘O — "Open file": the palette's file search (the New-tab panel
+        // advertises this shortcut, so it must exist as a binding too).
+        // Pressed while a chooser tab is focused, the pick fills that pane.
+        event.preventDefault();
+        const panes = editorPanesRef.current;
+        const pane = panes.find((p) => p.id === lastFocusedPaneIdRef.current) ?? panes[0];
+        setPaletteTargetPaneId(pane && isLauncherTab(pane.active) ? pane.id : null);
+        setCommandPaletteOpen(true);
+      }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isDesktopApp, handleCreateFile]);
+  }, [desktopTabs, createFileAndOpen, openLauncherTab]);
 
   const movePath = useCallback(async (sourcePath: string, targetPath: string, { skipReload = false } = {}) => {
-    if (!canWrite) return;
+    // Per-path: a path-share editor may move within the granted subtree —
+    // both ends must be writable (mirrors the server's check).
+    if (!canWriteWorkspacePath(sourcePath) || !canWriteWorkspacePath(targetPath)) return;
     if (!projectId) return;
     if (!sourcePath || !targetPath) return;
     if (sourcePath === targetPath) return;
@@ -7641,6 +10958,8 @@ export default function WorkspacePage() {
     }
 
     let ok = false;
+    let failure: string | null = null;
+    let linkUpdates: { files: number; links: number } | null = null;
     try {
       const res = await apiFetch('/api/workspace/files', {
         method: 'PATCH',
@@ -7648,10 +10967,28 @@ export default function WorkspacePage() {
         body: JSON.stringify({ projectId, sourcePath, targetPath }),
       });
       ok = res.ok;
+      if (!res.ok) {
+        failure = ((await res.json().catch(() => null)) as { error?: string } | null)?.error ?? null;
+      }
+      if (res.ok) {
+        // Obsidian-style rename link maintenance: the server rewrote inbound
+        // [[wikilinks]] — surface how many, like Obsidian's notice.
+        const data = (await res.json().catch(() => null)) as
+          | { linkUpdates?: { files?: number; links?: number } }
+          | null;
+        const updated = data?.linkUpdates;
+        if (updated && Number(updated.links) > 0) {
+          linkUpdates = { files: Number(updated.files ?? 0), links: Number(updated.links) };
+        }
+      }
     } catch {
       // network failure — treated as not ok below
     }
     if (!ok) {
+      // A rejected rename/move rolls back to a tree that looks untouched, so
+      // without this the refusal reads as "nothing happened" (the local disk
+      // refuses a target differing only in case from another file).
+      if (failure) showWorkspaceAppNotice('error', failure);
       if (movedSelection) {
         settleMove(movedSelection.from);
         openFileMoveRef.current = null;
@@ -7702,6 +11039,11 @@ export default function WorkspacePage() {
     setPendingPaneMoves((prev) =>
       prev.filter((m) => m.from !== sourcePath || m.to !== targetPath),
     );
+    if (linkUpdates) {
+      const links = `${linkUpdates.links} link${linkUpdates.links === 1 ? '' : 's'}`;
+      const files = `${linkUpdates.files} file${linkUpdates.files === 1 ? '' : 's'}`;
+      showWorkspaceAppNotice('success', `Updated ${links} in ${files}`);
+    }
 
     if (!skipReload) {
       await reloadFiles(false);
@@ -7711,7 +11053,7 @@ export default function WorkspacePage() {
       // to the now-gone old path.
       setLinkedReposRefreshKey((k) => k + 1);
     }
-  }, [canWrite, editorPanes, existingPaths, pendingOpenFileMove, projectId, reloadFiles, selectedFilePath, workspaceFileByPath, workspaceFiles]);
+  }, [canWriteWorkspacePath, editorPanes, existingPaths, pendingOpenFileMove, projectId, reloadFiles, selectedFilePath, showWorkspaceAppNotice, workspaceFileByPath, workspaceFiles]);
 
   const moveItem = useCallback(async (sourcePath: string, targetFolder: string | null, { skipReload = false } = {}) => {
     if (!sourcePath) return;
@@ -7721,7 +11063,7 @@ export default function WorkspacePage() {
   }, [movePath]);
 
   const handleFileDragStart = useCallback((event: DragEvent<HTMLDivElement>, filePath: string) => {
-    if (!canWrite) return;
+    if (!canWriteWorkspacePath(filePath)) return;
     const selection =
       selectedPaths.size > 0 && selectedPaths.has(filePath)
         ? Array.from(selectedPaths)
@@ -7745,19 +11087,33 @@ export default function WorkspacePage() {
       // The tree rows have no page-level dragend hook — disarm from the row.
       event.currentTarget.addEventListener('dragend', () => handleTabDragChange(false), { once: true });
     }
-  }, [canWrite, handleTabDragChange, isMobile, selectedPaths]);
+  }, [canWriteWorkspacePath, handleTabDragChange, isMobile, selectedPaths]);
 
   const handleDrop = useCallback(async (event: DragEvent<HTMLDivElement>, targetFolder: string | null) => {
-    if (!canWrite) return;
     event.preventDefault();
     event.stopPropagation();
     setIsFilesDropActive(false);
+    // Entries MUST be snapshotted before the first await — they go stale once
+    // the drop handler yields, which is what surfaced the raw NotFoundError.
+    const entries = dropEntriesFrom(event.dataTransfer);
     const droppedFiles = Array.from(event.dataTransfer.files ?? []);
-    if (droppedFiles.length > 0) {
-      queueUploads(droppedFiles, 'files', targetFolder);
+    if (entries || droppedFiles.length > 0) {
+      // Per-target: path-share editors may upload into their granted subtree.
+      if (!canUploadToFolder(targetFolder)) return;
       setDragOverPath(null);
+      if (entries) {
+        const { files, truncated } = await readDroppedEntries(entries);
+        if (files.length > 0) queueUploads(files, 'files', targetFolder);
+        else reportUploadError(entries[0].name, 'Nothing to upload in there.');
+        if (truncated) {
+          reportUploadError(entries[0].name, `Only the first ${MAX_ZIP_ENTRY_COUNT.toLocaleString()} files were queued.`);
+        }
+        return;
+      }
+      queueUploads(droppedFiles, 'files', targetFolder);
       return;
     }
+    if (!canWrite && pathGrants.length === 0) return;
     const listData = event.dataTransfer.getData('application/json');
     const sourcePath = event.dataTransfer.getData('text/plain');
     setDragOverPath(null);
@@ -7794,7 +11150,7 @@ export default function WorkspacePage() {
     setLinkedReposRefreshKey((k) => k + 1);
     // Clear multi-selection after move
     setSelectedPaths(new Set());
-  }, [canWrite, moveItem, queueUploads, reloadFiles]);
+  }, [canWrite, canUploadToFolder, pathGrants.length, moveItem, queueUploads, reloadFiles, reportUploadError]);
   const queueFileUploadsToFolder = useCallback((files: File[], targetFolder: string | null) => {
     queueUploads(files, 'files', targetFolder);
   }, [queueUploads]);
@@ -7805,11 +11161,18 @@ export default function WorkspacePage() {
   const selectChat = (index: number, { focusComposer = false }: { focusComposer?: boolean } = {}) => {
     const chatId = chatThreadsForCurrentProject[index]?.chat.id;
     if (!chatId) return;
+    // A rail-opened chat lands NARROW like the comment lane's "Open chat" —
+    // an even split collapses the document. Armed with the pre-open pane key,
+    // so a reused (possibly resized) pane keeps its width.
+    if (!isMobile) narrowChatPaneArmedRef.current = editorPanesRef.current.map((pane) => pane.id).join('|');
     activateDirectChat(chatId, { index, focusComposer, sidePanel: true });
   };
 
   const openChatById = useCallback(
-    async (chatId: string, { sidePanel = false }: { sidePanel?: boolean } = {}) => {
+    async (
+      chatId: string,
+      { sidePanel = false, appendTab = false }: { sidePanel?: boolean; appendTab?: boolean } = {},
+    ) => {
       const selectFromThreads = (threads: ChatThread[]) => {
         // `chatId` may be a short id-prefix ref from a shared link; activate
         // with the resolved full id (see findIndexByIdRef).
@@ -7820,6 +11183,7 @@ export default function WorkspacePage() {
           index: targetIndex,
           focusComposer: true,
           sidePanel,
+          appendTab,
         });
         return target.chat.id;
       };
@@ -7843,6 +11207,11 @@ export default function WorkspacePage() {
   useEffect(() => {
     if (isMobile || initialChatRevealRef.current === projectId || !currentChatId) return;
     if (!openPanels.includes('chat')) return;
+    // A non-owner whose plain chat-first arrival was just swapped to the
+    // document (effect above — same commit, so this closure still sees the
+    // pre-swap openPanels) must not get the chat re-revealed over it.
+    // Explicit chat intents (deep links, restored layouts) reveal as usual.
+    if (arrivalSwappedToDocRef.current) return;
     // Run only after the snapshot restore (same-commit ordering: the restore
     // effect is declared earlier, so the filesLoaded dep re-fires this after
     // it) — a restored layout gets to veto the legacy migration below.
@@ -7870,7 +11239,7 @@ export default function WorkspacePage() {
     // keep the mirrored file primary and dock the chat beside it. A chat-only
     // arrival (open-set ['chat']) still lands full-width via side's fallback.
     openChatTabInPanes(currentChatId, { side: openPanels.includes('editor') });
-  }, [currentChatId, deepLinkedWorkspaceFile, filesLoaded, isMobile, openChatTabInPanes, openPanels, projectId]);
+  }, [canWrite, currentChatId, deepLinkedWorkspaceFile, filesLoaded, isMobile, openChatTabInPanes, openPanels, projectId]);
 
   // Restored pane snapshots can hold chat tabs whose chats are gone (deleted
   // chats, dead drafts from an old session): prune them once this project's
@@ -8042,7 +11411,9 @@ export default function WorkspacePage() {
     filesLoaded,
     chatThreadsCount: chatThreadsForCurrentProject.length,
     isChatMode,
+    chatSurfaceOpen: openPanels.includes('chat'),
     isMobile,
+    canWrite,
     deepLinkedFileId,
     deepLinkedFilePath,
     deepLinkedWorkspaceFile,
@@ -8063,14 +11434,11 @@ export default function WorkspacePage() {
 
   // Mirrors the Chats-list "+ New" dropdown (project-sidebar): a compact list,
   // not the avatar/subtitle cards — keep the two menus identical.
-  const renderAssistantPickerMenu = ({
-    align = 'left',
-    keepMode = false,
-  }: { align?: 'left' | 'right'; keepMode?: boolean } = {}) => (
-    <div className={`absolute ${align === 'right' ? 'right-0' : 'left-0'} top-full z-50 mt-1.5 w-44 max-w-[calc(100vw-2rem)] rounded-lg border border-stone-200 bg-white py-1 text-xs shadow-lg`}>
+  const renderAssistantPickerMenu = () => (
+    <div className="absolute left-0 top-full z-50 mt-1.5 w-44 max-w-[calc(100vw-2rem)] rounded-lg border border-stone-200 bg-white py-1 text-xs shadow-lg">
       <button
         type="button"
-        onClick={() => void startAssistantChat(null, null, { forceNew: true, keepMode })}
+        onClick={() => void startAssistantChat(null, null, { forceNew: true })}
         className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 hover:bg-stone-50"
       >
         <ChatTeardropIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
@@ -8120,8 +11488,8 @@ export default function WorkspacePage() {
         : null;
     const activityLabel = formatRelativeTimeShort(chat?.last_message_at);
     const activityTitle = chat?.last_message_at ? formatRelativeTime(chat.last_message_at) : 'No activity yet';
-    const canArchive = Boolean(canWrite && chat?.id && !isDraftChatId(chat.id));
-    const canTogglePin = Boolean(user?.id && chat?.id && !isDraftChatId(chat.id));
+    const canArchive = canManageChat(canWrite, chat?.id);
+    const canTogglePin = canPinChat(user?.id, chat?.id);
     const canCopyChatLink = Boolean(chat?.id && !isDraftChatId(chat.id));
     const rawPreview = chat?.preview_text?.trim() || '';
     const defaultResponderLabel = 'No default responder';
@@ -8146,7 +11514,7 @@ export default function WorkspacePage() {
         ? `${externalAgentLabel(external)} · ran in ${external.cwd}`
         : chat.goal_summary?.trim() ||
         [
-          typeof chat.sunny_number === 'number' ? `#${chat.sunny_number}` : 'Sunny',
+          typeof chat.sunny_number === 'number' ? `#${chat.sunny_number}` : 'Sundial Agent',
           chat.model ? getChatModelLabel(chat.model) : null,
         ]
           .filter(Boolean)
@@ -8189,7 +11557,7 @@ export default function WorkspacePage() {
               : 'text-stone-400 hover:bg-stone-100 hover:text-stone-600'
           }`}
         >
-          <CaretDownIcon className="h-3.5 w-3.5" weight="bold" aria-hidden />
+          <DotsThreeVerticalIcon className="h-4 w-4" weight="bold" aria-hidden />
           <IconTooltip label="Chat actions" open={isChatMenuOpen} />
         </button>
         <AnchoredDropdown
@@ -8209,6 +11577,22 @@ export default function WorkspacePage() {
             >
               View details
             </button>
+            {/* Every edit this chat ever made, in the review timeline — the
+                whole-chat counterpart to a turn's diff. Tabs-only surface. */}
+            {isMobile ? null : (
+              <button
+                type="button"
+                data-testid="chat-menu-view-edits"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setOpenChatMenuId(null);
+                  handleOpenChatEdits(chat.id);
+                }}
+                className="w-full px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
+              >
+                View all edits
+              </button>
+            )}
             {canArchive && !showGroupChatUi ? (
               <button
                 type="button"
@@ -8222,13 +11606,28 @@ export default function WorkspacePage() {
                 Rename
               </button>
             ) : null}
-            {/* Phone/SMS "Connect to mobile" hidden from the UI for now — re-enable later.
-            {canWrite ? (
+            {/* Text-chat linking is cloud-only (Clerk phone + linq tables) —
+                local-backing workspaces are also hidden from iMessage /chats. */}
+            {canWrite && !isLocalWorkspace ? (
               <button
                 type="button"
                 onClick={(event) => {
                   event.stopPropagation();
                   setOpenChatMenuId(null);
+                  // Linking a row-less draft to mobile is explicit investment —
+                  // promote first so the link modal targets a real row (the
+                  // transport then guards it against typed-empty cleanup).
+                  if (isDraftChatId(chat.id)) {
+                    void promoteDraftWithItsSettings(chat.id).then((promoted) => {
+                      if (!promoted) return;
+                      // Armed so a dismissed modal doesn't leak the empty row
+                      // (cleanup or the reload marker sweep takes it back); a
+                      // completed link is kept by the transport guard.
+                      armTypedEmpty(promoted.chat.id);
+                      setLinkTextChatId(promoted.chat.id);
+                    });
+                    return;
+                  }
                   setLinkTextChatId(chat.id);
                 }}
                 className="w-full px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
@@ -8236,7 +11635,6 @@ export default function WorkspacePage() {
                 Connect to mobile
               </button>
             ) : null}
-            */}
             {canCopyChatLink ? (
               <button
                 type="button"
@@ -8248,6 +11646,36 @@ export default function WorkspacePage() {
                 className="w-full px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
               >
                 {copiedChatLinkId === chat.id ? 'Copied link' : 'Copy chat link'}
+              </button>
+            ) : null}
+            {canWrite ? (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setOpenChatMenuId(null);
+                  // Whole-workspace watch; a narrower path is set by the agent.
+                  void setCommentWatch(chat.id, chat.comment_watch_path ? null : '*');
+                }}
+                className="w-full px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
+              >
+                {chat.comment_watch_path ? 'Stop watching comments' : 'Watch comments'}
+              </button>
+            ) : null}
+            {/* Moved out of the chat header (founder: too loaded) — the
+                export pages the OPEN chat's history, so only its row offers it. */}
+            {chat?.id && chat.id === currentChatId && sundialChat.messages.length > 0 ? (
+              <button
+                type="button"
+                data-testid="chat-download-transcript"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setOpenChatMenuId(null);
+                  void downloadChatTranscript();
+                }}
+                className="w-full px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
+              >
+                Download transcript
               </button>
             ) : null}
             {canTogglePin ? (
@@ -8264,8 +11692,10 @@ export default function WorkspacePage() {
               </button>
             ) : null}
             {canArchive ? (
+              <>
               <button
                 type="button"
+                data-testid="chat-menu-archive"
                 onClick={(event) => {
                   event.stopPropagation();
                   setOpenChatMenuId(null);
@@ -8275,6 +11705,19 @@ export default function WorkspacePage() {
               >
                 {isArchived ? 'Unarchive chat' : 'Archive chat'}
               </button>
+              <button
+                type="button"
+                data-testid="chat-menu-delete"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setOpenChatMenuId(null);
+                  setChatPendingDelete({ id: chat.id, title: chat.title ?? null });
+                }}
+                className="w-full px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50"
+              >
+                Delete chat
+              </button>
+              </>
             ) : null}
         </AnchoredDropdown>
       </div>
@@ -8336,6 +11779,24 @@ export default function WorkspacePage() {
             selectChat(index, { focusComposer: true });
           }
         }}
+        // Right-click opens the row's actions menu (matches Files rows) —
+        // without this the desktop shell surfaces the raw WebKit menu.
+        // External transcripts have no menu; a renaming row keeps the native
+        // menu so the input's copy/paste stays reachable.
+        onContextMenu={
+          external || renamingChatId === chat.id
+            ? undefined
+            : (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                chatMenuTriggerRef.current = event.currentTarget.querySelector<HTMLButtonElement>(
+                  '[aria-label="Chat actions"]',
+                );
+                // Open, never toggle: the outside-click closer already ran on
+                // this same right-click's mousedown, so a toggle would re-open.
+                setOpenChatMenuId(chat.id);
+              }
+        }
         className={`group relative w-full cursor-pointer text-left ${
           layout === 'desktop'
             ? 'flex items-center gap-1.5 rounded-lg px-2 py-1 text-sm'
@@ -8359,7 +11820,7 @@ export default function WorkspacePage() {
               <ExternalAgentBadge external={external} />
             ) : folderRelation === 'touched' ? (
               <span
-                title={`Edited files in ${focusedSidebarFolder}/ — started elsewhere`}
+                title={`Edited files in ${focusedSidebarFolder}/ · started elsewhere`}
                 className="flex h-[17px] w-[17px] flex-shrink-0 items-center justify-center rounded-[5px] border border-dashed border-stone-300"
               >
                 <ChatTeardropIcon className="h-[13px] w-[13px] text-stone-400" weight="regular" aria-hidden />
@@ -8385,19 +11846,22 @@ export default function WorkspacePage() {
               />
             ) : null}
             {isTextChat ? <TransportBadge label="text" /> : null}
-            <div className="relative ml-auto flex h-5 shrink-0 items-center justify-end">
+            {/* In-flow, display-swapped (badge ⇄ actions): the hover actions
+                must take real layout space so the title TRUNCATES under them
+                instead of the icons painting over its last characters. */}
+            <div className="ml-auto flex h-5 shrink-0 items-center justify-end">
               {hasUnread ? (
                 <span
-                  className={`inline-flex min-w-5 items-center justify-center rounded-full bg-[#FF7628] px-1.5 py-0.5 text-[11px] font-semibold leading-none text-[#fff] ${
-                    isChatMenuOpen ? 'opacity-0' : 'group-hover:opacity-0'
+                  className={`min-w-5 items-center justify-center rounded-full bg-[#FF7628] px-1.5 py-0.5 text-[11px] font-semibold leading-none text-[#fff] ${
+                    isChatMenuOpen ? 'hidden' : 'inline-flex group-hover:hidden'
                   }`}
                 >
                   {unreadCount}
                 </span>
               ) : null}
               <div
-                className={`absolute inset-y-0 right-0 z-30 flex items-center justify-end ${
-                  isChatMenuOpen ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                className={`items-center justify-end ${
+                  isChatMenuOpen ? 'flex' : 'hidden group-hover:flex'
                 }`}
               >
                 {chatMenu}
@@ -8527,7 +11991,9 @@ export default function WorkspacePage() {
             <div className={sectionLabelClass}>{railPinned.length > 0 ? 'All' : 'Chats'}</div>
           ) : null}
           {chatLoadError && chatThreads.length === 0 ? (
-            chatsLoaded ? <div className={emptyTextClass}>{chatLoadError}</div> : null
+            // The initial load can 403 before the files payload marks the
+            // caller scoped — never surface that as an error to share guests.
+            chatsLoaded && !isScopedGuest ? <div className={emptyTextClass}>{chatLoadError}</div> : null
           ) : chatThreads.length === 0 ? (
             chatsLoaded ? <div className={emptyTextClass}>No chats yet.</div> : null
           ) : activeChats.length === 0 ? (
@@ -8547,14 +12013,19 @@ export default function WorkspacePage() {
   };
 
   if (accessError) {
-    const title =
-      accessError === 'not-found'
+    // Unclaimed key-gated workspace: whatever the denial status, the fix is
+    // the KEY (from the AI chat that created it), never a sign-in.
+    const claimGate = accessError !== 'not-found' && accessClaimable;
+    const title = claimGate
+      ? 'Claim this workspace'
+      : accessError === 'not-found'
         ? 'Workspace not found'
         : accessError === 'signin'
           ? 'Sign in required'
           : 'Private workspace';
-    const message =
-      accessError === 'not-found'
+    const message = claimGate
+      ? ''
+      : accessError === 'not-found'
         ? 'This workspace does not exist or has been deleted.'
         : accessError === 'signin'
           ? 'Please sign in to request access to this workspace.'
@@ -8571,8 +12042,9 @@ export default function WorkspacePage() {
             <SunnyAnimation name="shrug" className="mx-auto mb-4 h-36 w-36 object-contain" />
           )}
           <h1 className="text-2xl font-medium leading-tight">{title}</h1>
-          <p className="mt-3 text-stone-600">{message}</p>
-          {accessError === 'signin' && (
+          {message ? <p className="mt-3 text-stone-600">{message}</p> : null}
+          {claimGate ? <ClaimKeyGate workspacePath={buildWorkspacePath(workspaceRouteId)} /> : null}
+          {!claimGate && accessError === 'signin' && (
             <SignInButton mode="modal" forceRedirectUrl={buildWorkspacePath(workspaceRouteId)}>
               <button className="mt-8 flex w-full items-center justify-center gap-2 rounded-full bg-orange-500 py-3 text-sm font-medium text-white transition-all hover:bg-orange-600">
                 Sign in
@@ -8584,17 +12056,154 @@ export default function WorkspacePage() {
     );
   }
 
+  // The open file's own sharing: which Share surface its header button opens,
+  // and the access it already has (icon + status pill).
+  const activeFileIsExtraRoot = localRoots.some(
+    (entry) => entry.prefix && activeWorkspaceFile?.path.split('/', 1)[0] === entry.prefix,
+  );
+  const activeFileShareTarget = fileShareTarget({
+    isLocalWorkspace,
+    isExtraRootPath: activeFileIsExtraRoot,
+    canInviteShare,
+    isScopedGuest,
+    sharingLoaded: Boolean(shareInfo) && cloudPathSharesLoaded,
+    isSignedIn: Boolean(user),
+  });
+  const activeFileShare = fileShareStatus({
+    path: activeWorkspaceFile?.path,
+    isLocalWorkspace,
+    isExtraRootPath: activeFileIsExtraRoot,
+    localSharedScopePaths,
+    cloudPathShares,
+    cloudPathSharesLoaded,
+    workspaceShareStatus: shareStatus,
+    scopedGuestGrants: isScopedGuest ? pathGrants : null,
+  });
+  // General access lives in the path_shares ROOT grant, so both of these
+  // mutate the same rows the per-file icons read — reload them or every file
+  // keeps the icon of the access that was just turned off.
+  const handleVisibilityChange = async (visibility: 'private' | 'public') => {
+    await changeVisibility(visibility);
+    await refreshCloudPathShares();
+  };
+  const handlePublicAccessChange = async (access: 'view' | 'suggest' | 'edit' | 'none') => {
+    await changePublicAccess(access);
+    await refreshCloudPathShares();
+  };
+  const openPathShareScope = (scope: { path: string; kind: 'file' | 'folder' }) => {
+    setPathShareScope(scope);
+    void refreshCloudPathShares();
+  };
+  // What the "Shared" label manages: the grant that covers this file, else the
+  // workspace share it inherits from — and nothing at all for a scoped guest,
+  // whose access to BOTH sharing endpoints is a 403.
+  const activeFileShareScope = activeFileShare.scope;
+  const openReportedShare = activeFileShareScope
+    ? isLocalWorkspace
+      ? () => setLocalShareScope(activeFileShareScope)
+      : () => openPathShareScope(activeFileShareScope)
+    : isScopedGuest
+      ? null
+      : openShare;
+  // Copy-link fallback for viewers with no share modal. Only the ROOT grant's
+  // token may ride a copied link — a narrow file/chat token would leak that
+  // scope — so a narrow ?pshare guest gets no link at all rather than a bare
+  // URL that 404s for whoever they send it to.
+  const activeFileCopyUrl = (() => {
+    // Local extra-root mounts never sync, so they can't be shared — no
+    // copy-link fallback either, or the header hands out a link nobody
+    // else can open (with no share action, the button hides instead).
+    if (isLocalWorkspace && activeFileIsExtraRoot) return null;
+    const url = activeWorkspaceFile ? buildFileUrl(activeWorkspaceFile) : '';
+    if (!url) return null;
+    const token = rootShareTokenRef.current ?? (holdsRootGrantRef.current ? currentPathShareToken() : null);
+    if (token) return `${url}${url.includes('?') ? '&' : '?'}${PATH_SHARE_TOKEN_PARAM}=${encodeURIComponent(token)}`;
+    return isScopedGuest ? null : url;
+  })();
+  // Local: share this file to a cloud workspace via the sidecar. Cloud: the
+  // path-share modal, like the file rail's ⋮ → Share — the workspace modal
+  // only ever offered the bare /w/<id> URL, which names no file and (post
+  // root-grant) grants nothing. `fileShareModalScope` owns the choice for
+  // both, so the doc header and the top bar can't drift apart on it.
+  const openShareForFile = (
+    path: string,
+    target: ReturnType<typeof fileShareTarget>,
+    share: ReturnType<typeof fileShareStatus>,
+  ) => {
+    const route = fileShareModalScope(path, target, share);
+    if (!route) return null;
+    return route.lane === 'local'
+      ? () => setLocalShareScope(route.scope)
+      : () => openPathShareScope(route.scope);
+  };
+  const openActiveFileShare = activeWorkspaceFile
+    ? openShareForFile(activeWorkspaceFile.path, activeFileShareTarget, activeFileShare)
+    : null;
+
+  // Top-bar Share target: the FOCUSED pane's file when a pane shows it
+  // (split panes make the primary selection wrong — Codex round 8), else the
+  // visible primary selection. Null on covered/chat surfaces → workspace-only.
+  const topbarShareFilePath =
+    commitDiffOpen || !isEditorVisible
+      ? null
+      : focusedEditorPath && paneShowsFile(focusedEditorPath)
+        ? focusedEditorPath
+        : selectedFilePath && paneShowsFile(selectedFilePath)
+          ? selectedFilePath
+          : null;
+  // File + parent-folder share plan for an arbitrary on-screen path — the
+  // same target/covering-scope routing the doc header uses for the active
+  // file (extra-root mounts and scoped guests fall out as null).
+  const topbarSharePlan = (() => {
+    const path = topbarShareFilePath;
+    if (!path) return { fileName: null, parentDir: null, onShareFile: null, onShareFolder: null };
+    const isExtraRoot = localRoots.some(
+      (entry) => entry.prefix && path.split('/', 1)[0] === entry.prefix,
+    );
+    const target = fileShareTarget({
+      isLocalWorkspace,
+      isExtraRootPath: isExtraRoot,
+      canInviteShare,
+      isScopedGuest,
+      sharingLoaded: Boolean(shareInfo) && cloudPathSharesLoaded,
+      isSignedIn: Boolean(user),
+    });
+    const status = fileShareStatus({
+      path,
+      isLocalWorkspace,
+      isExtraRootPath: isExtraRoot,
+      localSharedScopePaths,
+      cloudPathShares,
+      cloudPathSharesLoaded,
+      workspaceShareStatus: shareStatus,
+      scopedGuestGrants: isScopedGuest ? pathGrants : null,
+    });
+    const onShareFile = openShareForFile(path, target, status);
+    const parentDir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : null;
+    const onShareFolder =
+      parentDir && target === 'local'
+        ? () => setLocalShareScope({ kind: 'folder', path: parentDir })
+        : parentDir && target === 'path'
+          ? () => openPathShareScope({ path: parentDir, kind: 'folder' })
+          : null;
+    return { fileName: formatFileName(getFileName(path)), parentDir, onShareFile, onShareFolder };
+  })();
+
   // Doc-header chrome shared between the desktop editor-column strip and the
   // mobile top bar. Below the mobile breakpoint the top bar carries the file
   // identity + per-file controls itself — one chrome bar in the same
   // left-to-right order as desktop, instead of stacking a second header that
   // repeats the file name.
-  const docFileNameControl = activeWorkspaceFile ? (
+  // `large` = the Google Docs-style header title (docs mode); the default is
+  // the compact 13px control the IDE header and mobile strip use.
+  const renderDocFileNameControl = (large = false) => activeWorkspaceFile ? (
     <DocFileNameControl
+      large={large}
       fileName={formatFileName(getFileName(activeWorkspaceFile.path))}
       canRename={canWrite && !documentEditorReadOnly}
       isRenaming={
         renameEntry?.source === 'header' &&
+        !renameEntry.paneId &&
         (renameEntry.fileId
           ? renameEntry.fileId === activeWorkspaceFile.id
           : renameEntry.path === activeWorkspaceFile.path)
@@ -8619,107 +12228,204 @@ export default function WorkspacePage() {
       onCancelRename={cancelRename}
     />
   ) : null;
+  // Hoisted out of docFileControls so the no-tabs shell can seat it beside
+  // the window's × (top-left) while the tabbed shell and mobile keep it at
+  // the row's end. Dots are HORIZONTAL (Belinda, 2026-08-07 — one ⋯ menu,
+  // matching the toolbar's own overflow glyph); the panel hugs whichever
+  // corner the trigger sits in.
+  // While the formatting toolbar is shown, the doc controls ride ITS right
+  // end instead of the header corner — see docsHeaderControls below. In the
+  // Docs style that is ALWAYS (founder: Edit/Suggest/View and the ⋯ fold
+  // entirely into the bar — the toolbar row stays mounted even over the raw
+  // markdown view, inert, so the controls never pop back up to the header).
+  // Defined up here because docFileControls' mode-picker gate reads it.
+  const controlsRideToolbar =
+    !isMobile && activeIsMarkdown && (docsPage || (isMarkdownEditing && showFormatToolbar));
+  // Docs style: the toolbar suppresses its own overflow trigger and its
+  // condensed tiers fold into the document ⋯ menu instead — ONE dots menu on
+  // the pill, not ⋯ + ⋮ side by side (Belinda's screenshot). ONE width const
+  // feeds both the flags here and the toolbar's containerWidth prop below, so
+  // the bar and the menu can never disagree on what's hidden.
+  const toolbarContentWidth = controlsRideToolbar
+    ? Math.max(0, toolbarRowWidth - toolbarControlsWidth)
+    : toolbarRowWidth;
+  const docsToolbarFlags = toolbarTierFlags(toolbarContentWidth);
+  const docsToolbarOverflowItems =
+    !isMobile &&
+    docsPage &&
+    isMarkdownEditing &&
+    toolbarEditor &&
+    // The frozen destroyed editor (file switch in flight) throws on any
+    // command — the bar goes inert then, so the menu must too (Codex).
+    !toolbarEditor.isDestroyed &&
+    !docsToolbarFlags.showClear &&
+    !documentEditorReadOnly &&
+    activeFileCap.canWrite
+      ? (close: () => void) => (
+          <ToolbarOverflowItems
+            editor={toolbarEditor}
+            flags={docsToolbarFlags}
+            onClose={close}
+            // This menu already lists its own Print below.
+            hidePrint
+          />
+        )
+      : undefined;
+  // ⌘F / ⌘⇧H belong to ONE pane: the last-clicked pane while it shows a file
+  // (the same file open in two panes must not open two find bars), else the
+  // primary.
+  const findOwnerPaneId = editorPanes.some(
+    (pane) => pane.id === focusedPaneId && pane.active && workspaceFileByPath.has(pane.active),
+  )
+    ? focusedPaneId
+    : PRIMARY_PANE_ID;
+  const docActionsMenu = activeWorkspaceFile ? (
+    <DocumentActionsMenu
+      findShortcuts={findOwnerPaneId === PRIMARY_PANE_ID}
+      formattingItems={docsToolbarOverflowItems}
+      // Horizontal ⋯ only where this IS the pill's single dots menu; the
+      // IDE/mobile shells keep ⋮ beside the toolbar's own ⋯ overflow.
+      horizontalDots={docsPage && !isMobile}
+      // Docs view keeps the ⋮ in the RIGHT corner (no window × to sit beside),
+      // so its panel hugs right; the IDE no-tabs shell seats it top-left.
+      menuAlign={!isMobile && !desktopTabs && !docsPage ? 'left' : 'right'}
+      editor={markdownEditor}
+      readOnly={documentEditorReadOnly || !activeFileCap.canWrite}
+      file={activeWorkspaceFile}
+      projectId={projectId}
+      fileUrl={buildFileUrl(activeWorkspaceFile) || null}
+      localWorkspace={isLocalWorkspace}
+      rawMarkdown={
+        activeIsMarkdown
+          ? {
+              active: showRawView,
+              onToggle: () => {
+                const el = docEditorBodyRef.current;
+                if (el) docScrollFractionRef.current = scrollFraction(el);
+                pendingRestoreRef.current = true;
+                setShowRawView((value) => !value);
+              },
+            }
+          : null
+      }
+      richViewer={
+        // Preview↔Source for code files with a rich viewer (CSV/JSON/HTML).
+        !isMarkdownEditing && hasRichViewer
+          ? { active: showRichViewer, onToggle: () => setShowRichViewer((v) => !v) }
+          : null
+      }
+      inlineTitle={activeIsMarkdown ? { active: showDocTitle, onToggle: toggleDocTitle } : null}
+      collapsed={
+        collapseDocControls
+          ? {
+              editMode: !documentReadOnly
+                ? { mode: effectiveDocEditMode, modes: docEditModes, onChange: setDocumentEditMode }
+                : null,
+              // No sign-in prompt anywhere (founder, 2026-08-05) — anonymous
+              // visitors use Log in.
+              signIn: null,
+              // Desktop drops the Share item — its affordance is the status
+              // icon riding next to the file name, which survives the
+              // collapse. NARROW MOBILE keeps it: the status icon only
+              // renders in the desktop doc header, and the mobile
+              // FileShareButton is gone under this collapse.
+              share: isMobile
+                ? (() => {
+                    const open =
+                      openActiveFileShare ??
+                      (!isLocalWorkspace && canShowShareControls && !isScopedGuest
+                        ? openShare
+                        : null);
+                    return open ? { onSelect: open } : null;
+                  })()
+                : null,
+              // Mirrors the buttons it replaces: mobile's caret covers
+              // markdown AND LaTeX (compile/view toolbar); desktop Aa is
+              // markdown-only.
+              formatToolbar: isMobile
+                ? activeIsMarkdown || activeTexFile
+                  ? { active: mobileToolbarExpanded, onToggle: () => setMobileToolbarExpanded((v) => !v) }
+                  : null
+                : // Docs style: the toolbar can never close — no toggle item.
+                  activeIsMarkdown && !docsPage
+                  ? { active: showFormatToolbar, onToggle: toggleFormatToolbar }
+                  : null,
+              // Squished row: the comments toggle folds in here like its
+              // neighbors — it's the only entry point once the icon is gone.
+              comments:
+                activeFileCommentCount > 0
+                  ? { count: activeFileCommentCount, onToggle: toggleCommentLane }
+                  : null,
+            }
+          : null
+      }
+      pdfPreviewUrl={pdfPreviewUrl}
+      onRename={() =>
+        // Web (no-tabs) shell: the rename input lives in the bar's file-name
+        // control ('header'), not a tab.
+        beginRename(activeWorkspaceFile.path, isMobile || !desktopTabs ? 'header' : 'tab', {
+          fileId: activeWorkspaceFile.id,
+          ...(isMobile || !desktopTabs ? {} : { paneId: PRIMARY_PANE_ID }),
+        })
+      }
+      onDuplicate={() => void duplicateFile(activeWorkspaceFile)}
+      onDelete={() => void deletePath(activeWorkspaceFile.path)}
+    />
+  ) : null;
+  const docFileNameControl = renderDocFileNameControl();
+  // A header crumb CLICK opens the rail scoped to that folder (FilesTabPanel
+  // folder-focus, same as double-clicking its row).
+  const focusRailFolder = (path: string) => {
+    setOpenLeftRail('project');
+    setSidebarSections((prev) => expandSection(prev, 'files'));
+    setSidebarFolderFocusIntent({ path, nonce: Date.now() });
+  };
   const docFileControls = activeWorkspaceFile ? (
     <>
-      {!documentReadOnly ? (
+      {/* Squished bar (narrow pane / small viewport): everything folds into
+          the ⋯ menu — see its `collapsed` section. */}
+      {/* Mode picker: rides the formatting toolbar's right end while it's
+          shown (Google Docs' Editing dropdown — founder). In the Docs style
+          this whole cluster IS what rides the toolbar, so it stays here; in
+          the IDE style the toolbar seats its own copy, so the header drops
+          this one. Mobile and non-markdown surfaces keep it here always. */}
+      {!collapseDocControls && !documentReadOnly && (docsPage || !controlsRideToolbar) ? (
         <EditModeControl
           mode={effectiveDocEditMode}
           onChange={setDocumentEditMode}
           menuPlacement="down"
           modes={docEditModes}
-          disabled={!canWrite}
+          disabled={!activeFileCap.canWrite}
         />
-      ) : canComment && isAuthLoaded && !user ? (
-        // Anonymous visitor on a Commenter link: suggesting
-        // needs an identity (see canComposeSuggestions).
+      ) : null}
+      {/* (No "Sign in to suggest edits" prompt — founder, 2026-08-05: the
+          header stays quiet; anonymous visitors sign in via Log in.) */}
+      {/* Formatting toolbar toggle — Aa, seated right before the ⋮ (founder:
+          "near the 3 dots"). Desktop IDE only: mobile keeps its own
+          collapsed-toolbar caret, and the Docs toolbar can NEVER close
+          (founder, 2026-08-05) so it offers no toggle at all. */}
+      {!collapseDocControls && !isMobile && !docsPage && activeIsMarkdown ? (
         <button
           type="button"
-          onClick={() => openSignIn({ redirectUrl: buildReturnPath({}) })}
-          className="rounded-lg px-2.5 py-1 text-[13px] text-stone-500 hover:bg-stone-100 hover:text-stone-700 transition-colors"
-        >
-          Sign in to suggest edits
-        </button>
-      ) : null}
-      {pdfPreviewUrl ? (
-        <a
-          href={pdfPreviewUrl}
-          target="_blank"
-          rel="noreferrer"
-          aria-label="Open in new tab"
-          className="relative group/tip inline-flex h-7 w-7 items-center justify-center rounded text-stone-400 hover:bg-stone-100 hover:text-stone-600"
-        >
-          <ArrowSquareOutIcon className="h-4 w-4" weight="regular" aria-hidden />
-          <IconTooltip label="Open in new tab" />
-        </a>
-      ) : null}
-      {!isMarkdownEditing && hasRichViewer ? (
-        // Preview↔Source for code files with a rich viewer (CSV/JSON/HTML),
-        // living beside Editing / Share instead of above the content.
-        <button
-          type="button"
-          onClick={() => setShowRichViewer((v) => !v)}
-          aria-label={showRichViewer ? 'Source' : 'Preview'}
-          aria-pressed={showRichViewer}
+          onClick={toggleFormatToolbar}
+          aria-pressed={showFormatToolbar}
+          aria-label="Formatting toolbar"
+          data-testid="format-toolbar-toggle"
           className={`relative group/tip inline-flex h-7 w-7 items-center justify-center rounded hover:bg-stone-100 ${
-            showRichViewer ? 'text-stone-700' : 'text-stone-400 hover:text-stone-600'
+            showFormatToolbar ? 'text-stone-700' : 'text-stone-400 hover:text-stone-600'
           }`}
         >
-          {activeCsvFile ? (
-            <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M3 10h18M3 14h18M3 6h18M3 18h18M9 6v12M15 6v12" />
-            </svg>
-          ) : activeJsonFile ? (
-            <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M4 7V4a1 1 0 011-1h3M17 3h3a1 1 0 011 1v3M20 17v3a1 1 0 01-1 1h-3M7 21H4a1 1 0 01-1-1v-3" />
-            </svg>
-          ) : (
-            <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z" />
-              <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-            </svg>
-          )}
-          <IconTooltip label={showRichViewer ? 'Source' : 'Preview'} />
+          <TextAaIcon className="h-4 w-4" weight="regular" aria-hidden />
+          <IconTooltip label="Formatting toolbar" />
         </button>
       ) : null}
-      {activeIsMarkdown ? (
-        <button
-          type="button"
-          onClick={() => {
-            const el = docEditorBodyRef.current;
-            if (el) docScrollFractionRef.current = scrollFraction(el);
-            pendingRestoreRef.current = true;
-            setShowRawView((value) => !value);
-          }}
-          aria-pressed={showRawView}
-          aria-label="Raw markdown"
-          data-testid="toggle-raw-markdown"
-          className={`relative group/tip inline-flex h-7 w-7 items-center justify-center rounded hover:bg-stone-100 ${
-            showRawView ? 'text-stone-700' : 'text-stone-400 hover:text-stone-600'
-          }`}
-        >
-          <CodeIcon className="h-4 w-4" weight="regular" aria-hidden />
-          <IconTooltip label={showRawView ? 'Rendered view' : 'Raw markdown'} />
-        </button>
-      ) : null}
-      {/* Per-file Share (wireframe: file header, right before Comments) —
-          replaces the bare Copy-file-link button. */}
-      <FileShareMenu
-        fileUrl={buildFileUrl(activeWorkspaceFile) || null}
-        onShareFile={
-          // Local: share this file to a cloud workspace — but extra-root
-          // mounts can't share (shares cover the primary root only).
-          isLocalWorkspace &&
-          !localRoots.some((entry) => entry.prefix && activeWorkspaceFile.path.split('/', 1)[0] === entry.prefix)
-            ? () => setLocalShareScope({ kind: 'file', path: activeWorkspaceFile.path })
-            : undefined
-        }
-        onOpenWorkspaceShare={!isLocalWorkspace && canShowShareControls ? openShare : undefined}
-      />
-      {/* Comments toggle — lives beside Share in the file header (wireframe),
-          not the window top-right. Desktop only: the lane needs the wide
-          editor column. Hidden while the file has zero comments — commenting
-          starts from the selection bubble (⌘⌥M), not this toggle. */}
-      {!isMobile && activeFileCommentCount > 0 ? (
+      {/* Comments toggle — MOBILE only here: desktop's copy moved up to the
+          window's top-right cluster, seated left of the right-panel toggle
+          (Belinda, 2026-08-07 — Google Docs' own comment/share corner).
+          Hidden while the file has zero comments — commenting starts from the
+          selection bubble (⌘⌥M), not here; when the row collapses it folds
+          into the ⋯ menu like its neighbors. */}
+      {isMobile && !collapseDocControls && activeFileCommentCount > 0 ? (
         <button
           type="button"
           onClick={toggleCommentLane}
@@ -8727,7 +12433,7 @@ export default function WorkspacePage() {
           aria-label="Comments"
           data-testid="doc-comments-toggle"
           className={`relative group/tip inline-flex h-7 w-7 items-center justify-center rounded hover:bg-stone-100 ${
-            commentsLaneToggled ? 'bg-stone-100 text-stone-700' : 'text-stone-400 hover:text-stone-600'
+            commentsLaneToggled ? 'text-stone-700' : 'text-stone-400 hover:text-stone-600'
           }`}
         >
           <ChatTextIcon
@@ -8736,32 +12442,349 @@ export default function WorkspacePage() {
             aria-hidden
           />
           {commentBadgeCount > 0 ? (
-            <span className="absolute -right-1 -top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full border border-white bg-[#e7c49e] px-1 text-[10px] font-semibold text-[#634a31]">
+            <span className="absolute -right-0.5 -top-0.5 inline-flex h-3.5 min-w-3.5 items-center justify-center rounded-full border border-white bg-[#e7c49e] px-1 text-[9px] font-semibold text-[#634a31]">
               {Math.min(commentBadgeCount, 9)}
             </span>
           ) : null}
           <IconTooltip label="Comments" />
         </button>
       ) : null}
+      {/* Per-file Share button: MOBILE only — desktop's share affordance is
+          the status icon riding next to the file name (founder). */}
+      {isMobile && !collapseDocControls ? (
+      <FileShareButton
+        variant="button"
+        fileUrl={activeFileCopyUrl}
+        shareStatus={activeFileShare.status}
+        onShareFile={openActiveFileShare ?? undefined}
+        // /api/workspace/share 403s for a scoped guest, so the workspace
+        // modal would only error at them — they get copy-link instead.
+        onOpenWorkspaceShare={
+          !isLocalWorkspace && canShowShareControls && !isScopedGuest ? openShare : undefined
+        }
+      />
+      ) : null}
+      {/* The ⋮ document-actions menu rides here (row end) in the tabbed shell
+          and on mobile; the no-tabs shell seats it beside the window's × at
+          the top-LEFT corner instead (founder). */}
+      {isMobile || desktopTabs ? docActionsMenu : null}
     </>
   ) : null;
+  // Share status rides NEXT TO THE FILE NAME (founder): a lock while the doc
+  // is private, the usual audience glyphs (people / globe) once it isn't —
+  // and clicking it IS the share entry point. The status variant keeps
+  // FileShareButton's copy-link fallback, so a modal-less viewer (e.g. a
+  // ?pshare guest) can still copy the usable file link. Desktop only; mobile
+  // keeps the full-size button in its merged bar.
+  const docShareStatusIcon = activeWorkspaceFile ? (
+    <FileShareButton
+      variant="status"
+      fileUrl={activeFileCopyUrl}
+      shareStatus={activeFileShare.status}
+      onShareFile={openActiveFileShare ?? undefined}
+      onOpenWorkspaceShare={
+        !isLocalWorkspace && canShowShareControls && !isScopedGuest ? openShare : undefined
+      }
+    />
+  ) : null;
+  // Google Docs seats its mode picker and overflow at the RIGHT END OF THE
+  // TOOLBAR, not in a corner above it — a floating cluster up there read as
+  // app chrome bolted onto a document (founder). While the toolbar is shown,
+  // the Docs style seats its WHOLE control cluster there and the IDE style
+  // seats just the mode picker (its Aa/⋮ keep their header seats); with the
+  // toolbar hidden — or the raw markdown view in its place — everything
+  // falls back to the header corner. (controlsRideToolbar itself is defined
+  // above docFileControls, whose mode-picker gate reads it.)
+  const docsHeaderControls = (
+    <>
+      {docFileControls}
+      {!isMobile && !desktopTabs ? docActionsMenu : null}
+    </>
+  );
+  // Split panes get the SAME doc chrome as the primary — header row (path,
+  // name, share status, Aa, ⋮) and the mode picker at the toolbar's right
+  // end — built per file/pane from the same pieces. Per-file capability and
+  // share status are derived for the pane's own file (not the page selection);
+  // the mode itself is workspace-global, so picking in any pane moves all.
+  const buildSplitPaneChrome = (file: WorkspaceFileRow, paneId: string, editor: Editor | null) => {
+    const isMarkdown = isMarkdownFile(file);
+    const cap = pathCapability({ canWrite, canSuggest, canComment }, pathGrants, file.path, Boolean(user));
+    const readOnly = !cap.canWrite && !cap.canSuggest;
+    const modes = isMarkdown ? MARKDOWN_DOC_EDIT_MODES : DOC_EDIT_MODES;
+    const mode: WorkspaceEditMode = !cap.canWrite
+      ? modes.includes('suggest')
+        ? 'suggest'
+        : 'view'
+      : modes.includes(documentEditMode)
+        ? documentEditMode
+        : 'edit';
+    // Same coercion as the primary: a non-markdown file has no View, so a
+    // "Viewing" workspace edits it — and the pane's own picker now shows that.
+    const editorReadOnly = readOnly || mode === 'view';
+    const isExtraRoot = localRoots.some(
+      (entry) => entry.prefix && file.path.split('/', 1)[0] === entry.prefix,
+    );
+    const shareTarget = fileShareTarget({
+      isLocalWorkspace,
+      isExtraRootPath: isExtraRoot,
+      canInviteShare,
+      isScopedGuest,
+      sharingLoaded: Boolean(shareInfo) && cloudPathSharesLoaded,
+      isSignedIn: Boolean(user),
+    });
+    const share = fileShareStatus({
+      path: file.path,
+      isLocalWorkspace,
+      isExtraRootPath: isExtraRoot,
+      localSharedScopePaths,
+      cloudPathShares,
+      cloudPathSharesLoaded,
+      workspaceShareStatus: shareStatus,
+      scopedGuestGrants: isScopedGuest ? pathGrants : null,
+    });
+    const copyUrl = (() => {
+      if (isLocalWorkspace && isExtraRoot) return null;
+      const url = buildFileUrl(file);
+      if (!url) return null;
+      const token = rootShareTokenRef.current ?? (holdsRootGrantRef.current ? currentPathShareToken() : null);
+      if (token) return `${url}${url.includes('?') ? '&' : '?'}${PATH_SHARE_TOKEN_PARAM}=${encodeURIComponent(token)}`;
+      return isScopedGuest ? null : url;
+    })();
+    const shareIcon = (
+      <FileShareButton
+        variant="status"
+        fileUrl={copyUrl}
+        shareStatus={share.status}
+        onShareFile={openShareForFile(file.path, shareTarget, share) ?? undefined}
+        onOpenWorkspaceShare={
+          !isLocalWorkspace && canShowShareControls && !isScopedGuest ? openShare : undefined
+        }
+      />
+    );
+    const showToolbar = isMarkdown && (docsPage || showFormatToolbar);
+    const nameControl = (large = false) => (
+      <DocFileNameControl
+        large={large}
+        fileName={formatFileName(getFileName(file.path))}
+        canRename={cap.canWrite && !editorReadOnly}
+        isRenaming={
+          renameEntry?.source === 'header' &&
+          renameEntry.paneId === paneId &&
+          (renameEntry.fileId ? renameEntry.fileId === file.id : renameEntry.path === file.path)
+        }
+        renameValue={renameEntry?.name ?? ''}
+        inputRef={renameInputRef}
+        onBeginRename={(event) =>
+          beginRename(file.path, 'header', { fileId: file.id, clickEvent: event, paneId })
+        }
+        onRenameValueChange={(name) =>
+          setRenameEntry({ path: file.path, name, source: 'header', fileId: file.id, paneId })
+        }
+        onCommitRename={() => void commitRename()}
+        onCancelRename={cancelRename}
+      />
+    );
+    const modePicker = !readOnly ? (
+      <EditModeControl
+        mode={mode}
+        onChange={setDocumentEditMode}
+        menuPlacement="down"
+        modes={modes}
+        disabled={!cap.canWrite}
+      />
+    ) : null;
+    // No-tabs shell: no strip to rename in — the header's name control is
+    // the rename input (same rule as the primary).
+    const renameFromMenu = () =>
+      beginRename(file.path, desktopTabs ? 'tab' : 'header', { fileId: file.id, paneId });
+    const actionsMenu = (collapsed: boolean, flags?: ToolbarTierFlags) => (
+      <DocumentActionsMenu
+        // Docs style: the toolbar's condensed tiers fold in here — ONE dots
+        // menu on the pill (same as the primary's docsToolbarOverflowItems).
+        formattingItems={
+          docsPage && flags && !flags.showClear && editor && !editor.isDestroyed && !editorReadOnly && cap.canWrite
+            ? (close) => <ToolbarOverflowItems editor={editor} flags={flags} onClose={close} hidePrint />
+            : undefined
+        }
+        horizontalDots={docsPage}
+        menuAlign="right"
+        editor={editor}
+        readOnly={editorReadOnly || !cap.canWrite}
+        file={file}
+        projectId={projectId}
+        fileUrl={copyUrl}
+        localWorkspace={isLocalWorkspace}
+        collapsed={
+          collapsed
+            ? {
+                editMode: !readOnly ? { mode, modes, onChange: setDocumentEditMode } : null,
+                signIn: null,
+                share: null,
+                formatToolbar:
+                  isMarkdown && !docsPage
+                    ? { active: showFormatToolbar, onToggle: toggleFormatToolbar }
+                    : null,
+                comments: null,
+              }
+            : null
+        }
+        // The pane is print:hidden — Print would print the primary doc.
+        hidePrint
+        findShortcuts={findOwnerPaneId === paneId}
+        onRename={renameFromMenu}
+        onDuplicate={() => void duplicateFile(file)}
+        onDelete={() => void deletePath(file.path)}
+      />
+    );
+    const header = docsPage && isMarkdown ? (
+      // Google Docs style: the big title with the menu bar beneath it (mirrors
+      // the primary's docs header; its controls ride the toolbar).
+      <div className="relative flex shrink-0 items-center justify-between gap-2 px-3 pt-1 print:hidden">
+        <div className="flex min-w-0 items-center">
+          <WorkspaceEntryIcon
+            path={file.path}
+            className="ml-1.5 mr-0.5 h-8 w-8 shrink-0 text-stone-500 [stroke-width:0.9]"
+          />
+          <div className="flex min-w-0 flex-col">
+            <div className="flex min-w-0 items-center gap-1.5 pl-1.5" title={file.path}>
+              {nameControl(true)}
+              {shareIcon}
+            </div>
+            <MarkdownMenuBar
+              className="-mt-1 px-0"
+              editor={editor}
+              readOnly={editorReadOnly || !cap.canWrite}
+              file={file}
+              projectId={projectId}
+              localWorkspace={isLocalWorkspace}
+              sidebarOpen={openLeftRail !== null}
+              hidePrint
+              onRename={renameFromMenu}
+              onDuplicate={() => void duplicateFile(file)}
+              onDelete={() => void deletePath(file.path)}
+              onToggleSidebar={toggleSidebar}
+            />
+          </div>
+        </div>
+      </div>
+    ) : (
+      <DocPaneHeader
+        path={file.path}
+        nameControl={nameControl()}
+        shareIcon={shareIcon}
+        tall={!desktopTabs}
+        onFocusFolder={focusRailFolder}
+        controls={(collapsed) => (
+          <>
+            {/* Mode picker rides the toolbar while it's shown (IDE style). */}
+            {!collapsed && !showToolbar ? modePicker : null}
+            {!collapsed && !docsPage && isMarkdown ? (
+              <button
+                type="button"
+                onClick={toggleFormatToolbar}
+                aria-pressed={showFormatToolbar}
+                aria-label="Formatting toolbar"
+                data-testid="format-toolbar-toggle"
+                className={`relative group/tip inline-flex h-7 w-7 items-center justify-center rounded hover:bg-stone-100 ${
+                  showFormatToolbar ? 'text-stone-700' : 'text-stone-400 hover:text-stone-600'
+                }`}
+              >
+                <TextAaIcon className="h-4 w-4" weight="regular" aria-hidden />
+                <IconTooltip label="Formatting toolbar" />
+              </button>
+            ) : null}
+            {actionsMenu(collapsed)}
+          </>
+        )}
+      />
+    );
+    // Same seating as the primary: IDE style seats the mode picker at the
+    // pill's right end; the Docs style folds the ⋮ in there too.
+    const toolbarTrailing = (flags: ToolbarTierFlags) =>
+      docsPage ? (
+        <>
+          {modePicker}
+          {actionsMenu(false, flags)}
+        </>
+      ) : (
+        modePicker
+      );
+    return {
+      header,
+      showToolbar,
+      toolbarFirst: desktopTabs && !docsPage,
+      toolbarTrailing,
+      readOnly: editorReadOnly,
+      toolbarReadOnly: editorReadOnly || !cap.canWrite,
+      editMode: (!cap.canWrite || mode === 'suggest' ? 'suggest' : 'edit') as 'edit' | 'suggest',
+      canResolveSuggestions: cap.canWrite,
+      forceSuggesting: !cap.canWrite,
+    };
+  };
   // The ONE live chat surface (single useSundialChat instance). Desktop mounts
   // it inside whichever pane shows the active chat tab; mobile mounts it as
   // the legacy sole chat column. `sole` = chat fills the center (arrival).
+  // Chat → markdown file. Text parts only: tool calls, reasoning and status
+  // rows are transcript chrome, not the conversation worth keeping.
+  const downloadChatTranscript = async () => {
+    const title = currentChatHeaderTitle || 'Chat';
+    const speaker = (role: string) =>
+      role === 'user' ? 'You' : currentChatHarness === 'vercel' ? 'Sunny' : CHAT_HARNESS_LABELS[currentChatHarness];
+    // The live list is only the loaded window, so a long chat would export
+    // silently truncated. Page backwards through the whole history — the route
+    // clamps `limit` to 200 per page, so one big request is NOT enough — and
+    // fall back to what's on screen if any page fails.
+    let messages: TranscriptMessage[] = sundialChat.messages;
+    if (currentChatId && !isDraftChatId(currentChatId)) {
+      try {
+        const collected: ChatMessage[] = [];
+        let before: number | null = null;
+        // Bounded: 200 pages is 40k messages, far past any real chat, and a
+        // broken cursor can't spin here forever.
+        for (let page = 0; page < 200; page += 1) {
+          const params = new URLSearchParams({ chatId: currentChatId, limit: '200' });
+          if (before !== null) params.set('beforeSequence', String(before));
+          const res = await apiFetch(`/api/workspace/messages?${params.toString()}`);
+          if (!res.ok) throw new Error(`history page failed (${res.status})`);
+          const payload = (await res.json()) as {
+            messages?: ChatMessage[];
+            page?: { hasMore?: boolean; firstSequence?: number | null };
+          };
+          const batch = payload.messages ?? [];
+          collected.unshift(...batch);
+          const first = payload.page?.firstSequence ?? null;
+          if (!payload.page?.hasMore || batch.length === 0 || first === null || first === before) break;
+          before = first;
+        }
+        // Filter the RAW rows: normalizeChatMessage rewrites every role that
+        // isn't system/assistant to 'user', so a stray `role: 'tool'` row (the
+        // session loader expects those) would reach the transcript disguised
+        // as something you said.
+        const full = conversationMessages(
+          collected.filter((row) => row.role === 'user' || row.role === 'assistant').map(normalizeChatMessage),
+        );
+        if (full.length > conversationMessages(messages).length) messages = full;
+      } catch {
+        /* keep the on-screen window */
+      }
+    }
+    downloadBlob(
+      new Blob([buildChatTranscript(title, messages, speaker)], { type: 'text/markdown;charset=utf-8' }),
+      `${sanitizeFilename(title) || 'chat'}.md`,
+    );
+  };
+
   const renderChatSurface = (sole: boolean) => (
     <WorkspaceChatPane
                     variant="space-side"
-                    composerKey={`${currentChatId ?? 'no-chat'}:${messageDraftVersion}:chat`}
+                    notice={
+                      localEngineNotice ? (
+                        <LocalEngineNotice harness={localEngineNotice} onDismiss={dismissLocalEngineNotice} />
+                      ) : undefined
+                    }
+                    composerKey={`${(currentChatId && chatLineageIdRef.current[currentChatId]) || currentChatId || 'no-chat'}:${messageDraftVersion}:chat`}
                     emptyState={
-                      isLocalWorkspace &&
-                      localEngines.defaultHarness === null &&
-                      liveChatMessagesForEdits.length === 0 &&
-                      (currentChat?.message_count ?? 0) === 0 ? (
-                        <LocalEngineOnboarding
-                          engines={{ claude: localEngines.claude, codex: localEngines.codex }}
-                          onChoose={handleChooseLocalEngine}
-                        />
-                      ) : // The chat-first landing: greeting + starter prompts. Only when
+                      // The chat-first landing: greeting + starter prompts. Only when
                       // chat IS the workspace — an empty side chat keeps its quiet
                       // transcript. Gated on message emptiness alone (live + REST
                       // copies): last_message_at is unusable here because drafts
@@ -8778,6 +12801,15 @@ export default function WorkspacePage() {
                               : CHAT_HARNESS_LABELS[currentChatHarness]
                           }
                           hasChat={Boolean(currentChatId)}
+                          onSendPrompt={(text) => void handleSendMessageRef.current(text, { standalone: true })}
+                        />
+                      ) : currentChatMessages.length === 0 &&
+                        liveChatMessagesForEdits.length === 0 &&
+                        !currentChatExternal ? (
+                        // Ordinary empty chat: one quiet suggestion chip.
+                        <EmptyChatPrompt
+                          hasChat={Boolean(currentChatId)}
+                          onSendPrompt={(text) => void handleSendMessageRef.current(text, { standalone: true })}
                         />
                       ) : undefined
                     }
@@ -8789,10 +12821,7 @@ export default function WorkspacePage() {
                           data-testid="external-session-banner"
                           className="shrink-0 border-t border-stone-200 bg-stone-50 px-4 py-3 text-xs leading-snug text-stone-600"
                         >
-                          <p>
-                            Rendered in place from {externalAgentHome(currentChatExternal)}…; this chat stays on your
-                            Mac.
-                          </p>
+                          <p>Found in {externalAgentLabel(currentChatExternal)}.</p>
                           {externalActionError ? <p className="mt-1 text-red-600">{externalActionError}</p> : null}
                           <div className="mt-2 flex items-center gap-2">
                             {/* One action: importing links the chat to the engine's own
@@ -8817,7 +12846,9 @@ export default function WorkspacePage() {
                       queueUploads(droppedFiles, 'chat', null, currentChatId);
                     }}
                     streamError={sundialChat.error}
+                    reconnecting={sundialChat.reconnecting}
                     interruptError={currentChatId ? interruptErrorByChatId[currentChatId] : undefined}
+                    modelDeclined={sundialChat.modelDeclined}
                     beforeContent={null}                    header={
                       // On mobile the chat column is sole and the top bar
                       // already carries the chat identity (assistant picker) —
@@ -8828,17 +12859,80 @@ export default function WorkspacePage() {
                       // displayed" signal for smokes (card clicks debounce).
                       // bg-white, not stone: the pane's ACTIVE chat tab is
                       // page-colored and must fuse with this row below it.
-                      <div data-chat-id={currentChat?.id} className="flex h-9 shrink-0 items-center justify-between gap-2 bg-white px-3">
-                        {/* Left: Sunny avatar, then the title. */}
-                        <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                      <div
+                        data-chat-id={currentChat?.id}
+                        // No bar above (web build / desktop with it hidden):
+                        // this header is the top row — h-11 so its controls
+                        // center on the rail/cluster line — and it clears the
+                        // pinned top-right cluster (a visible chat is always
+                        // the rightmost pane in the no-tabs layout), plus,
+                        // when sole with the rail collapsed, the floating
+                        // Home/Sidebar cluster on the left.
+                        className={`relative flex shrink-0 items-center gap-0 bg-white px-3 ${
+                          desktopTabs ? 'h-9' : 'h-11'
+                        }`}
+                        style={
+                          !desktopTabs && sole && openLeftRail === null && topbarLeftFloatWidth
+                            ? { paddingLeft: topbarLeftFloatWidth }
+                            : undefined
+                        }
+                      >
+                        {/* No × in the tabs shell: the chat IS a tab and the
+                            tab's own close is the one way to shut it. The
+                            no-tabs shell closes each window at its own
+                            top-LEFT corner (macOS convention — founder), with
+                            the ⋮ chat menu seated right of it; the identity
+                            centers on the window (absolute, so the side
+                            clusters never push it). */}
+                        {desktopTabs ? null : (
+                          <button
+                            type="button"
+                            onClick={closeActiveChatTab}
+                            aria-label="Close chat"
+                            data-testid="chat-column-close"
+                            className="relative group/tip inline-flex h-7 w-7 shrink-0 items-center justify-center rounded text-stone-400 hover:bg-stone-100 hover:text-stone-600"
+                          >
+                            <XIcon className="h-4 w-4" weight="regular" aria-hidden />
+                            <IconTooltip label="Close" />
+                          </button>
+                        )}
+                        <div
+                          className="pointer-events-none absolute inset-y-0 flex items-center justify-center overflow-hidden"
+                          // MEASURED obstruction band (the doc header's rule),
+                          // asymmetric: a symmetric 2×max reservation starved
+                          // the title of the narrow side's free space and, once
+                          // negative, spilled the avatar under the pinned
+                          // cluster. Left: the × + ⋮ cluster (~76px) plus the
+                          // floating nav when sole with the rail collapsed;
+                          // right: the pinned cluster while it overlays this
+                          // header (no-tabs, dock closed). Tabbed: just the ⋮
+                          // at the row end. The title centers in the free band
+                          // and truncates before ever reaching either cluster.
+                          style={{
+                            left: !desktopTabs
+                              ? 76 + (sole && openLeftRail === null ? topbarLeftFloatWidth : 0)
+                              : 48,
+                            right: !desktopTabs
+                              ? rightDockView === null
+                                ? Math.max(topbarRightWidth, 40) + 8
+                                : 12
+                              : 48,
+                          }}
+                        >
+                        <div className="pointer-events-auto flex w-fit min-w-0 max-w-full items-center gap-1.5">
                           {currentChatUsesGroupPresentation ? (
                             <GearSixIcon className="h-4 w-4 shrink-0 text-stone-500" weight="regular" aria-hidden />
                           ) : currentChatExternal ? (
                             <ExternalAgentBadge external={currentChatExternal} className="h-5 w-5" />
                           ) : (
                             <span className="flex h-5 w-5 shrink-0 overflow-hidden rounded-full">
+                              {/* The ONE default Sunny, never a per-chat variant
+                                  (desktop's treatment): the header is identity
+                                  chrome, and a rotating face read as a different
+                                  product each chat. Variants stay in the playful
+                                  surfaces (chat list, assistant bubbles). */}
                               <img
-                                src={(currentChat ? sunnyAvatarByChatId.get(currentChat.id) : null) ?? '/sunnies/sundial-default.png'}
+                                src={DEFAULT_SUNNY_AVATAR}
                                 alt=""
                                 className="h-full w-full object-cover"
                                 draggable={false}
@@ -8871,57 +12965,220 @@ export default function WorkspacePage() {
                               onCancel={() => setRenamingHeaderTitle(false)}
                             />
                           </div>
+                          {/* Share status rides next to the chat name — a
+                              lock while private, the audience glyphs once
+                              shared; clicking opens the share surface. Cloud
+                              chats inherit the WORKSPACE's audience (the
+                              chat link only opens once the workspace is
+                              shared); local chats share per-chat. */}
+                          {/* Not for external transcripts: their synthetic
+                              external:<agent>:<id> ids have no share scope —
+                              Import (the banner) comes first. */}
+                          {currentChatId && !isDraftChatId(currentChatId) && !currentChatExternal
+                            ? (() => {
+                                const status = isLocalWorkspace ? 'private' : shareStatus;
+                                const Icon =
+                                  status === 'public'
+                                    ? GlobeHemisphereWestIcon
+                                    : status === 'shared'
+                                      ? UsersThreeIcon
+                                      : LockSimpleIcon;
+                                const label =
+                                  status === 'public'
+                                    ? 'Shared by link'
+                                    : status === 'shared'
+                                      ? 'Shared with people'
+                                      : 'Private · share';
+                                return (
+                                  <button
+                                    type="button"
+                                    onClick={openChatShare}
+                                    aria-label="Share chat"
+                                    data-testid="chat-share-status"
+                                    data-share-status={status}
+                                    className="relative group/tip inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-stone-400 hover:bg-stone-100 hover:text-stone-600"
+                                  >
+                                    <Icon className="h-3.5 w-3.5" weight="regular" aria-hidden />
+                                    <IconTooltip label={label} side="bottom" />
+                                  </button>
+                                );
+                              })()
+                            : null}
+                          {/* Inline cadence — small muted text when this chat
+                              has a schedule; opens the Schedules panel. The
+                              header stays ONE line: no chip, no second row. */}
+                          {projectId && currentChatId && !isDraftChatId(currentChatId) ? (
+                            <ChatHeaderScheduleText
+                              projectId={projectId}
+                              chatId={currentChatId}
+                              refresh={schedulesPanelMode}
+                              onOpen={() => setSchedulesPanelMode('list')}
+                            />
+                          ) : null}
                           {currentChatHasTextTransport ? <TransportBadge label="text" /> : null}
                         </div>
-                        {/* Right: copy chat link, "+ New" (same control as the
-                            sidebar) opens the new-chat menu, then close. */}
-                        <div className="flex shrink-0 items-center gap-1">
-                          {currentChatLink ? (
-                            <button
-                              type="button"
-                              onClick={openChatShare}
-                              aria-label="Share chat"
-                              data-testid="chat-share-button"
-                              className="relative group/tip inline-flex h-7 w-7 items-center justify-center rounded text-stone-400 hover:bg-stone-100 hover:text-stone-600"
-                            >
-                              <ExportIcon className="h-4 w-4" weight="regular" aria-hidden />
-                              <IconTooltip label="Share chat" side="bottom" />
-                            </button>
+                        </div>
+                        {/* Right: the chat's ⋮ menu — mirrors the sidebar
+                            chat-row ⋮ for the open chat (founder). New chat
+                            lives in the pane strip's ＋ and the sidebar's
+                            "New chat" row, not here. */}
+                        <div
+                          ref={chatHeaderMenuWrapRef}
+                          className={`flex shrink-0 items-center gap-1 ${desktopTabs ? 'ml-auto' : ''}`}
+                        >
+                          {/* No menu for external-agent transcripts (synthetic
+                              external:<agent>:<id> ids, read-only until
+                              imported) — same suppression as their sidebar
+                              rows; the Import banner is their one action. */}
+                          {currentChat && currentChatId && !currentChatExternal ? (
+                            <>
+                              <button
+                                ref={chatHeaderMenuTriggerRef}
+                                type="button"
+                                onClick={() => setChatHeaderMenuOpen((value) => !value)}
+                                aria-label="Chat actions"
+                                aria-haspopup="menu"
+                                aria-expanded={chatHeaderMenuOpen}
+                                data-testid="chat-header-menu"
+                                className={`relative group/tip inline-flex h-7 w-7 items-center justify-center rounded hover:bg-stone-100 ${
+                                  chatHeaderMenuOpen ? 'bg-stone-100 text-stone-700' : 'text-stone-400 hover:text-stone-600'
+                                }`}
+                              >
+                                <DotsThreeVerticalIcon className="h-4 w-4" weight="bold" aria-hidden />
+                                <IconTooltip label="Chat actions" open={chatHeaderMenuOpen} />
+                              </button>
+                              <AnchoredDropdown
+                                open={chatHeaderMenuOpen}
+                                anchorRef={chatHeaderMenuTriggerRef}
+                                // The trigger sits at the window's LEFT corner
+                                // in the no-tabs shell — hug that edge there.
+                                align={desktopTabs ? 'right' : 'left'}
+                                className="w-44 rounded-xl border border-stone-200 bg-white py-1 shadow-lg"
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setChatHeaderMenuOpen(false);
+                                    setChatDetailsChatId(currentChatId);
+                                  }}
+                                  className="w-full px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
+                                >
+                                  View details
+                                </button>
+                                {/* Every edit this chat ever made, as one flat
+                                    diff (tabs-only surface). */}
+                                {!isMobile && !isDraftChatId(currentChatId) ? (
+                                  <button
+                                    type="button"
+                                    data-testid="chat-header-view-edits"
+                                    onClick={() => {
+                                      setChatHeaderMenuOpen(false);
+                                      handleOpenChatEdits(currentChatId);
+                                    }}
+                                    className="w-full px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
+                                  >
+                                    View all edits
+                                  </button>
+                                ) : null}
+                                {canWrite && !currentChatExternal && !isDraftChatId(currentChatId) ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setChatHeaderMenuOpen(false);
+                                      setRenamingHeaderTitle(true);
+                                    }}
+                                    className="w-full px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
+                                  >
+                                    Rename
+                                  </button>
+                                ) : null}
+                                {!isDraftChatId(currentChatId) ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setChatHeaderMenuOpen(false);
+                                      void handleCopyChatLink(currentChatId);
+                                    }}
+                                    className="w-full px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
+                                  >
+                                    {copiedChatLinkId === currentChatId ? 'Copied link' : 'Copy chat link'}
+                                  </button>
+                                ) : null}
+                                {canWrite && !isDraftChatId(currentChatId) ? (
+                                  <button
+                                    type="button"
+                                    data-testid="chat-header-watch-comments"
+                                    onClick={() => {
+                                      setChatHeaderMenuOpen(false);
+                                      // Whole-workspace watch; a narrower path is set by the agent.
+                                      void setCommentWatch(currentChatId, currentChat.comment_watch_path ? null : '*');
+                                    }}
+                                    className="w-full px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
+                                  >
+                                    {currentChat.comment_watch_path ? 'Stop watching comments' : 'Watch comments'}
+                                  </button>
+                                ) : null}
+                                {sundialChat.messages.length > 0 ? (
+                                  <button
+                                    type="button"
+                                    data-testid="chat-header-download-transcript"
+                                    onClick={() => {
+                                      setChatHeaderMenuOpen(false);
+                                      void downloadChatTranscript();
+                                    }}
+                                    className="w-full px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
+                                  >
+                                    Download transcript
+                                  </button>
+                                ) : null}
+                                {user?.id && !isDraftChatId(currentChatId) ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setChatHeaderMenuOpen(false);
+                                      void toggleChatPin(currentChatId, !isChatPinned(currentChat));
+                                    }}
+                                    className="w-full px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
+                                  >
+                                    {isChatPinned(currentChat) ? 'Unpin chat' : 'Pin chat'}
+                                  </button>
+                                ) : null}
+                                {canManageChat(canWrite, currentChatId)
+                                  ? (() => {
+                                      // THIS chat's archive state (the outer
+                                      // isArchived is the workspace's).
+                                      const chatArchived = Boolean(currentChat.archived_at);
+                                      return (
+                                        <>
+                                          <button
+                                            type="button"
+                                            data-testid="chat-header-archive"
+                                            onClick={() => {
+                                              setChatHeaderMenuOpen(false);
+                                              void toggleChatArchive(currentChatId, !chatArchived);
+                                            }}
+                                            className="w-full px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
+                                          >
+                                            {chatArchived ? 'Unarchive chat' : 'Archive chat'}
+                                          </button>
+                                          <button
+                                            type="button"
+                                            data-testid="chat-header-delete"
+                                            onClick={() => {
+                                              setChatHeaderMenuOpen(false);
+                                              setChatPendingDelete({ id: currentChatId, title: currentChat.title ?? null });
+                                            }}
+                                            className="w-full px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50"
+                                          >
+                                            Delete chat
+                                          </button>
+                                        </>
+                                      );
+                                    })()
+                                  : null}
+                              </AnchoredDropdown>
+                            </>
                           ) : null}
-                          <div className="relative" ref={chatHeaderPickerRef}>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                if (showAssistantPicker) {
-                                  closeAssistantPicker();
-                                } else {
-                                  openAssistantPickerMenu({ keepMode: true });
-                                }
-                              }}
-                              aria-haspopup="menu"
-                              aria-expanded={showAssistantPicker}
-                              aria-label="New chat"
-                              data-testid="chat-header-new"
-                              className="relative group/tip inline-flex h-7 w-7 items-center justify-center rounded text-stone-400 hover:bg-stone-100 hover:text-stone-600"
-                            >
-                              <PlusIcon className="h-4 w-4" weight="bold" aria-hidden />
-                              {/* Suppress the hover tooltip while the menu is open —
-                                  the click keeps the button hovered, so the dark
-                                  bubble would otherwise sit behind the dropdown. */}
-                              <IconTooltip label="New chat" open={showAssistantPicker} />
-                            </button>
-                            {showAssistantPicker ? renderAssistantPickerMenu({ align: 'right', keepMode: true }) : null}
-                          </div>
-                          <button
-                            type="button"
-                            onClick={closeActiveChatTab}
-                            aria-label="Close chat"
-                            data-testid="chat-column-close"
-                            className="relative group/tip inline-flex h-7 w-7 shrink-0 items-center justify-center rounded text-stone-400 hover:bg-stone-100 hover:text-stone-600"
-                          >
-                            <XIcon className="h-4 w-4" weight="bold" aria-hidden />
-                            <IconTooltip label="Close" />
-                          </button>
                         </div>
                       </div>
                       )
@@ -8931,7 +13188,17 @@ export default function WorkspacePage() {
                       assistantGreeting,
                       showGreeting: Boolean(assistantGreeting && !currentChat?.last_message_at && currentChatMessages.length === 0),
                       messages: sundialChat.messages,
-                      showWorkingIndicator,
+                      // A send/start failure means NO run exists, and a hard
+                      // stream-open failure means this window can't watch one
+                      // — showing "Thinking…" beside either quiet notice
+                      // would contradict it (Codex rounds 12 + 21).
+                      showWorkingIndicator:
+                        showWorkingIndicator &&
+                        !(
+                          sundialChat.error &&
+                          (isSendStartFailure(sundialChat.error) ||
+                            isHardStreamOpenFailure(sundialChat.error))
+                        ),
                       turnLinkBase: currentChatId && typeof window !== 'undefined'
                         ? `${window.location.origin}${buildWorkspaceChatPath(workspaceRouteId, currentChatId)}`
                         : undefined,
@@ -8941,22 +13208,31 @@ export default function WorkspacePage() {
                       isStreaming:
                         sundialChat.status === 'streaming' ||
                         sundialChat.status === 'submitted',
-                      latestTurnJustCompleted:
-                        completedRunChatId !== null && completedRunChatId === currentChatId,
-                      onOpenDiffFile: isMobile ? undefined : handleOpenDiffFile,
+                      onOpenTurnDiff: isMobile ? undefined : handleOpenTurnDiff,
                       knownFilePaths: mentionableFilePaths,
                       workspaceId: projectId,
                       onOpenWikiFile: handleOpenEditedFileInline,
+                      onOpenEditedFile: handleOpenFileFromEditCard,
+                      attachmentHref: localAttachmentHref,
                     }}
                     composerProps={{
                       chatId: currentChatId,
                       showGroupChatUi: currentChatUsesGroupPresentation,
                       hasAssistant: Boolean(currentChatId),
+                      // The brain has no per-path rails yet — it 403s scoped
+                      // guests server-side, so disable the composer with a
+                      // clear notice instead of a dead send. Same for ANY
+                      // read-only visitor (public view links, chat-share
+                      // mirrors): /api/workspace/messages 403s them. Gated on
+                      // filesLoaded — canWrite optimistically starts true.
+                      disabledNotice: isScopedGuest || (!canWrite && filesLoaded)
+                        ? 'Chatting with Sunny isn’t available for shared-access guests yet'
+                        : null,
                       initialValue: currentChatId ? (messageInputByChatIdRef.current[currentChatId] ?? '') : '',
                       textareaRef: chatInputRef,
                       shouldFocus: shouldFocusChatInput,
                       onFocusHandled: () => setShouldFocusChatInput(false),
-                      onDraftChange: setStoredMessageDraft,
+                      onDraftChange: handleComposerDraftChange,
                       onAction: handleChatAction,
                       attachments: currentAttachments,
                       onRemoveAttachment: (attachment) => {
@@ -8981,6 +13257,22 @@ export default function WorkspacePage() {
                       // effectiveOpenFilePath can go stale. Display-only; what's
                       // sent to the agent is unchanged.
                       openFilePath: activeWorkspaceFile ? effectiveOpenFilePath : null,
+                      // "New chat in this folder" scopes the chat server-side
+                      // (chats.folder_scope); the composer shows it as a chip so
+                      // the scope is visible without living in the draft text.
+                      folderScope: currentChat?.folder_scope ?? null,
+                      // Sunny listens to new comments on this path — the chip
+                      // makes the standing watch visible (and clearable).
+                      commentWatchPath: currentChat?.comment_watch_path ?? null,
+                      onClearCommentWatch: currentChatId
+                        ? () => void setCommentWatch(currentChatId, null)
+                        : undefined,
+                      // `/watch [all]` and `/unwatch` in the composer. A draft
+                      // chat has no row to PATCH yet, so it gets no handler.
+                      onCommentWatchCommand:
+                        currentChatId && !isDraftChatId(currentChatId)
+                          ? (path: string | null) => void setCommentWatch(currentChatId, path)
+                          : undefined,
                       mentionableFiles,
                       connectedApps,
                       connectedAppsLoading,
@@ -9006,6 +13298,7 @@ export default function WorkspacePage() {
                       harnessLocked:
                         isLocalWorkspace &&
                         (liveChatMessagesForEdits.length > 0 || (currentChat?.message_count ?? 0) > 0),
+                      onNewChatWithHarness: canWrite ? startChatWithHarness : undefined,
                       models,
                       modelsLoading,
                       modelsEmptyReason,
@@ -9021,96 +13314,167 @@ export default function WorkspacePage() {
                   />
   );
 
-  const newTabLauncher = canWrite ? (
-    <div className="relative flex items-center">
-      <button
-        ref={newTabTriggerRef}
-        type="button"
-        onClick={() => setShowNewTabMenu((open) => !open)}
-        aria-label="New tab"
-        aria-haspopup="menu"
-        aria-expanded={showNewTabMenu}
-        data-testid="new-tab-launcher"
-        className="relative group/tip ml-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center self-center rounded text-stone-400 hover:bg-stone-200/60 hover:text-stone-600"
-      >
-        <PlusIcon className="h-4 w-4" weight="bold" aria-hidden />
-        <IconTooltip label="New tab" open={showNewTabMenu} />
-      </button>
-      <AnchoredDropdown
-        open={showNewTabMenu}
-        anchorRef={newTabTriggerRef}
-        align="left"
-        className="w-44 rounded-lg border border-stone-200 bg-white py-1 text-xs shadow-lg"
-      >
-        <button
-          type="button"
-          onClick={() => {
-            setShowNewTabMenu(false);
-            // The draft input lives in the files tree — reveal it first. The
-            // launcher means "new TAB": the committed file appends beside the
-            // active tab instead of replacing it.
-            draftAppendTabRef.current = true;
-            setOpenLeftRail('project');
-            setSidebarSections((prev) => expandSection(prev, 'files'));
-            handleCreateFile();
-          }}
-          className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 hover:bg-stone-50"
-        >
-          <FilePlusIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
-          New file
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            setShowNewTabMenu(false);
-            void startAssistantChat(null, null, { forceNew: true, keepMode: true, appendTab: true });
-          }}
-          className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 hover:bg-stone-50"
-        >
-          <ChatTeardropIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
-          New chat
-        </button>
-      </AnchoredDropdown>
+  // ＋ opens the New-tab chooser in ITS OWN pane — the same surface as ⌘T
+  // (Obsidian: every new-tab affordance lands on the "what goes here?" tab).
+  // Shown to read-only visitors too: the panel itself gates its picks, and
+  // "Open file" is always available.
+  const renderNewTabLauncher = (paneId: string) => (
+    <button
+      type="button"
+      onClick={() => {
+        lastFocusedPaneIdRef.current = paneId;
+        setEditorPanes((prev) => openPaneTab(prev, paneId, LAUNCHER_TAB));
+      }}
+      aria-label="New tab"
+      data-testid="new-tab-launcher"
+      className="relative group/tip ml-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center self-center rounded text-stone-400 hover:bg-stone-200/60 hover:text-stone-600"
+    >
+      <PlusIcon className="h-4 w-4" weight="bold" aria-hidden />
+      <IconTooltip label="New tab" />
+    </button>
+  );
+
+  // The ⌘T "New tab" body (Obsidian-style): a centered chooser for what fills
+  // this tab. Every pick routes through a pane-model path that CONSUMES the
+  // active launcher tab in place (openTab/replaceActiveTab), so the chosen
+  // thing lands in this tab, not beside it.
+  const launcherOption = (
+    testId: string,
+    label: string,
+    onPick: () => void,
+    shortcut?: string,
+  ) => (
+    <button
+      type="button"
+      data-testid={testId}
+      onClick={onPick}
+      className="flex items-center gap-2 text-[15px] text-stone-500 transition-colors hover:text-stone-800"
+    >
+      {label}
+      {shortcut ? (
+        <span className="rounded border border-stone-200 px-1 py-px text-[11px] text-stone-400">
+          {shortcut}
+        </span>
+      ) : null}
+    </button>
+  );
+  const renderLauncherPanel = (paneId: string) => (
+    <div
+      data-testid="new-tab-panel"
+      className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4"
+    >
+      {/* Gated on the ACTUAL create capability for this pane's folder context
+          — path-share editors have folder edit grants without workspace-wide
+          canWrite, and createFileAndOpen would let them create here. */}
+      {canUploadToFolder(createParentForPane(editorPanes.find((p) => p.id === paneId)))
+        ? launcherOption('new-tab-create-file', 'Create new file', () => void createFileAndOpen(paneId), '⌘N')
+        : null}
+      {launcherOption(
+        'new-tab-open-file',
+        'Open file',
+        () => {
+          setPaletteTargetPaneId(paneId);
+          setCommandPaletteOpen(true);
+        },
+        '⌘O',
+      )}
+      {canWrite
+        ? launcherOption('new-tab-new-chat', 'New chat', () =>
+            void startAssistantChat(null, null, { forceNew: true, keepMode: true, appendTab: true, paneId }),
+          )
+        : null}
+      {/* Same gating as the palette action: local workspaces ARE the local
+          agent surface — nothing to connect. */}
+      {canWrite && !isLocalWorkspace
+        ? launcherOption('new-tab-connect-agent', 'Connect local agent', () => void openLocalAgentModal())
+        : null}
     </div>
-  ) : null;
+  );
+
+  // "This chat's edits" as a tab: ONE flat diff on white — the same look as the
+  // turn diff, chat-wide. The timeline (rows, filters, gray dock styling) is a
+  // right-dock tool only; center surfaces read as documents (2026-08-04
+  // founder direction).
+  // No-tabs shell: these surfaces carry their own × (no strip to close from).
+  const closeSpecialSurface = (tab: string) =>
+    void applyPaneTransition((prev) => {
+      const pane = prev.find((p) => p.active === tab);
+      return pane ? closePaneTab(prev, pane.id, tab) : { panes: prev };
+    });
+  // The floating Home/Sidebar cluster sits over the LEFTMOST pane's top-left
+  // corner when the rail is collapsed — a surface whose × lives there shifts
+  // past it, same measure the chat header and file view use.
+  const leftmostPaneInset = openLeftRail === null ? topbarLeftFloatWidth : 0;
+
+  const renderChatEditsSurface = (tab: string, headerInsetLeft = 0) => {
+    const scopedChatId = reviewChatIdOfTab(tab);
+    if (!scopedChatId) return null; // unscoped review tabs are no longer creatable
+    return (
+      <ChatDiffPanel
+        key={tab}
+        chatId={scopedChatId}
+        workspaceId={cloudProjectId}
+        onOpenFile={handleOpenFileFromEditCard}
+        onClose={desktopTabs ? undefined : () => closeSpecialSurface(tab)}
+        headerInsetLeft={headerInsetLeft}
+        refreshToken={pendingEditsInvalidationToken}
+      />
+    );
+  };
+
+  // One turn's edits as a tab — the same card the chat transcript renders, so
+  // the two surfaces can never drift in styling.
+  const renderDiffSurface = (tab: string, headerInsetLeft = 0) => {
+    const assistantMessageId = diffIdOfTab(tab);
+    if (!assistantMessageId) return null;
+    return (
+      <TurnDiffPanel
+        key={tab}
+        assistantMessageId={assistantMessageId}
+        workspaceId={cloudProjectId}
+        onOpenFile={handleOpenFileFromEditCard}
+        onClose={desktopTabs ? undefined : () => closeSpecialSurface(tab)}
+        headerInsetLeft={headerInsetLeft}
+      />
+    );
+  };
 
   // Home + sidebar toggle live in the rail's top row while it's open, and at
   // the left end of the single top bar while it's collapsed — one bar total.
+  // The desktop app's one home is /local (local projects + cloud workspaces
+  // together) — cloud workspaces opened in the shell go back there too.
   const shellNavControls = (
-    <>
-      {/* The desktop app's one home is /local (local projects + cloud
-          workspaces together) — cloud workspaces opened in the shell
-          go back there too, not to the web dashboard. */}
-      <Link
-        href={isLocalWorkspace || isDesktopApp ? '/local' : '/dashboard'}
-        onClick={() => persistLayoutConfig()}
-        aria-label="Home"
-        data-testid="topbar-home"
-        // ml-1.5: founder-requested ~6px nudge right, in both the rail top
-        // row and the collapsed-rail bar (additive to the traffic-light pad).
-        className="relative group/tip ml-1.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-stone-400 hover:bg-stone-100 hover:text-stone-600"
-      >
-        <HouseIcon className="h-5 w-5" weight="regular" aria-hidden />
-        <IconTooltip label="Home" />
-      </Link>
-      <button
-        type="button"
-        onClick={toggleSidebar}
-        aria-pressed={openLeftRail !== null}
-        aria-label="Toggle sidebar"
-        data-testid="topbar-sidebar-toggle"
-        className={`relative group/tip inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg hover:bg-stone-100 ${
-          openLeftRail !== null ? 'bg-stone-100 text-stone-700' : 'text-stone-400 hover:text-stone-600'
-        }`}
-      >
-        <SidebarSimpleIcon
-          className="h-5 w-5"
-          weight={openLeftRail !== null ? 'fill' : 'regular'}
-          aria-hidden
-        />
-        <IconTooltip label="Sidebar" />
-      </button>
-    </>
+    <ShellNavControls
+      homeHref={isLocalWorkspace || isDesktopApp ? '/local' : '/dashboard'}
+      onNavigateHome={() => persistLayoutConfig()}
+      sidebarOpen={openLeftRail !== null}
+      onToggleSidebar={toggleSidebar}
+    />
+  );
+  // The collapsed-rail FLOAT in the Docs style: the sidebar toggle alone.
+  // Google Docs has one mark in that corner, and even Home read as app
+  // chrome floating over the page (founder) — Home rides the rail the
+  // toggle reveals. The rail's own top row and the tabs strip keep the
+  // full pair; the IDE float does too.
+  const floatNavControls = panelViewActive ? (
+    // Embedded panel: Home keeps its top corner (founder 2026-08-26); the
+    // sidebar toggle stays shed — Files in the bottom switcher opens the rail.
+    <ShellNavControls
+      homeHref={isLocalWorkspace || isDesktopApp ? '/local' : '/dashboard'}
+      sidebarOpen={openLeftRail !== null}
+      onToggleSidebar={toggleSidebar}
+      homeOnly
+    />
+  ) : docsPage ? (
+    <ShellNavControls
+      homeHref={isLocalWorkspace || isDesktopApp ? '/local' : '/dashboard'}
+      onNavigateHome={() => persistLayoutConfig()}
+      sidebarOpen={openLeftRail !== null}
+      onToggleSidebar={toggleSidebar}
+      minimal
+    />
+  ) : (
+    shellNavControls
   );
 
   // The rail's top row carries Home + the sidebar toggle (the rail reaches
@@ -9119,102 +13483,135 @@ export default function WorkspacePage() {
   // into the Files section header (founder: the project name + picker sit
   // where the "Files" label was).
   const workspaceTitleControl = (
-    <div className="border-b border-stone-200">
-    <div
-      className={`flex h-11 min-w-0 items-center gap-1.5 px-3 ${isDesktopApp ? 'pl-[72px]' : ''}`}
-      {...(isDesktopApp ? { 'data-tauri-drag-region': '' } : {})}
-    >
-              {shellNavControls}
-            </div>
-    <div className="px-2 pb-2">
-      <button
-        type="button"
-        onClick={() => setCommandPaletteOpen(true)}
-        data-testid="sidebar-search-bar"
-        className="flex w-full items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 py-1.5 text-left text-xs text-stone-400 shadow-[0_1px_2px_rgba(28,25,23,0.04)] transition-colors hover:border-stone-300 hover:text-stone-500"
-      >
-        <MagnifyingGlassIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
-        <span className="min-w-0 flex-1 truncate">Search</span>
-        <kbd className="rounded border border-stone-200 bg-stone-50 px-1 py-px font-sans text-[10px] text-stone-400">⌘K</kbd>
-      </button>
-    </div>
-    </div>
+    <SidebarTopChrome
+      navControls={shellNavControls}
+      desktopPad={isDesktopApp}
+      onOpenSearch={() => {
+        setPaletteTargetPaneId(null);
+        setCommandPaletteOpen(true);
+      }}
+    />
   );
 
-  // The Files-section header slot — the wireframe's "Workspace" title (ws
-  // glyph + the word "Workspace") with the switcher caret kept on the row.
-  // Double-click still renames the underlying project title; the current
-  // project name lives in the tooltip and the switcher menu.
+  // The Files-section header slot: the root's identity — icon + name, no
+  // dropdown (Home in the top chrome is the way back). Icon says what the
+  // root IS: a stack for multi-folder workspaces, the local/cloud origin
+  // glyph when the root is a single folder. Double-click still renames;
+  // right-click opens the old workspace menu (rename / new / archive…).
+  const primaryRootName = localRoots.find((entry) => !entry.prefix)?.name ?? null;
+  const hasExtraRoots = localRoots.some((entry) => entry.prefix);
+  const workspaceLabel = workspaceTitleLabel(projectTitle, primaryRootName, hasExtraRoots);
+  // The root's kind glyph — shared by the rail identity header and the
+  // mobile/collapsed headers so every screen size says the same thing.
+  const workspaceKindIcon = hasExtraRoots ? (
+    <StackSimpleIcon className="h-3.5 w-3.5 shrink-0 text-stone-400" weight="regular" aria-hidden />
+  ) : isLocalWorkspace ? (
+    <LocalRootGlyph className="h-3.5 w-3.5 shrink-0 text-stone-400" />
+  ) : (
+    <CloudIcon className="h-3.5 w-3.5 shrink-0 text-stone-400" weight="regular" aria-hidden />
+  );
+  // pl-1: the section header sits at px-3 (12px) while tree rows start at
+  // 16px (px-2 scroller + px-2 row) — this lines the icon up with the rows.
   const workspaceIdentityHeader = (
-    <div className="relative flex min-w-0 flex-1 items-center gap-1" ref={workspaceSwitcherRef}>
-      <div className="flex min-w-0 items-center gap-1" data-workspace-switcher-trigger>
-        {isEditingTitle && canWrite ? (
-          <input
-            autoFocus
-            size={Math.max(editingTitleValue.length + 1, 2)}
-            className="min-w-0 max-w-[240px] bg-transparent text-[13px] font-semibold text-stone-700 outline-none"
-            value={editingTitleValue}
-            onChange={(e) => setEditingTitleValue(e.target.value)}
-            onBlur={() => saveProjectTitle(editingTitleValue)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                saveProjectTitle(editingTitleValue);
-              } else if (e.key === 'Escape') {
-                setIsEditingTitle(false);
-              }
-            }}
-            maxLength={200}
-          />
-        ) : (
-          <button
-            type="button"
-            className={`flex min-w-0 items-center gap-1.5 text-left text-[13px] font-semibold text-stone-700 ${canWrite ? 'cursor-pointer hover:text-stone-900' : 'cursor-default'}`}
-            onClick={toggleWorkspaceSwitcher}
-            onDoubleClick={startProjectTitleEdit}
-            title={
-              canWrite
-                ? `${projectTitle} — click to open the workspace menu. Double-click to rename.`
-                : projectTitle
+    <div
+      className="flex min-w-0 flex-1 items-center gap-1 pl-1"
+      ref={workspaceSwitcherRef}
+      data-workspace-switcher-trigger
+      onContextMenu={(e) => {
+        e.preventDefault();
+        toggleWorkspaceSwitcher();
+      }}
+    >
+      {isEditingTitle && canWrite ? (
+        <input
+          autoFocus
+          size={Math.max(editingTitleValue.length + 1, 2)}
+          className="min-w-0 max-w-[240px] bg-transparent text-[13px] font-semibold text-stone-700 outline-none"
+          value={editingTitleValue}
+          onClick={(e) => e.stopPropagation()}
+          onChange={(e) => setEditingTitleValue(e.target.value)}
+          onBlur={() => saveProjectTitle(editingTitleValue)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              saveProjectTitle(editingTitleValue);
+            } else if (e.key === 'Escape') {
+              setIsEditingTitle(false);
             }
-          >
-            <WorkspaceRootGlyph className="h-3.5 w-3.5 shrink-0 text-stone-400" />
-            <span className="truncate">Workspace</span>
-          </button>
-        )}
-        {archivedTag}
-        <button
-          aria-label="Switch workspace"
-          className={`relative group/tip shrink-0 cursor-pointer rounded p-0.5 hover:bg-stone-100 ${isEditingTitle ? 'invisible' : ''}`}
-          onClick={toggleWorkspaceSwitcher}
+          }}
+          maxLength={200}
+        />
+      ) : (
+        <span
+          className="flex min-w-0 items-center gap-1.5 text-left text-[13px] font-semibold text-stone-700"
+          // The title is identity, not blank header area — clicking it must
+          // not collapse the section (click renames, right-click = menu).
+          onClick={(e) => {
+            e.stopPropagation();
+            startProjectTitleEdit();
+          }}
+          title={
+            canWrite
+              ? `${workspaceLabel}. Click to rename, right-click for options.`
+              : workspaceLabel
+          }
         >
-          <CaretDownIcon
-            className={`h-3 w-3 text-stone-400 transition-transform ${showWorkspaceSwitcher ? 'rotate-180' : ''}`}
-            weight="bold"
-            aria-hidden
-          />
-          <IconTooltip label="Switch workspace" open={showWorkspaceSwitcher} />
-        </button>
-      </div>
-      {workspaceSwitcherMenu}
+          <span className="relative flex shrink-0 items-center">
+            {workspaceKindIcon}
+            <IconTooltip
+              label={
+                hasExtraRoots
+                  ? 'Workspace · multiple folders'
+                  : isLocalWorkspace
+                    ? 'Local folder · on this device'
+                    : 'Cloud workspace'
+              }
+              align="left"
+            />
+          </span>
+          <span className="truncate" data-testid="workspace-identity-label">
+            {workspaceLabel}
+          </span>
+        </span>
+      )}
+      {archivedTag}
+      {/* Clicks inside the (right-click) switcher menu bubble through the
+          React tree — they must not collapse the section. */}
+      <span onClick={(e) => e.stopPropagation()}>{workspaceSwitcherMenu}</span>
     </div>
   );
 
   // Right end of the single top bar (collaborators · right dock · Share) —
-  // pinned at the window's absolute top-right (founder: Share always stays
-  // there), independent of pane count, dock state, or special views.
-  // The strip rows beneath reserve its measured width as right padding.
+  // pinned at the window's absolute top-right, independent of pane count,
+  // dock state, or special views. The strip rows beneath reserve its
+  // measured width as right padding.
   const topBarRightControls = (
     <div
       ref={topbarRightRef}
-      className="absolute right-0 top-0 z-30 flex h-11 shrink-0 items-center gap-3 border-b border-stone-200/60 bg-stone-100/70 pl-2 pr-3 print:hidden"
+      // Bar chrome (border + fill) only while a bar row runs beneath it — the
+      // primary strip, or the dock's icon strip. With no bar (web build /
+      // desktop with it hidden, dock closed) the cluster floats bare over the
+      // header rows, which reserve its measured width as right padding.
+      className={`absolute right-0 top-0 z-30 flex h-11 shrink-0 items-center gap-3 pl-2 pr-3 print:hidden ${
+        desktopTabs || rightDockView !== null ? 'border-b border-stone-200/60 bg-stone-100/70' : ''
+      } ${
+        // During a tab drag this z-30 cluster otherwise swallows dragover in
+        // the top-right corner (it has no drag handlers), flipping the cursor
+        // to no-drop and killing the pane drop preview around the right-panel
+        // icon. pointer-events-none lets the drag fall through to the strip
+        // and overlay beneath — and keeps its tooltips from popping mid-drag.
+        editorTabDragActive ? 'pointer-events-none' : ''
+      }`}
       data-testid="topbar-right"
       {...(isDesktopApp ? { 'data-tauri-drag-region': '' } : {})}
     >
               {showOffline && (
                 <span data-testid="workspace-offline-banner" className="text-xs font-medium text-stone-900">Offline</span>
               )}
-              {/* Collaborators + Assistants */}
+              {/* Collaborators + Assistants. Skipped entirely when empty — an
+                  empty stack still costs a gap-3 slot, which the doc header
+                  mirrors as dead space right of its controls. */}
+              {visibleCollaborators.length || activeAssistantBubbles.length ? (
               <div className="flex -space-x-2">
                 {/* Human collaborators */}
                 {visibleCollaborators.map((c, i) => {
@@ -9255,6 +13652,9 @@ export default function WorkspacePage() {
                       label={label}
                       color={c.color}
                       size="md"
+                      // Jump to this collaborator: open their broadcast file
+                      // and center their live caret.
+                      onClick={() => jumpToCollaborator(c)}
                     />
                   );
                 })}
@@ -9288,6 +13688,7 @@ export default function WorkspacePage() {
                   );
                 })}
               </div>
+              ) : null}
 
               {/* Per-document controls (mode picker, comments toggle, Share
                   file, raw toggle, toolbar toggle) moved into the document
@@ -9299,6 +13700,40 @@ export default function WorkspacePage() {
                   dock's own icon strip (founder: buttons that change the
                   panel belong ON the panel). */}
               {!isMobile ? (
+                <div className="flex items-center gap-1">
+                  {/* One scale everywhere (h-8 / h-5): this cluster mirrors
+                      the top-LEFT sidebar toggle, and the two panel icons at
+                      different sizes read as a mistake (founder, 2026-08-05)
+                      — items-center keeps the row's centers aligned even
+                      where the neighbors are h-7. */}
+                  {/* Comments toggle — left of the right-panel toggle
+                      (Belinda, 2026-08-07: Google Docs' comment corner).
+                      Same zero-comments gate as the mobile copy. */}
+                  {activeFileCommentCount > 0 ? (
+                    <button
+                      type="button"
+                      onClick={toggleCommentLane}
+                      aria-pressed={commentsLaneToggled}
+                      aria-label="Comments"
+                      data-testid="doc-comments-toggle"
+                      className={`relative group/tip inline-flex h-8 w-8 items-center justify-center rounded-lg hover:bg-stone-100 ${
+                        commentsLaneToggled ? 'bg-stone-100 text-stone-700' : 'text-stone-400 hover:text-stone-600'
+                      }`}
+                    >
+                      <ChatTextIcon
+                        className="h-5 w-5"
+                        weight={commentsLaneToggled ? 'fill' : 'regular'}
+                        aria-hidden
+                      />
+                      {commentBadgeCount > 0 ? (
+                        <span className="absolute -right-0.5 -top-0.5 inline-flex h-3.5 min-w-3.5 items-center justify-center rounded-full border border-white bg-[#e7c49e] px-1 text-[9px] font-semibold text-[#634a31]">
+                          {Math.min(commentBadgeCount, 9)}
+                        </span>
+                      ) : null}
+                      <IconTooltip label="Comments" />
+                    </button>
+                  ) : null}
+                  {panelViewActive ? null : (
                   <button
                     type="button"
                     data-testid="right-dock-toggle"
@@ -9311,54 +13746,111 @@ export default function WorkspacePage() {
                       rightDockView !== null ? 'bg-stone-100 text-stone-700' : 'text-stone-400 hover:text-stone-600'
                     }`}
                   >
-                    <SidebarSimpleIcon className="h-5 w-5 -scale-x-100" weight="regular" aria-hidden />
+                    <SidebarSimpleIcon
+                      className="h-5 w-5 -scale-x-100"
+                      weight="regular"
+                      aria-hidden
+                    />
                     <IconTooltip label="Toggle right panel" />
                   </button>
+                  )}
+                </div>
               ) : null}
-
-              {/* Share */}
-              {isLocalWorkspace && localShares.some((share) => share.enabled) && (
-                <button
-                  type="button"
-                  onClick={openShare}
-                  className="rounded-full bg-sky-500/10 px-2.5 py-0.5 text-xs text-sky-700 hover:bg-sky-500/20"
-                  data-testid="share-status"
-                  title="Live-syncing to the cloud — click to manage"
-                >
-                  {localShares.filter((share) => share.enabled).length} shared ·{' '}
-                  {localShares.reduce((n, share) => n + share.bridgedFiles, 0)} files syncing
-                </button>
-              )}
-              {canShowShareControls && (
-                <button
-                  type="button"
-                  onClick={openShare}
-                  aria-label="Share"
-                  className="bg-stone-900 text-white px-2.5 lg:px-4 py-1.5 rounded-lg text-sm font-medium inline-flex items-center gap-2 cursor-pointer"
-                >
-                  <WorkspaceShareStatusIcon status={shareStatus} className="w-4 h-4" />
-                  <span className="hidden lg:inline">Share</span>
-                </button>
-              )}
+              {/* Share (back after PR #1038 — founder review 2026-08-04):
+                  scope picked on the way in — active file, its folder, or the
+                  workspace — each routing to the modal that owns that scope.
+                  Scoped ?pshare= guests get no button: both share endpoints
+                  403 for them (same gate as the doc header's share). */}
+              {canShowShareControls && !isScopedGuest ? (
+                <TopbarShareButton
+                  shareStatus={isLocalWorkspace ? null : shareStatus}
+                  // Scopes follow the FOCUSED pane's on-screen file (null on
+                  // chat-only surfaces, the commit diff view, and background
+                  // tabs → plain workspace share). See topbarSharePlan.
+                  fileName={topbarSharePlan.fileName}
+                  folderPath={topbarSharePlan.parentDir}
+                  onShareFile={topbarSharePlan.onShareFile}
+                  onShareFolder={topbarSharePlan.onShareFolder}
+                  onShareWorkspace={openShare}
+                />
+              ) : null}
     </div>
   );
+
+  // THE Docs doc-header render condition (the header JSX gates on this too —
+  // one source, so the float suppression below can't drift from it). Header
+  // showing = the header row seats the collapsed-rail sidebar toggle itself
+  // (in-flow, leading the file glyph), so the window-corner float stays
+  // suppressed.
+  const docsHeaderOwnsTopLeft =
+    !isMobile &&
+    docsPage &&
+    activeIsMarkdown &&
+    Boolean(activeWorkspaceFile) &&
+    !primaryChatActive &&
+    !primaryLauncherActive &&
+    !primaryReviewActive &&
+    !primaryDiffActive;
+  // No-bar layout with the rail collapsed: Home + the sidebar toggle would
+  // have no home (their bar seat is gone), so they float bare at the window's
+  // top-left — the mirror of the pinned top-right cluster. Keeps the macOS
+  // traffic-light clearance + a drag strip in the desktop shell.
+  const topBarLeftFloat = (
+    <div
+      ref={topbarLeftFloatRef}
+      data-testid="topbar-float-nav"
+      className={`absolute left-0 top-0 z-30 flex h-11 items-center gap-1.5 pr-2 print:hidden ${
+        isDesktopApp ? 'pl-[calc(72px/var(--sd-zoom,1))]' : 'pl-2'
+      }`}
+      {...(isDesktopApp ? { 'data-tauri-drag-region': '' } : {})}
+    >
+      {floatNavControls}
+    </div>
+  );
+
+  // First visible paint waits for the pane-snapshot restore too (one effect
+  // pass after filesLoaded): the frame that fades in already shows the right
+  // pane owner — restored tabs, or the chat-first arrival — never a
+  // preselected document that a later commit swaps out.
+  const workspaceShellReady =
+    layoutConfigReady && filesLoaded && (!projectId || panesRestoredFor === projectId);
+  // `/new` first paints the generic route skeleton. Once the workspace shell
+  // itself is ready, keep the SAME creation card over its real editor skeleton
+  // until the seeded TeX Y.Doc has hydrated — no spinner-only gap between the
+  // two loading stages.
+  const onboardingWorkspaceLoading =
+    onboardingTexIntent &&
+    workspaceFileByPath.has(WELCOME_TEX_PATH) &&
+    (activeWorkspaceFile?.path !== WELCOME_TEX_PATH || !fileContentReady);
 
   return (
     // Data-plane context: local workspaces route deep components' /api/workspace
     // reads (Review panel, compare, labels) through the sidecar-emulated fetch.
     <ApiFetchProvider value={apiFetch}>
-    {!(layoutConfigReady && filesLoaded) && (
+    {!workspaceShellReady && (
       // The workspace below stays opacity-0 until the file list arrives — on a
       // big local folder that walk takes a while, so show progress instead of
       // a blank white page.
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-white" role="status" data-testid="workspace-loading-overlay">
-        <div className="flex flex-col items-center gap-3">
-          <span className="h-6 w-6 animate-spin rounded-full border-2 border-stone-200 border-t-stone-500" aria-hidden />
-          <span className="text-sm text-stone-400">Loading project…</span>
-        </div>
+      <div className="fixed inset-0 z-50" data-testid="workspace-loading-overlay">
+        {onboardingTexIntent ? (
+          <WorkspaceRouteLoading creating />
+        ) : (
+          <div className="flex h-full items-center justify-center bg-white" role="status">
+            <div className="flex flex-col items-center gap-3">
+              <span className="h-6 w-6 animate-spin rounded-full border-2 border-stone-200 border-t-stone-500" aria-hidden />
+              <span className="text-sm text-stone-400">Loading project…</span>
+            </div>
+          </div>
+        )}
       </div>
     )}
-    <div className={`h-screen bg-white flex flex-col transition-opacity duration-300 ${layoutConfigReady && filesLoaded ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
+    {workspaceShellReady && onboardingWorkspaceLoading ? <WorkspaceCreationOverlay fixed /> : null}
+    {/* h-dvh, not h-screen: 100vh on iOS Safari is the LARGE viewport (URL
+        bar collapsed), so with the toolbars visible the app laid out ~100px
+        taller than the visible area — the composer sat behind Safari's bottom
+        bar, and once iOS scrolled the window (keyboard focus) the top bar
+        went off-screen instead. dvh tracks the visible viewport. */}
+    <div className={`h-dvh bg-white flex flex-col transition-opacity duration-300 ${workspaceShellReady ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
       <div className="flex-1 flex overflow-hidden">
         {/* Main content area */}
         <div
@@ -9369,48 +13861,35 @@ export default function WorkspacePage() {
         >
           {/* Main header */}
           {isMobile ? (
-          <div className="h-12 px-3 flex items-center justify-between shrink-0">
+          // In the macOS shell this bar is the topmost chrome at narrow
+          // widths (the desktop tab strip is !isMobile-gated), so it takes
+          // over the traffic-light inset and the window drag region. The
+          // attribute rides on the left group too: Tauri only starts a drag
+          // when the mousedown target itself carries it, and the flex-1
+          // group owns the empty stretch beside the title.
+          <div
+            className={`h-12 px-3 flex items-center justify-between shrink-0 ${isDesktopApp ? 'pl-[calc(72px/var(--sd-zoom,1))]' : ''}`}
+            {...(isDesktopApp ? { 'data-tauri-drag-region': '' } : {})}
+          >
             <>
-              <div className="flex items-center gap-1.5 min-w-0 flex-1">
+              <div
+                className="flex items-center gap-1.5 min-w-0 flex-1"
+                {...(isDesktopApp ? { 'data-tauri-drag-region': '' } : {})}
+              >
+                {/* ONE sidebar toggle (founder: side panel view, not separate
+                    chat/files icons) — opens the unified panel: files tree +
+                    chats, mirroring the desktop rail. */}
                 <button
-                  onClick={() => setMobilePanel('chats')}
-                  aria-label="Chats"
+                  onClick={() => setMobilePanel('files')}
+                  aria-label="Toggle sidebar"
+                  data-testid="mobile-sidebar-toggle"
                   className="relative group/tip p-2 -ml-1 rounded-lg hover:bg-stone-100 text-stone-400 shrink-0"
                 >
-                  {/* Same chats-list icon as the desktop sidebar tab — this
-                      opens the chats drawer, not a generic menu. */}
-                  <ChatsCircleIcon className="w-5 h-5" weight="regular" aria-hidden />
-                  <IconTooltip label="Chats" />
+                  <SidebarSimpleIcon className="w-5 h-5" weight="regular" aria-hidden />
+                  <IconTooltip label="Sidebar" />
                 </button>
-                {/* The list toggles (chats above, files here) sit together on
-                    the left edge, mirroring the desktop sidebar toggle. */}
-                <button
-                  onClick={() => {
-                    if (isSpaceMode) {
-                      setMobilePanel('files');
-                      return;
-                    }
-                    setWorkspaceViewMode('space');
-                    if (!selectedFilePath) {
-                      setMobilePanel('files');
-                    }
-                  }}
-                  aria-label={isSpaceMode ? 'Files' : 'Space'}
-                  className="relative group/tip p-2 rounded-lg hover:bg-stone-100 text-stone-400 shrink-0"
-                >
-                  <FolderSimpleIcon className="w-5 h-5" weight="regular" aria-hidden />
-                  <IconTooltip label={isSpaceMode ? 'Files' : 'Space'} />
-                </button>
-                {isSpaceMode ? (
-                  <button
-                    onClick={handleReturnToChatFromSpace}
-                    aria-label="Back"
-                    className="relative group/tip p-1.5 rounded-lg hover:bg-stone-100 text-stone-400 shrink-0"
-                  >
-                    <ArrowLeftIcon className="w-5 h-5" weight="regular" aria-hidden />
-                    <IconTooltip label="Back" />
-                  </button>
-                ) : null}
+                {/* No back arrow here (founder: too many options) — the Chats
+                    toggle two icons over is the way back to the chat. */}
                 {/* mobilePanel guard: while the files drawer is open, ITS
                     header hosts the rename input — a second autofocused copy
                     here would steal focus back and forth, and the loser's
@@ -9442,7 +13921,11 @@ export default function WorkspacePage() {
                       onClick={showAssistantDropdown}
                       aria-haspopup="menu"
                       aria-expanded={showAssistantPicker}
-                      className={`flex min-w-0 items-center gap-1.5 rounded-lg px-1.5 py-1 transition-colors ${assistantPickerTriggerClassName}`}
+                      // max-w-full (like the workspace-switcher trigger): the
+                      // wrapper is a plain block div, so the content-sized
+                      // button ignored its width — a long chat title pushed
+                      // the caret out over the workspace-menu cloud icon.
+                      className={`flex min-w-0 max-w-full items-center gap-1.5 rounded-lg px-1.5 py-1 transition-colors ${assistantPickerTriggerClassName}`}
                     >
                       {currentChatUsesGroupPresentation ? (
                         <>
@@ -9453,8 +13936,10 @@ export default function WorkspacePage() {
                       ) : currentChatId ? (
                         <>
                           <span className="flex h-5 w-5 shrink-0 overflow-hidden rounded-full">
+                            {/* Mobile's stand-in for the chat header — same rule:
+                                the ONE default Sunny, not a per-chat variant. */}
                             <img
-                              src={(currentChat ? sunnyAvatarByChatId.get(currentChat.id) : null) ?? '/sunnies/sundial-default.png'}
+                              src={DEFAULT_SUNNY_AVATAR}
                               alt=""
                               className="h-full w-full object-cover"
                               draggable={false}
@@ -9478,19 +13963,18 @@ export default function WorkspacePage() {
                   )
                 ) : (
                   <div className="relative min-w-0" ref={workspaceSwitcherRef}>
+                    {/* New identity style (sidepanel 0.1): kind icon + name,
+                        no caret — tap still opens the workspace menu (mobile
+                        has no right-click). */}
                     <button
                       type="button"
                       onClick={toggleWorkspaceSwitcher}
                       data-workspace-switcher-trigger
-                      className="flex max-w-full items-center gap-1 rounded-lg px-1.5 py-1 text-left hover:bg-stone-50"
+                      className="flex max-w-full items-center gap-1.5 rounded-lg px-1.5 py-1 text-left hover:bg-stone-50"
                       title={canWrite ? 'Open workspace menu' : projectTitle}
                     >
+                      {workspaceKindIcon}
                       <span className="truncate text-sm font-medium text-stone-700">{projectTitle}</span>
-                      <CaretDownIcon
-                        className={`w-3 h-3 shrink-0 text-stone-400 transition-transform ${showWorkspaceSwitcher ? 'rotate-180' : ''}`}
-                        weight="bold"
-                        aria-hidden
-                      />
                     </button>
                     {workspaceSwitcherMenu}
                   </div>
@@ -9514,11 +13998,9 @@ export default function WorkspacePage() {
                       aria-label="Workspace menu"
                       className="p-2 rounded-lg hover:bg-stone-100 text-stone-400"
                     >
-                      <CaretDownIcon
-                        className={`w-4 h-4 transition-transform ${showWorkspaceSwitcher ? 'rotate-180' : ''}`}
-                        weight="bold"
-                        aria-hidden
-                      />
+                      {/* The workspace kind glyph is the menu handle now —
+                          same identity language as the rail, no caret. */}
+                      {workspaceKindIcon}
                     </button>
                     {workspaceSwitcherMenu}
                   </div>
@@ -9527,20 +14009,12 @@ export default function WorkspacePage() {
                     desktop doc header) — the editor column skips its own
                     header strip on mobile space mode. */}
                 {isSpaceMode && editorColumnVisible ? docFileControls : null}
-                {canShowShareControls && (
-                  <button
-                    type="button"
-                    onClick={openShare}
-                    aria-label="Share"
-                    className="relative group/tip p-2 rounded-lg hover:bg-stone-100 text-stone-400"
-                  >
-                    <WorkspaceShareStatusIcon status={shareStatus} className="w-5 h-5" />
-                    <IconTooltip label="Share" />
-                  </button>
-                )}
+                {/* No standalone Share: the per-file button rides in the file
+                    controls above; workspace share lives in the workspace
+                    menu (PR #1038). */}
                 {/* Single chrome row: the formatting toolbar stays collapsed
                     behind this toggle. */}
-                {isSpaceMode && editorColumnVisible && activeWorkspaceFile && (activeIsMarkdown || activeTexFile) ? (
+                {!collapseDocControls && isSpaceMode && editorColumnVisible && activeWorkspaceFile && (activeIsMarkdown || activeTexFile) ? (
                   <button
                     type="button"
                     onClick={() => setMobileToolbarExpanded((v) => !v)}
@@ -9551,8 +14025,22 @@ export default function WorkspacePage() {
                       mobileToolbarExpanded ? 'text-stone-500' : 'text-stone-400'
                     }`}
                   >
-                    <WrenchIcon className="w-4 h-4" weight="regular" aria-hidden />
+                    <TextAaIcon className="w-4 h-4" weight="regular" aria-hidden />
                     <IconTooltip label={mobileToolbarExpanded ? 'Hide toolbar' : 'Show toolbar'} />
+                  </button>
+                ) : null}
+                {/* Explicit exit from the file view back to chat — the left
+                    arrow alone read as ambiguous (2026-08-01 feedback). */}
+                {isSpaceMode ? (
+                  <button
+                    type="button"
+                    onClick={handleReturnToChatFromSpace}
+                    aria-label="Close file view"
+                    data-testid="close-file-view"
+                    className="relative group/tip p-2 rounded-lg hover:bg-stone-100 text-stone-400"
+                  >
+                    <XIcon className="w-4 h-4" weight="bold" aria-hidden />
+                    <IconTooltip label="Close file view" />
                   </button>
                 ) : null}
               </div>
@@ -9562,14 +14050,34 @@ export default function WorkspacePage() {
 
           {/* Content area — flex row so left rails sit beside the content. */}
           <div className="relative flex flex-1 overflow-hidden">
+            {/* Panel view: the rail OVERLAYS the single surface instead of
+                squeezing it — a ~400px side-panel browser leaves no room for
+                both, and the layout's contract is one surface at a time. The
+                scrim click returns to the document. */}
+            {!isMobile && panelViewActive && openLeftRail === 'project' ? (
+              <div
+                data-testid="panel-rail-scrim"
+                className="absolute inset-0 z-20 bg-stone-900/20"
+                onClick={() => setOpenLeftRail(null)}
+              />
+            ) : null}
             {!isMobile && openLeftRail === 'project' ? (
               <aside
                 data-testid="project-left-rail"
-                style={{ width: leftRailWidth }}
+                style={
+                  panelViewActive
+                    ? { width: leftRailWidth, maxWidth: '85%' }
+                    : { width: leftRailWidth }
+                }
                 // In-flow at every desktop width: below lg the center columns
                 // shrink (max-lg:min-w-0) so the editor stays visible beside
-                // the rail instead of being covered by an overlay.
-                className="relative flex shrink-0 flex-col border-r border-stone-200 bg-stone-50"
+                // the rail instead of being covered by an overlay. Panel view
+                // is the exception — see the scrim above.
+                className={
+                  panelViewActive
+                    ? 'absolute inset-y-0 left-0 z-30 flex flex-col border-r border-stone-200 bg-stone-50 shadow-xl'
+                    : 'relative flex shrink-0 flex-col border-r border-stone-200 bg-stone-50'
+                }
               >
                 <ResizeHandle
                   side="right"
@@ -9580,32 +14088,67 @@ export default function WorkspacePage() {
                 />
                 <ProjectSidebar
                   header={workspaceTitleControl}
+                  support={
+                    savedFlags?.sundial_support_enabled === true && !isMobile ? (
+                      <SundialSupport
+                        workspaceId={cloudProjectId}
+                        open={rightDockView === 'support'}
+                        onOpenChange={(nextOpen) => {
+                          if (nextOpen) openRightDock('support');
+                          else setRightDockView((current) => (current === 'support' ? null : current));
+                        }}
+                        panelTarget={supportPanelHost}
+                      />
+                    ) : null
+                  }
+                  // "Open with …" docks above the footer (in-flow, never
+                  // overlaying chats) — the checklist that used to live here
+                  // moved to Settings → Get set up. Scoped share guests are
+                  // viewers, not arrivals; local projects have no cloud
+                  // connect surface, so both skip the row.
+                  openWith={
+                    // Link visitors (any pathGrants, root grants included)
+                    // skip it too: the modal's paste-into-AI prompt is
+                    // pathname-only, which would hand an external agent a
+                    // URL their access token isn't part of.
+                    !isScopedGuest && !isLocalWorkspace && pathGrants.length === 0 ? (
+                      <OpenWithRow onOpen={() => setShowOpenWithModal(true)} />
+                    ) : null
+                  }
                   footer={
-                    <div>
-                      <div className="-mx-3 mb-1.5">
-                        <a
-                          href={FEEDBACK_FORM_URL}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="flex w-full items-center gap-2 px-3 py-1.5 text-[13px] font-medium text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-800"
-                        >
-                          <span className="flex w-6 shrink-0 items-center justify-center">
-                            <MegaphoneIcon className="h-4 w-4" weight="regular" aria-hidden />
-                          </span>
-                          Feedback
-                        </a>
-                        <a
-                          href={DISCORD_INVITE_URL}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="flex w-full items-center gap-2 px-3 py-1.5 text-[13px] font-medium text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-800"
-                        >
-                          <span className="flex w-6 shrink-0 items-center justify-center">
-                            <DiscordLogoIcon className="h-4 w-4" weight="regular" aria-hidden />
-                          </span>
-                          Community
-                        </a>
-                      </div>
+                    <div className="relative">
+                    <ClaimOwnershipNudge
+                      show={
+                        hasMounted &&
+                        (isClerkLoaded || desktopSignedIn || clerkNeverLoads()) &&
+                        !(Boolean(isClerkSignedIn) || desktopSignedIn) &&
+                        isOwner &&
+                        filesLoaded &&
+                        !workspaceRouteContext?.local &&
+                        !claimNudgeDismissed
+                      }
+                      onLogIn={() => openSignIn?.({ forceRedirectUrl: buildWorkspacePath(workspaceRouteId) })}
+                      onDismiss={dismissClaimNudge}
+                      // Embedded panel browsers (ChatGPT's side panel) have no
+                      // Google session, so signing in THERE is the hard path —
+                      // offer the ownership link to claim in the browser that
+                      // already knows them. sd_anon is the adopting identity
+                      // for the standard handoff (fresh panel browser adopts
+                      // the link's key), so it is the right key here.
+                      claimUrl={
+                        panelViewActive && hasMounted
+                          ? (() => {
+                              const anonId = readAnonCookie();
+                              return anonId
+                                ? `${window.location.origin}${buildWorkspacePath(workspaceRouteId)}?anon=${anonId}`
+                                : null;
+                            })()
+                          : null
+                      }
+                    />
+                    {/* Feedback + Community are icon-only and share the identity
+                        row with Settings — two full-width labelled rows above it
+                        cost more sidebar height than they earn. */}
                     <div className="@container/footer flex items-center gap-2">
                       <SidebarIdentity
                         hasMounted={hasMounted}
@@ -9633,7 +14176,34 @@ export default function WorkspacePage() {
                           {Math.round(workspaceStorageUsage.usageRatio * 100)}%
                         </span>
                       ) : null}
-                      {!isLocalWorkspace && <CreditBalancePill onOpenBilling={() => openSettingsTab('billing')} />}
+                      {!isLocalWorkspace && (
+                        <CreditBalancePill
+                          enabled={backgroundDataReady}
+                          onOpenBilling={() => openSettingsTab('billing')}
+                        />
+                      )}
+                      <a
+                        href={FEEDBACK_FORM_URL}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={openExternalOnDesktop}
+                        aria-label="Feedback"
+                        className="relative group/tip flex h-7 w-7 shrink-0 items-center justify-center rounded text-stone-400 hover:bg-stone-200/60 hover:text-stone-600"
+                      >
+                        <MegaphoneIcon className="h-4 w-4" weight="regular" aria-hidden />
+                        <IconTooltip label="Feedback" side="top" align="right" />
+                      </a>
+                      <a
+                        href={DISCORD_INVITE_URL}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={openExternalOnDesktop}
+                        aria-label="Community"
+                        className="relative group/tip flex h-7 w-7 shrink-0 items-center justify-center rounded text-stone-400 hover:bg-stone-200/60 hover:text-stone-600"
+                      >
+                        <DiscordLogoIcon className="h-4 w-4" weight="regular" aria-hidden />
+                        <IconTooltip label="Community" side="top" align="right" />
+                      </a>
                       <button
                         type="button"
                         onClick={() => openSettingsTab('workspace')}
@@ -9653,16 +14223,16 @@ export default function WorkspacePage() {
                       canWrite={canWrite}
                       title={workspaceIdentityHeader}
                       onReorderEntries={handleReorderEntries}
+                      childOrder={fileOrder}
                       collapsed={isSectionCollapsed(sidebarSections, 'files')}
                       onToggleCollapsed={() => toggleSidebarSectionCollapsed('files')}
-                      onAddRepo={isLocalWorkspace ? undefined : () => connectOrSignIn(() => setShowAddRepoModal(true), { modal: 'addRepo' })}
-                      onAddRepoHover={() => prefetchRepositories(user?.id)}
-                      onAddOverleaf={
-                        isLocalWorkspace
-                          ? undefined
-                          : () => connectOrSignIn(() => setShowAddOverleafModal(true), { modal: 'addOverleaf' })
-                      }
                       onConnectLocalAgent={isLocalWorkspace ? undefined : () => void openLocalAgentModal()}
+                      // Cloud-only: the modal posts to /api/workspace/skills, and
+                      // the local sidecar has no skills route to answer it.
+                      // Workspace-level canWrite, not the ＋ menu's folder-scoped
+                      // gate: skills/ is global metadata, and the route 403s a
+                      // folder-scoped editor — don't offer a doomed modal.
+                      onAddSkill={isLocalWorkspace || !canWrite ? undefined : () => setShowAddSkillModal(true)}
                       showMetaFiles={showMetaFiles}
                       setShowMetaFiles={setShowMetaFiles}
                       showAgentMetaFiles={showAgentMetaFiles}
@@ -9676,6 +14246,11 @@ export default function WorkspacePage() {
                       fileUploadInputRef={fileUploadInputRef}
                       onCreateFile={handleCreateFile}
                       onCreateFolder={handleCreateFolder}
+                      // Mirrors beginDraft's target: the header ＋ must not
+                      // render when creating there would silently no-op, and
+                      // its Upload lands in the same folder as New file.
+                      createParentPath={sidebarCreateParent}
+                      canCreateEntries={canUploadToFolder(sidebarCreateParent)}
                       onQueueFileUploads={queueFileUploadsToFolder}
                       isFilesDropActive={isFilesDropActive}
                       setIsFilesDropActive={setIsFilesDropActive}
@@ -9710,18 +14285,19 @@ export default function WorkspacePage() {
                         setSidebarSections((prev) => expandSection(prev, 'files'));
                         handleFileClick(file);
                       }}
+                      onPrefetchFile={prefetchWorkspaceFile}
                       onOpenInNewTab={isMobile || !desktopTabs ? undefined : handleOpenInNewTab}
                       onOpenToSide={isMobile || !desktopTabs ? undefined : handleOpenToSide}
                       openMenuPath={openMenuPath}
                       setOpenMenuPath={setOpenMenuPath}
                       fileMenuRef={fileMenuRef}
                       onCopyFileLink={handleCopyFileLink}
-                      buildFileUrl={buildFileUrl}
                       onDownloadFile={downloadFile}
                       onDownloadFolder={downloadFolder}
                       onDownloadWorkspace={isLocalWorkspace ? undefined : downloadWorkspaceZip}
                       onNewChatInFolder={startChatInFolder}
                       onFocusedFolderChange={setFocusedSidebarFolder}
+                      focusFolderIntent={sidebarFolderFocusIntent}
                       onAddContextFolder={
                         isLocalWorkspace && isDesktopApp ? handleAddContextFolder : undefined
                       }
@@ -9730,6 +14306,7 @@ export default function WorkspacePage() {
                       onDeletePaths={deletePaths}
                       onUndoDelete={restoreLastDeletedPaths}
                       canUndoDelete={hasDeletedHistory}
+                      deleteSeq={deleteSeq}
                       onDuplicatePath={duplicatePath}
                       expandedFolders={expandedFolders}
                       onFileDragStart={handleFileDragStart}
@@ -9737,14 +14314,18 @@ export default function WorkspacePage() {
                       onShareEntry={
                         isLocalWorkspace
                           ? (path, kind) => setLocalShareScope({ kind: kind === 'folder' ? 'folder' : 'file', path })
-                          : // SEAM: per-path cloud share modals land in a separate
-                            // in-flight PR — until then a cloud entry's share
-                            // affordance opens the workspace-level share modal.
-                            canShowShareControls
-                            ? () => openShare()
+                          : canInviteShare && !isScopedGuest
+                            ? (path, kind) => {
+                                setPathShareScope({ path, kind: kind === 'folder' ? 'folder' : 'file' });
+                                void refreshCloudPathShares();
+                              }
                             : undefined
                       }
-                      sharedScopePaths={isLocalWorkspace ? localSharedScopePaths : undefined}
+                      onShareWorkspace={canShowShareControls ? openShare : undefined}
+                      sharedScopePaths={isLocalWorkspace ? localSharedScopeKinds : cloudSharedScopePaths}
+                      sharedBadgeLabel={isLocalWorkspace ? undefined : 'Shared'}
+                      canWritePath={canWriteWorkspacePath}
+                      hasWriteGrants={pathGrants.some((grant) => grant.role === 'edit')}
                       pinStorageKey={projectId ?? undefined}
                     />
                   }
@@ -9759,26 +14340,31 @@ export default function WorkspacePage() {
                       startChatInFolder(focusedSidebarFolder);
                       return;
                     }
-                    openCenterPanel('chat');
-                    void startAssistantChat(null, null, { forceNew: true, keepMode: true });
+                    // side: the file-first landing means a document usually
+                    // owns the pane — the new chat docks to its right rather
+                    // than replacing what the user is reading. `side` falls
+                    // through to replace when the primary is already a chat.
+                    openCenterPanel('chat', { side: true });
+                    void startAssistantChat(null, null, { forceNew: true, keepMode: true, sideTab: true });
                   }}
-                  onConnectLocalAgent={isLocalWorkspace ? undefined : () => void openLocalAgentModal()}
                   canStartChat={canWrite}
-                  /* Tasks (scheduled chats) hidden from the UI for now — re-enable later.
-                  tasksPanel={
-                    projectId ? (
-                      <TasksRail
-                        projectId={projectId}
-                        collapsed={isSectionCollapsed(sidebarSections, 'tasks')}
-                        onToggleCollapsed={() => toggleSidebarSectionCollapsed('tasks')}
-                        chatId={currentChatId && !isDraftChatId(currentChatId) ? currentChatId : null}
-                        onOpenChat={(chatId) => {
-                          setSidebarSections((prev) => expandSection(prev, 'chats'));
-                          void openChatById(chatId, { sidePanel: true });
-                        }}
-                      />
-                    ) : undefined
-                  } */
+                  onOpenSchedules={projectId ? () => setSchedulesPanelMode('list') : undefined}
+                  onNewSchedule={
+                    canWrite && projectId
+                      ? () => {
+                          // Schedules need a signed-in owner (the server
+                          // refuses anon creation) — route anon clicks to
+                          // sign-in instead of a form that can only fail.
+                          if (!localConfig && (clerkAuthRef.current.isLoaded || clerkNeverLoads()) && !clerkAuthRef.current.isSignedIn) {
+                            openSignIn({ redirectUrl: buildReturnPath({}) });
+                            return;
+                          }
+                          setSchedulesPanelMode('create');
+                        }
+                      : undefined
+                  }
+                  chatsCollapsed={isSectionCollapsed(sidebarSections, 'chats')}
+                  onToggleChats={() => toggleSidebarSectionCollapsed('chats')}
                   syncPanel={
                     linkedRepos.length > 0 ? (
                       <CommitsRail
@@ -9802,10 +14388,10 @@ export default function WorkspacePage() {
               </aside>
             ) : null}
             <div className="flex-1 overflow-hidden">
-            {/* linkedRepos guard: if the repo is unlinked while a commit is
-                selected, the sidebar falls back to the Files tab — the stale
-                diff viewer must drop with it. */}
-            {selectedCommit && linkedRepos.length > 0 && openLeftRail === 'project' && !isSectionCollapsed(sidebarSections, 'sync') ? (
+            {/* linkedRepos guard (inside commitDiffOpen): if the repo is
+                unlinked while a commit is selected, the sidebar falls back to
+                the Files tab — the stale diff viewer must drop with it. */}
+            {commitDiffOpen && selectedCommit ? (
               // The commit view keeps the one-bar chrome: an empty bar row
               // under the pinned top-right cluster, viewer below.
               <div className="flex h-full flex-col">
@@ -9847,6 +14433,12 @@ export default function WorkspacePage() {
                 data-testid="editor-pane-primary"
                 className="relative flex min-w-0 flex-1 flex-col overflow-hidden print:static"
                 style={{ flexGrow: paneGrow[PRIMARY_PANE_ID] ?? 1 }}
+                // Any interaction inside the pane focuses it for ⌘W — tab
+                // clicks alone would leave the ref stale after editing here.
+                onPointerDownCapture={() => {
+                  lastFocusedPaneIdRef.current = PRIMARY_PANE_ID;
+                  setFocusedPaneId(PRIMARY_PANE_ID);
+                }}
               >
                 {/* Squash wrapper: hovering an edge zone slides the whole live
                     pane — tab strip included — into the surviving half. */}
@@ -9865,8 +14457,11 @@ export default function WorkspacePage() {
                     top-right; when this is the rightmost strip (single pane,
                     dock closed) the row reserves their width. Testid kept
                     from the old top-bar home so the shell smokes stay
-                    stable. */}
-                {!isMobile ? (
+                    stable. Desktop shell only, and only while the ⋮ "Hide
+                    top bar" preference is off — the web build and the hidden
+                    state render no bar at all (the doc/chat headers are the
+                    topmost chrome; the pinned corner clusters float). */}
+                {!isMobile && desktopTabs ? (
                   <div
                     data-testid="topbar-tabs"
                     className="flex shrink-0 items-stretch"
@@ -9878,14 +14473,13 @@ export default function WorkspacePage() {
                   >
                     {openLeftRail === null ? (
                       <div
-                        className={`flex shrink-0 items-center gap-1.5 border-b border-stone-200/60 bg-stone-100/70 pr-1 ${isDesktopApp ? 'pl-[72px]' : 'pl-2'}`}
+                        className={`flex shrink-0 items-center gap-1.5 border-b border-stone-200/60 bg-stone-100/70 pr-1 ${isDesktopApp ? 'pl-[calc(72px/var(--sd-zoom,1))]' : 'pl-2'}`}
                         data-testid="topbar-left"
                         {...(isDesktopApp ? { 'data-tauri-drag-region': '' } : {})}
                       >
                         {shellNavControls}
                       </div>
                     ) : null}
-                    {desktopTabs ? (
                     <EditorTabStrip
                       className="min-w-0 flex-1"
                       dragRegion={isDesktopApp}
@@ -9897,6 +14491,8 @@ export default function WorkspacePage() {
                       onCloseTab={(path) => handlePaneTabClose(PRIMARY_PANE_ID, path)}
                       onDropTab={(payload, index) => handlePaneTabDrop(PRIMARY_PANE_ID, payload, index)}
                       onTabDragChange={handleTabDragChange}
+                      onSplitRight={(path) => handleTabSplitRight(PRIMARY_PANE_ID, path)}
+                      canSplit={editorPanes.length < MAX_EDITOR_PANES}
                       renamingPath={
                         renameEntry?.source === 'tab' && renameEntry.paneId === PRIMARY_PANE_ID
                           ? renameEntry.path
@@ -9907,51 +14503,202 @@ export default function WorkspacePage() {
                       onRenameValueChange={handleTabRenameValueChange}
                       onCommitRename={() => void commitRename()}
                       onCancelRename={cancelRename}
-                      trailing={newTabLauncher}
+                      trailing={renderNewTabLauncher(PRIMARY_PANE_ID)}
                     />
-                    ) : (
-                      // Web (browser) shell: NO tabs — the browser has its own
-                      // tab row. The bar keeps the shell controls and carries
-                      // the open file's name (rename included); rail clicks
-                      // replace the displayed file/chat instead of stacking.
-                      <div
-                        data-testid="topbar-web-bar"
-                        className="flex h-11 min-w-0 flex-1 items-center border-b border-stone-200/60 bg-stone-100/70 px-2.5"
-                      >
-                        {primaryChatActive ? null : docFileNameControl}
-                      </div>
-                    )}
                   </div>
                 ) : null}
-                <div className="relative flex min-h-0 flex-1 flex-col print:static">
+                <div
+                  // Google Docs style: the desk color runs under ALL the doc
+                  // chrome (title row, menu bar, toolbar strip) — a white band
+                  // above the gray desk read as a seam (Belinda, round 3).
+                  className={`relative flex min-h-0 flex-1 flex-col print:static ${
+                    docsPage && isMarkdownEditing ? 'bg-stone-50' : ''
+                  }`}
+                >
                 {/* An active chat tab claims the pane: the chat surface renders
                     where the doc chrome would (the wireframe's chats-as-tabs). */}
-                {primaryChatActive ? renderChatSurface(editorPanes.length === 1) : (<>
-                {/* Per-document controls live at the pane's top-right now
-                    (mode picker, links, raw + toolbar toggles) — they apply to
-                    this pane's file. */}
-                {!isMobile && activeWorkspaceFile ? (
+                {primaryChatActive ? renderChatSurface(editorPanes.length === 1) : primaryLauncherActive ? renderLauncherPanel(PRIMARY_PANE_ID) : primaryReviewActive ? renderChatEditsSurface(editorPanes[0].active, leftmostPaneInset) : primaryDiffActive ? renderDiffSurface(editorPanes[0].active, leftmostPaneInset) : (<>
+                {/* The file's own header row (wireframe): its identity —
+                    folder path + name — leads, and the always-on controls
+                    (mode picker · Aa · Share · ⋯, plus Comments when any
+                    exist) close the row. Both shells: a tab label truncates
+                    to ~20ch and can't show where the file sits, and the web
+                    bar no longer duplicates the name. */}
+                {docsHeaderOwnsTopLeft && activeWorkspaceFile ? (
+                  // Google Docs style: one compact header cluster — the big
+                  // title with the File/Edit/View/Insert/Format menu bar
+                  // directly beneath it, controls top-right (like Docs' own
+                  // comment/share corner). The path lives in the tooltip.
                   <div
+                    ref={docHeaderRef}
                     data-testid="topbar-doc-controls"
-                    className="flex shrink-0 items-center justify-end gap-1 px-2 pt-1 print:hidden"
+                    // items-center: the controls corner floats vertically
+                    // centered against the title+menus cluster, like Docs'
+                    // own comment/share corner. pt-1: the cluster stays short
+                    // but keeps a touch of air above the title — pt-0.5 sat
+                    // the title against the window edge (founder, 2026-08-14
+                    // round 2).
+                    className="relative flex shrink-0 items-center justify-between gap-2 px-3 pt-1 print:hidden"
+                    // Topmost chrome: clear the pinned right cluster while
+                    // the doc is the rightmost surface. NO window × here:
+                    // Google Docs has no close-document control (founder,
+                    // 2026-08-05) — you leave via the sidebar / ⌘W; the ×
+                    // stays in the IDE windows shell. No sidebar toggle up
+                    // here either (Belinda, 2026-08-07 round 3) — it rides
+                    // the toolbar pill's left end — so the only left
+                    // clearance is the macOS traffic lights.
+                    style={{
+                      ...(openLeftRail === null && isDesktopApp
+                        ? { paddingLeft: 'calc(72px/var(--sd-zoom,1))' }
+                        : {}),
+                      ...(editorPanes.length === 1 && rightDockView === null && topbarRightWidth
+                        ? { paddingRight: topbarRightWidth }
+                        : {}),
+                    }}
                   >
-                    {docFileControls}
-                    {activeIsMarkdown ? (
-                      <button
-                        type="button"
-                        onClick={toggleFormatToolbar}
-                        aria-pressed={showFormatToolbar}
-                        aria-label="Formatting toolbar"
-                        data-testid="format-toolbar-toggle"
-                        className={`relative group/tip inline-flex h-7 w-7 items-center justify-center rounded hover:bg-stone-100 ${
-                          showFormatToolbar ? 'text-stone-700' : 'text-stone-400 hover:text-stone-600'
-                        }`}
+                    <div className="flex min-w-0 items-center">
+                      {/* Google Docs' own two-column header (Belinda,
+                          2026-08-07 round 2): the file's tree glyph is its
+                          own column spanning both rows — like Docs' doc
+                          mark — with the title + menu bar stacked beside.
+                          No sidebar toggle up here (round 3) — it rides the
+                          toolbar pill's left end below. */}
+                      <WorkspaceEntryIcon
+                        path={activeWorkspaceFile.path}
+                        // mr-0.5: the title/menu column's own text inset
+                        // (10px of button padding) already provides the
+                        // visual gap — a wider margin read as the icon
+                        // floating loose (Belinda, round 4).
+                        // The doc mark still reads as part of the title
+                        // cluster, but it must not outweigh the name: at 32px
+                        // the 16-grid glyph's 1.3 stroke doubles to 2.6px of
+                        // near-black and pulled the eye off the title. stone-500
+                        // + a hairline stroke land it near the title's own text
+                        // weight; the palette remap makes it muted in dark too.
+                        className="ml-1.5 mr-0.5 h-8 w-8 shrink-0 text-stone-500 [stroke-width:0.9]"
+                      />
+                      <div className="flex min-w-0 flex-col">
+                      <div
+                        // pl-1.5: the name button's own px-1 lands the title
+                        // text on the menu buttons' px-2.5 text inset — the
+                        // two rows read left-aligned like Docs.
+                        className="flex min-w-0 items-center gap-1.5 pl-1.5"
+                        title={activeWorkspaceFile.path}
                       >
-                        <TextAaIcon className="h-4 w-4" weight="regular" aria-hidden />
-                        <IconTooltip label="Formatting toolbar" />
-                      </button>
-                    ) : null}
+                        {renderDocFileNameControl(true)}
+                        {/* Share status beside the name (PR #1086 pattern). */}
+                        {docShareStatusIcon}
+                      </div>
+                      <MarkdownMenuBar
+                        // -mt-1: the menu hugs the title like Docs' own
+                        // header (Belinda, round 3 — the rows sat too far
+                        // apart).
+                        className="-mt-1 px-0"
+                        // Raw markdown view hides the Tiptap editor — hand the
+                        // bar no editor so Insert/Format/Edit items go inert
+                        // instead of editing the hidden rich view (Codex r5).
+                        editor={isMarkdownEditing ? markdownEditor : null}
+                        readOnly={documentEditorReadOnly || !activeFileCap.canWrite}
+                        file={activeWorkspaceFile}
+                        projectId={projectId}
+                        localWorkspace={isLocalWorkspace}
+                        sidebarOpen={openLeftRail !== null}
+                        onNewFile={
+                          // Per-folder capability, not workspace canWrite: a
+                          // path-share editor creates inside their granted
+                          // subtree (mirrors beginDraft's own guard — Codex).
+                          canUploadToFolder(sidebarCreateParent)
+                            ? () => {
+                                setOpenLeftRail('project');
+                                setSidebarSections((prev) => expandSection(prev, 'files'));
+                                handleCreateFile();
+                              }
+                            : undefined
+                        }
+                        onRename={() =>
+                          beginRename(activeWorkspaceFile.path, isMobile || !desktopTabs ? 'header' : 'tab', {
+                            fileId: activeWorkspaceFile.id,
+                            ...(isMobile || !desktopTabs ? {} : { paneId: PRIMARY_PANE_ID }),
+                          })
+                        }
+                        onDuplicate={() => void duplicateFile(activeWorkspaceFile)}
+                        onDelete={() => void deletePath(activeWorkspaceFile.path)}
+                        onToggleSidebar={toggleSidebar}
+                      />
+                      </div>
+                    </div>
+                    {/* No controls corner at all: everything rides the
+                        toolbar's right end (founder — "entirely folded into
+                        the formatting bar"), which never closes in Docs. */}
                   </div>
+                ) : !isMobile && activeWorkspaceFile ? (
+                  <DocPaneHeader
+                    headerRef={docHeaderRef}
+                    collapsed={collapseDocControls}
+                    path={activeWorkspaceFile.path}
+                    nameControl={docFileNameControl}
+                    shareIcon={docShareStatusIcon}
+                    controls={() => docFileControls}
+                    tall={!desktopTabs}
+                    // The LaTeX split toolbars run directly beneath — a
+                    // hairline makes the two chrome rows read as separate bars.
+                    divider={Boolean(activeTexFile)}
+                    // Only while the doc is the RIGHTMOST surface (sole pane,
+                    // dock closed; a docked chat is always the last pane) it
+                    // clears the pinned cluster floating over it.
+                    paddingRight={
+                      !desktopTabs && editorPanes.length === 1 && rightDockView === null
+                        ? topbarRightWidth
+                        : undefined
+                    }
+                    // Little-windows shell: the window's controls sit at its
+                    // top-LEFT corner (macOS convention — founder): × then the
+                    // ⋮ document menu. Collapsed rail: shift past the floating
+                    // Home/Sidebar cluster; on the macOS shell floor at the
+                    // traffic-light clearance (the measured width is 0 for the
+                    // first frames, which would park the × under the lights).
+                    leading={
+                      !desktopTabs ? (
+                        <>
+                          <button
+                            type="button"
+                            onClick={closeActiveFileView}
+                            aria-label="Close file view"
+                            data-testid="close-file-view"
+                            className="relative group/tip inline-flex h-7 w-7 items-center justify-center rounded text-stone-400 hover:bg-stone-100 hover:text-stone-600"
+                          >
+                            <XIcon className="h-4 w-4" weight="regular" aria-hidden />
+                            <IconTooltip label="Close file view" />
+                          </button>
+                          {docActionsMenu}
+                        </>
+                      ) : undefined
+                    }
+                    leadingLeft={
+                      openLeftRail === null && isDesktopApp
+                        ? `max(${topbarLeftFloatWidth}px, calc(72px/var(--sd-zoom,1)))`
+                        : openLeftRail === null && topbarLeftFloatWidth
+                          ? topbarLeftFloatWidth
+                          : 8
+                    }
+                    // The mirrored obstruction grows when this row is topmost:
+                    // the pinned right cluster joins the doc controls while the
+                    // doc is the rightmost surface, and with the rail collapsed
+                    // the floating Home/Sidebar cluster obstructs the left.
+                    mirrorRight={
+                      !desktopTabs && editorPanes.length === 1 && rightDockView === null
+                        ? topbarRightWidth
+                        : 0
+                    }
+                    mirrorLeft={
+                      !desktopTabs
+                        ? (openLeftRail === null
+                            ? Math.max(topbarLeftFloatWidth, isDesktopApp ? 72 : 0)
+                            : 0) + 76
+                        : 0
+                    }
+                    onFocusFolder={focusRailFolder}
+                  />
                 ) : null}
                 {/* On mobile space mode the top bar already carries the file
                     identity + controls — skip this strip so chrome stays one
@@ -9970,104 +14717,151 @@ export default function WorkspacePage() {
                     }
                   />
                 )}
-                {!menusHidden && !mobileToolbarCollapsed && activeWorkspaceFile && isMarkdownFile(activeWorkspaceFile) ? (
+                {/* Desktop Docs: the ROW is permanent for markdown files —
+                    the toolbar can never close, and it carries the doc
+                    controls even over the raw view (inert strip, live ⋮).
+                    Everywhere else the row needs the RICH view
+                    (isMarkdownEditing): a live toolbar over the hidden rich
+                    view would format at a stale selection (Codex r6). */}
+                {activeWorkspaceFile &&
+                (isMobile
+                  ? !mobileToolbarCollapsed && isMarkdownEditing
+                  : docsPage
+                    ? activeIsMarkdown
+                    : showFormatToolbar && isMarkdownEditing) ? (
                   <div
-                    data-testid="doc-menu-row"
-                    className="shrink-0 border-b border-stone-200/60 bg-stone-50"
+                    ref={toolbarRowCallbackRef}
+                    // Docs: pt-1 — the header cluster above is part of the
+                    // same tight stack (Belinda, 2026-08-07).
+                    // Title row first, bar under it — every shell, web and
+                    // desktop alike (founder, 2026-08-18: the desktop-only
+                    // order-first experiment is reverted).
+                    className={`px-3 shrink-0 ${docsPage && !isMobile ? 'pb-1 pt-0.5' : 'py-1'}`}
                   >
-                    <MarkdownMenuBar
-                      editor={markdownEditor}
-                      readOnly={documentEditorReadOnly || !canWrite}
-                      file={activeWorkspaceFile}
-                      projectId={projectId}
-                      sidebarOpen={openLeftRail !== null}
-                      onNewFile={handleCreateFile}
-                      onRename={() =>
-                        // Web (no-tabs) shell: the rename input lives in the
-                        // bar's file-name control ('header'), not a tab.
-                        beginRename(activeWorkspaceFile.path, isMobile || !desktopTabs ? 'header' : 'tab', {
-                          fileId: activeWorkspaceFile.id,
-                          ...(isMobile || !desktopTabs ? {} : { paneId: PRIMARY_PANE_ID }),
-                        })
-                      }
-                      onDuplicate={() => void duplicateFile(activeWorkspaceFile)}
-                      onDelete={() => void deletePath(activeWorkspaceFile.path)}
-                      onToggleSidebar={() => toggleLeftRail('project')}
-                    />
-                  </div>
-                ) : null}
-                {(isMobile ? !mobileToolbarCollapsed : showFormatToolbar) && activeWorkspaceFile && isMarkdownFile(activeWorkspaceFile) ? (
-                  <div ref={toolbarRowCallbackRef} className="px-3 py-2 shrink-0">
-                    <div className="flex items-stretch rounded-xl border border-stone-200 bg-white shadow-[0_1px_2px_rgba(28,25,23,0.05)]">
+                    <div
+                      // One pill for both styles: the flat stone-200 bar read
+                      // as a gray slab in Docs (founder, 2026-08-14) — the
+                      // buttons carry their own hover gray, the pill stays
+                      // quiet white like the IDE's.
+                      className="flex items-stretch rounded-xl border border-stone-200 bg-white shadow-[0_1px_2px_rgba(28,25,23,0.05)]"
+                    >
+                      {/* Collapsed-rail sidebar toggle: seated with the
+                          toolbar's OWN icon buttons (Belinda, round 3 — it
+                          read as broken chrome alone under the bar and
+                          crowded the title beside it). Styled as a toolbar
+                          button, split off by the toolbar's separator.
+                          Keeps the float-nav + toggle testids — it IS the
+                          collapsed-rail nav; the rail's top row takes over
+                          the moment it opens. */}
+                      {docsHeaderOwnsTopLeft && !desktopTabs && openLeftRail === null ? (
+                        <div
+                          data-testid="topbar-float-nav"
+                          className="flex shrink-0 items-center self-center pl-1.5"
+                        >
+                          <button
+                            type="button"
+                            onClick={toggleSidebar}
+                            aria-pressed={false}
+                            aria-label="Toggle sidebar"
+                            data-testid="topbar-sidebar-toggle"
+                            className="relative group/tip inline-flex h-7 w-7 items-center justify-center rounded text-stone-600 transition-colors hover:bg-stone-200/60 hover:text-stone-900"
+                          >
+                            <SidebarSimpleIcon className="h-4 w-4" weight="regular" aria-hidden />
+                            <IconTooltip label="Sidebar" />
+                          </button>
+                          <div className="mx-1 h-5 w-px shrink-0 bg-stone-300" aria-hidden />
+                        </div>
+                      ) : null}
                       <div className="min-w-0 flex-1">
                         {/* Keep the row mounted (reserving the toolbar's height)
                             while the editor instance is briefly null on a
                             markdown→markdown switch, so the chrome never
-                            collapses and the frame doesn't flicker/jump. */}
-                        {toolbarEditor ? (
+                            collapses and the frame doesn't flicker/jump.
+                            isMarkdownEditing too: the Docs row stays up over
+                            the RAW view, where a live toolbar would format
+                            the hidden rich view (Codex r6) — inert strip. */}
+                        {isMarkdownEditing && toolbarEditor ? (
                           <MarkdownToolbar
                             editor={toolbarEditor}
                             // Commenters: formatting/structural commands can't
                             // be staged as suggestion marks — keep them
                             // disabled, not silently applying untracked edits.
-                            readOnly={documentEditorReadOnly || !canWrite}
-                            containerWidth={toolbarRowWidth}
+                            readOnly={documentEditorReadOnly || !activeFileCap.canWrite}
+                            // The doc controls sit in this same pill while
+                            // they ride the toolbar, so the formatting groups
+                            // get what's left — otherwise the bar reveals a
+                            // tier it can't fit and the two clusters collide.
+                            // Shared with docsToolbarFlags above.
+                            containerWidth={toolbarContentWidth}
                             zoom={editorZoom}
                             onZoomChange={setEditorZoom}
                             lineHeight={editorLineHeight}
                             onLineHeightChange={setEditorLineHeight}
                             pageChrome={editorPageChrome}
                             onPageChromeChange={setEditorPageChrome}
+                            // Docs: the condensed tiers live in the document ⋯
+                            // menu at this pill's right end — no second dots
+                            // trigger on the bar itself.
+                            hideOverflowMenu={docsPage && !isMobile}
+                            authorshipLens={showAuthorship}
+                            // Cloud-only: blame comes from /api/workspace/file-blame,
+                            // which the local sidecar has no counterpart for — so the
+                            // toggle isn't rendered there rather than flipping a lens
+                            // that can never paint (Codex, PR #1104 round 7).
+                            onToggleAuthorshipLens={
+                              cloudProjectId ? () => setShowAuthorship((on) => !on) : undefined
+                            }
                           />
                         ) : (
-                          <div className="h-10" aria-hidden />
+                          <div className="h-9" aria-hidden />
                         )}
                       </div>
-                      <button
-                        type="button"
-                        onMouseDown={(event) => {
-                          event.preventDefault();
-                          setMenusHidden((v) => !v);
-                        }}
-                        aria-label={menusHidden ? 'Show menus' : 'Hide menus'}
-                        aria-pressed={menusHidden}
-                        className="relative group/tip inline-flex h-7 w-7 shrink-0 items-center justify-center self-center rounded px-1.5 mr-2 text-stone-600 transition-colors hover:bg-stone-200/60 hover:text-stone-900 cursor-pointer"
-                      >
-                        {menusHidden ? (
-                          <CaretDownIcon className="h-4 w-4" weight="regular" aria-hidden />
-                        ) : (
-                          <CaretUpIcon className="h-4 w-4" weight="regular" aria-hidden />
-                        )}
-                        <IconTooltip label={menusHidden ? 'Show menus' : 'Hide menus'} />
-                      </button>
+                      {/* Google Docs' own layout: the mode picker (and, in
+                          the Docs style, Aa + ⋮ with it) closes the toolbar
+                          row. The IDE header keeps its Aa/⋮ — only the mode
+                          picker moves down here. */}
+                      {controlsRideToolbar ? (
+                        <div
+                          ref={toolbarControlsRef}
+                          className="flex shrink-0 items-center gap-1 pr-1.5"
+                        >
+                          {docsPage ? (
+                            docsHeaderControls
+                          ) : !collapseDocControls && !documentReadOnly ? (
+                            <EditModeControl
+                              mode={effectiveDocEditMode}
+                              onChange={setDocumentEditMode}
+                              menuPlacement="down"
+                              modes={docEditModes}
+                              disabled={!activeFileCap.canWrite}
+                            />
+                          ) : null}
+                        </div>
+                      ) : null}
                     </div>
                   </div>
                 ) : null}
-                {!mobileToolbarCollapsed && activeTexFile && activeWorkspaceFile ? (
-                  <div ref={toolbarRowCallbackRef} className="px-3 py-2 shrink-0">
-                    <LatexEditorToolbar
-                      {...latexEditorRefHandlers(textEditorRef)}
-                      readOnly={documentEditorReadOnly}
-                      viewMode={latexViewMode}
-                      onViewModeChange={handleLatexViewModeChange}
-                      compile={latexCompile}
-                      canCompile={canWrite}
-                      mainDocument={latexMainDocument}
-                      containerWidth={toolbarRowWidth}
-                      onFix={handleLatexFix}
-                      canFix={canLatexFix}
-                      fixInFlight={fixInFlight}
-                      // Error lines map to the compiled root; only let them jump
-                      // the editor when the open file *is* that root (W1.root §3.3).
-                      onNavigateToLine={
-                        activeIsRoot ? (line) => textEditorRef.current?.revealLine?.(line) : undefined
-                      }
-                    />
-                  </div>
+                {/* Mobile keeps the single full-width bar; on desktop the
+                    chrome splits Overleaf-style — formatting toolbar over the
+                    editor pane, compile controls in the PDF pane header (both
+                    seated inside LatexWorkbench below). */}
+                {!mobileToolbarCollapsed && activeTexFile && activeWorkspaceFile && isMobile ? (
+                  <LatexToolbarRow
+                    {...latexEditorRefHandlers(textEditorRef)}
+                    {...latexCompileProps}
+                    readOnly={documentEditorReadOnly}
+                    autoFix={latexAutoFix}
+                    onToggleAutoFix={toggleLatexAutoFix}
+                    autoCompile={latexAutoCompile}
+                    onToggleAutoCompile={isLocalWorkspace ? undefined : toggleLatexAutoCompile}
+                    showInPdfHint={synctexHint?.text ?? null}
+                  />
+
                 ) : null}
                 <div
                   ref={docEditorBodyRef}
                   data-testid="doc-editor-body"
+                  // Desk color comes from the pane column above (one source).
                   className="flex-1 min-h-0 overflow-auto"
                 >
                   {activeWorkspaceFile ? (
@@ -10127,12 +14921,22 @@ export default function WorkspacePage() {
                                 alt={formatFileName(getFileName(activePreviewFile.path))}
                               />
                             )}
-                            {binaryPreviewStatus !== 'loading' && pdfPreviewUrl && (
-                              <div className="overflow-hidden rounded-2xl bg-white">
-                                <iframe
-                                  title={formatFileName(getFileName(activePreviewFile.path))}
-                                  src={pdfPreviewUrl}
-                                  className="block h-[calc(100vh-6.5rem)] min-h-[520px] w-full bg-white"
+                            {binaryPreviewStatus !== 'loading' && binaryPreviewUrl && previewRendersPdf && (
+                              // PDF.js viewer, not a native-viewer <iframe>: links
+                              // clicked inside the native viewer navigate the frame
+                              // itself, and sites that refuse framing (CSP
+                              // frame-ancestors) white the pane out instead of opening.
+                              <div className="h-[calc(100vh-6.5rem)] min-h-[520px] overflow-hidden rounded-2xl bg-white">
+                                <LatexPdfPane
+                                  // The viewer treats fileUrl swaps as recompiles
+                                  // (keeps scroll/page state) — a different file
+                                  // must remount with fresh state instead.
+                                  // stateKey then restores that file's own
+                                  // last position from the viewer cache.
+                                  key={activePreviewFile.id}
+                                  stateKey={activePreviewFile.id}
+                                  texPath={activePreviewFile.path}
+                                  pdfUrl={binaryPreviewUrl}
                                 />
                               </div>
                             )}
@@ -10145,66 +14949,131 @@ export default function WorkspacePage() {
                       ) : activeTexFile ? (
                         <div
                           ref={reserveCommentLane ? commentLaneRowRef : null}
-                          className={`flex h-full min-h-0 ${reserveCommentLane ? 'gap-3' : ''}`}
+                          // relative: seats the floating auto-fix offer card.
+                          className="relative flex h-full min-h-0 min-w-0 flex-col"
                         >
-                        <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
                           <div className="min-h-0 flex-1">
+                            {/* Chrome junction: 'cut' (full-height divider,
+                                edgeCut/headerCut hairlines on the bars) was
+                                chosen over 'low' — to flip back, pass
+                                dividerChrome="shim" here and drop the
+                                edgeCut/headerCut props. */}
                             <LatexWorkbench
                               isMobile={isMobile}
                               viewMode={latexViewMode}
                               onViewModeChange={handleLatexViewModeChange}
+                              // The lane joins the split BETWEEN the editor and the
+                              // PDF — parked to the right of the workbench it read as
+                              // "comments on the PDF" and sat a pane away from the text.
+                              commentLane={commentLaneColumn}
                               editor={(
+                                <div className="flex h-full min-h-0 flex-col">
+                                  {/* Formatting toolbar rides the editor pane
+                                      (Overleaf): it collapses with the pane in
+                                      PDF view, and carries the compile cluster
+                                      only in Source view, where the PDF header
+                                      that normally seats it is collapsed. */}
+                                  {!isMobile ? (
+                                    <LatexToolbarRow
+                                      {...latexEditorRefHandlers(textEditorRef)}
+                                      {...latexCompileProps}
+                                      readOnly={documentEditorReadOnly}
+                                      autoFix={latexAutoFix}
+                                      onToggleAutoFix={toggleLatexAutoFix}
+                                      autoCompile={latexAutoCompile}
+                                      onToggleAutoCompile={isLocalWorkspace ? undefined : toggleLatexAutoCompile}
+                                      showInPdfHint={synctexHint?.text ?? null}
+                                      showCompileControls={latexViewMode === 'source'}
+                                      edgeCut
+                                    />
+                                  ) : null}
+                                  <div className="min-h-0 flex-1 overflow-hidden">
                                 <CollabCodeEditor
                                   key={activeWorkspaceFile.id}
                                   fileId={activeWorkspaceFile.id}
                                   filePath={activeWorkspaceFile.path}
                                   collabPath={activeCollabPath}
                                   workspaceId={projectId}
+                                  apiFetch={apiFetch}
                                   user={collabUser}
                                   readOnly={documentEditorReadOnly}
-                                  canResolveSuggestions={canWrite}
+                                  canResolveSuggestions={activeFileCap.canWrite}
                                   editMode={effectiveDocEditMode === 'suggest' ? 'suggest' : 'edit'}
                                   bare
+                                  compileMarkers={latexMarkers}
                                   onImageUpload={handleLatexImageUpload}
                                   onReady={handleCodeEditorReady}
                                   onContentChange={handleViewerContentChange}
+                                  onLocalEdit={activeTexFile ? noteLatexLocalEdit : undefined}
                                   onConnectionStatusChange={setCollabStatus}
                                   pendingAdditions={spacePendingAdditions}
                                   onKeepAddition={handleSpaceKeepAddition}
                                   onUndoAddition={handleSpaceUndoAddition}
                                   onJumpToTurn={handleJumpToTurn}
+                                  revealPeer={peerReveal?.path === activeWorkspaceFile.path ? peerReveal : null}
+                                  onRevealPeerDone={handlePeerRevealDone}
+                                  onFocused={() => handleEditorFocusedPath(activeWorkspaceFile.path)}
+                                  onShowInPdf={handleSynctexForward}
                                   {...codeCommentProps}
                                 />
+                                  </div>
+                                </div>
                               )}
                               preview={(
                                 <LatexPdfPane
-                                  key={`${activeWorkspaceFile.path}:latex-pane`}
+                                  // File id, not path: common names (main.tex)
+                                  // would restore positions across workspaces,
+                                  // and a same-path file swap must remount so
+                                  // the mount-time state restore applies.
+                                  key={`${activeWorkspaceFile.id}:latex-pane`}
+                                  stateKey={activeWorkspaceFile.id}
                                   texPath={activeWorkspaceFile.path}
+                                  compileRootPath={latexRootPath}
                                   pdfUrl={latexCompile.pdfUrl}
                                   synctex={synctexIndex}
                                   onInverseSearch={handleSynctexInverse}
+                                  jumpTarget={synctexJump}
+                                  commentMarkers={pdfCommentMarkers}
+                                  onMarkerClick={pdfCommentsEnabled ? selectCommentThread : undefined}
+                                  // synctexIndex gates the offer itself: with
+                                  // no line map (pre-compile, older artifact)
+                                  // the bubble would silently do nothing.
+                                  onCommentSelection={
+                                    pdfCommentsEnabled && canCommentOnActiveFile && synctexIndex
+                                      ? handlePdfCommentSelection
+                                      : undefined
+                                  }
+                                  // Overleaf-style: the compile cluster tops
+                                  // the PDF pane — except in Source view,
+                                  // where the collapsed pane stays mounted and
+                                  // the toolbar seats the cluster instead
+                                  // (rendering both would double every compile
+                                  // control in the DOM). Mobile keeps it on
+                                  // the full-width toolbar. `dense` (narrow
+                                  // pane) sheds the cluster's diagnostics; the
+                                  // bottom summary bar still carries them.
+                                  headerCut
+                                  headerLeft={
+                                    !isMobile && latexViewMode !== 'source'
+                                      ? ({ dense }: { dense: boolean }) => (
+                                          <LatexCompileControls
+                                            {...latexCompileProps}
+                                            hideDiagnostics={dense}
+                                          />
+                                        )
+                                      : undefined
+                                  }
                                 />
                               )}
                             />
                           </div>
-                          <CompileSummaryBar
-                            compileError={latexCompile.compileError}
-                            errorLines={latexCompile.errorLines}
-                            logText={latexCompile.logText}
-                            stale={latexCompile.stale}
-                            lastCompiledAt={latexCompile.lastCompiledAt}
-                            compiling={latexCompile.compiling}
-                            canFix={canLatexFix}
-                            onFix={handleLatexFix}
-                            fixInFlight={fixInFlight}
-                            // Error lines map to the compiled root; only jump the
-                            // editor when the open file *is* that root (W1.root §3.3).
-                            onNavigateToLine={
-                              activeIsRoot ? (line) => textEditorRef.current?.revealLine?.(line) : undefined
-                            }
-                          />
-                        </div>
-                        {commentLaneColumn}
+                          {latexSuggestAutoFix ? (
+                            <AutoFixSuggestionCard onAnswer={handleLatexAutoFixSuggestion} />
+                          ) : showSynctexTip ? (
+                            // Same floating slot; the auto-fix offer (an actual
+                            // question) outranks the one-time teaching card.
+                            <SyncTexTipCard onDismiss={dismissSynctexTip} />
+                          ) : null}
                         </div>
                       ) : activeCodeFile ? (
                         <>
@@ -10223,7 +15092,7 @@ export default function WorkspacePage() {
                                     editable={!documentEditorReadOnly}
                                     suggesting={effectiveDocEditMode === 'suggest'}
                                     onRowOp={handleCsvRowOp}
-                                    onResolveSuggestion={canWrite ? handleCsvResolveSuggestion : undefined}
+                                    onResolveSuggestion={activeFileCap.canWrite ? handleCsvResolveSuggestion : undefined}
                                   />
                                 )}
                                 {activeJsonFile && (
@@ -10257,13 +15126,15 @@ export default function WorkspacePage() {
                                 filePath={activeWorkspaceFile.path}
                                 collabPath={activeCollabPath}
                                 workspaceId={projectId}
+                                apiFetch={apiFetch}
                                 user={collabUser}
                                 readOnly={documentEditorReadOnly}
-                                canResolveSuggestions={canWrite}
+                                canResolveSuggestions={activeFileCap.canWrite}
                                 editMode={effectiveDocEditMode === 'suggest' ? 'suggest' : 'edit'}
                                 hidden={hasRichViewer && showRichViewer}
                                 onReady={handleCodeEditorReady}
                                 onContentChange={handleViewerContentChange}
+                                onLocalEdit={activeTexFile ? noteLatexLocalEdit : undefined}
                                 onConnectionStatusChange={setCollabStatus}
                                 pendingAdditions={spacePendingAdditions}
                                 onKeepAddition={handleSpaceKeepAddition}
@@ -10274,6 +15145,9 @@ export default function WorkspacePage() {
                                     : undefined
                                 }
                                 onJumpToTurn={handleJumpToTurn}
+                                revealPeer={peerReveal?.path === activeWorkspaceFile.path ? peerReveal : null}
+                                onRevealPeerDone={handlePeerRevealDone}
+                                onFocused={() => handleEditorFocusedPath(activeWorkspaceFile.path)}
                                 {...codeCommentProps}
                               />
                             </div>
@@ -10341,7 +15215,6 @@ export default function WorkspacePage() {
                               <MarkdownEditorFrame
                                 editor={isMarkdownFile(activeWorkspaceFile) ? markdownEditor : null}
                                 readOnly={documentEditorReadOnly}
-                                showMenuBar={false}
                                 showToolbar={false}
                                 zoom={editorZoom}
                                 lineHeight={editorLineHeight}
@@ -10352,6 +15225,15 @@ export default function WorkspacePage() {
                                   !isMarkdownFile(activeWorkspaceFile)
                                 }
                               >
+                                {/* Inline title (⋯ → Show file title): the doc's
+                                    H1 is the file name, display-only — mirrors
+                                    .tiptap h1 metrics, never touches the
+                                    markdown itself. */}
+                                {showDocTitle && activeIsMarkdown && !showRawView ? (
+                                  <h1 className="mb-3 text-[1.875rem] font-bold leading-[1.2]">
+                                    {formatFileName(getFileName(activeWorkspaceFile.path)).replace(/\.[^.]+$/, '')}
+                                  </h1>
+                                ) : null}
                                 <CollabEditor
                                   key={activeWorkspaceFile.id}
                                   fileId={activeWorkspaceFile.id}
@@ -10360,29 +15242,43 @@ export default function WorkspacePage() {
                                   workspaceId={projectId}
                                   user={collabUser}
                                   readOnly={documentEditorReadOnly}
-                                  canResolveSuggestions={canWrite}
-                                  forceSuggesting={!canWrite}
+                                  canResolveSuggestions={activeFileCap.canWrite}
+                                  forceSuggesting={!activeFileCap.canWrite}
                                   codeMode={hasRichViewer}
                                   hidden={showRawView || (hasRichViewer && showRichViewer)}
                                   onReady={handleEditorReady}
                                   onContentChange={hasRichViewer && showRichViewer ? handleViewerContentChange : undefined}
                                   onConnectionStatusChange={setCollabStatus}
                                   pendingAdditions={spacePendingAdditions}
+                                  suggestionAuthors={spaceSuggestionAuthors}
+                                  attributionRanges={showAuthorship ? authorshipRanges : undefined}
                                   onKeepAddition={handleSpaceKeepAddition}
                                   onUndoAddition={handleSpaceUndoAddition}
                                   onJumpToTurn={handleJumpToTurn}
                                   onNavigateToFile={(file) => {
-                                    if (file) {
-                                      setSelectedFilePath(file);
-                                      if (!isMobile) setOpenLeftRail('project');
+                                    if (!file) return;
+                                    // Claim a pane like every other open path:
+                                    // a bare selection can't move the primary
+                                    // when the file is already displayed in a
+                                    // side pane, and the claim is what keeps
+                                    // the primary's body and strip in step.
+                                    if (isMobile) setSelectedFilePath(file);
+                                    else {
+                                      claimPrimaryWithFile(file);
+                                      setOpenLeftRail('project');
                                     }
                                   }}
+                                  onNavigateToWikiTarget={handleWikiNavigate}
+                                  fetchWikiNoteText={fetchWikiNoteText}
                                   wikiLinkSuggestions={wikiLinkSuggestions}
                                   commentRanges={resolvedCommentRanges}
                                   draftCommentRange={draftCommentRange}
                                   activeCommentThreadId={activeCommentThreadId}
                                   onSelectComment={selectCommentThread}
                                   onImageDrop={handleEditorImageDrop}
+                                  revealPeer={peerReveal?.path === activeWorkspaceFile.path ? peerReveal : null}
+                                  onRevealPeerDone={handlePeerRevealDone}
+                                  onFocused={() => handleEditorFocusedPath(activeWorkspaceFile.path)}
                                 />
                               </MarkdownEditorFrame>
                             </div>
@@ -10393,17 +15289,25 @@ export default function WorkspacePage() {
                       </div>
                       </div>
                     </div>
-                  ) : (
+                  ) : filesLoaded && chatsLoaded ? (
+                    // Only once both lists have landed: "nothing open" is a
+                    // statement about the workspace, and asserting it over a
+                    // still-booting one is the arrival flash the founder read
+                    // as an error.
                     <div className="flex flex-col items-center justify-center gap-3 h-full text-stone-400">
-                      <SunnyAnimation name="shrug" className="w-28 opacity-90" />
+                      {/* Sunny scanning for something to open — the current
+                          animation rig, same as every other empty surface. */}
+                      <SunnyAnimation name="telescope" className="w-28 opacity-90" />
                       <p>Nothing open. Pick a file or chat from the sidebar.</p>
                     </div>
-                  )}
+                  ) : null}
                 </div>
-                {/* Status pill: quiet file facts anchored to THIS doc pane's
-                    bottom-right (never window-fixed, so it can't overlay
-                    chats, empty states, or other panes). Primary pane, real
-                    file documents only — no folders/binaries. */}
+                {/* Status pill: quiet file facts anchored INTO this doc pane's
+                    bottom-right corner (never window-fixed, so it can't overlay
+                    chats, empty states, or other panes). bottom-0/right-0 with
+                    the radius + hairline on the two inner edges only, so it
+                    reads as chrome rather than a card floating over the
+                    document. Primary pane, real file documents only. */}
                 {!isMobile &&
                 activeWorkspaceFile &&
                 activeWorkspaceFile.type !== 'folder' &&
@@ -10411,38 +15315,42 @@ export default function WorkspacePage() {
                 !isBinaryFile(activeWorkspaceFile) ? (
                   <div
                     data-testid="status-pill"
-                    className="absolute bottom-2 right-3 z-20 flex items-center gap-1 rounded-md border border-stone-200 bg-white/95 px-2.5 py-1 text-[11px] text-stone-500 shadow-sm print:hidden"
+                    className="absolute bottom-0 right-0 z-20 flex items-center gap-1 rounded-tl-md border-l border-t border-stone-200 bg-white px-2.5 py-1 text-[11px] text-stone-500 print:hidden"
                   >
-                    {docStats ? (
-                      <span>
-                        {docStats.words.toLocaleString()} words · {docStats.chars.toLocaleString()} characters ·{' '}
-                      </span>
-                    ) : null}
-                    <span>
+                    {/* Word/char counts live in their own component — the
+                        per-keystroke updates must not re-render this page. */}
+                    <DocStatsSpan editor={activeIsMarkdown ? markdownEditor : null} />
+                    {/* Relative ("now", "5h", "Yesterday") — the full
+                        date+time spent far more width than it earned. */}
+                    <span
+                      title={(() => {
+                        const raw = activeWorkspaceFile.updated_at ?? activeWorkspaceFile.created_at;
+                        return raw
+                          ? new Date(raw).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+                          : undefined;
+                      })()}
+                    >
                       {(() => {
                         const raw = activeWorkspaceFile.updated_at ?? activeWorkspaceFile.created_at;
-                        if (!raw) return 'Edited recently';
-                        return `Edited ${new Date(raw).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}`;
+                        return raw ? `Edited ${formatRelativeTimeShort(raw)}` : 'Edited recently';
                       })()}
                     </span>
-                    {isLocalWorkspace ? (
-                      localSharedScopePaths.has('') ||
-                      localSharedScopePaths.has(activeWorkspaceFile.path) ||
-                      [...localSharedScopePaths].some(
-                        (scope) => scope !== '' && activeWorkspaceFile.path.startsWith(`${scope}/`),
-                      ) ? (
-                        <button type="button" onClick={openShare} className="underline hover:text-stone-700">
+                    {(isLocalWorkspace || canShowShareControls) && activeFileShare.status !== 'private' ? (
+                      // Manages what it reports: the grant that actually
+                      // covers this file (its own or an ancestor folder's),
+                      // else the workspace share it inherits from. A scoped
+                      // guest manages neither — for them it's a plain label.
+                      openReportedShare ? (
+                        <button type="button" onClick={openReportedShare} className="underline hover:text-stone-700">
                           · Shared
                         </button>
                       ) : (
-                        // Founder: unshared local files just say "Local" — no
-                        // privacy sentence.
-                        <span>· Local</span>
+                        <span>· Shared</span>
                       )
-                    ) : canShowShareControls && shareStatus !== 'private' ? (
-                      <button type="button" onClick={openShare} className="underline hover:text-stone-700">
-                        · Shared
-                      </button>
+                    ) : isLocalWorkspace ? (
+                      // Founder: unshared local files just say "Local" — no
+                      // privacy sentence.
+                      <span>· Local</span>
                     ) : null}
                   </div>
                 ) : null}
@@ -10483,12 +15391,20 @@ export default function WorkspacePage() {
                       paneFile && frozenMove
                         ? remapPath(paneFile.path, frozenMove.to, frozenMove.from)
                         : paneFile?.path;
+                    const paneChrome =
+                      paneFile && paneFile.type !== 'folder' && !isBinaryFile(paneFile)
+                        ? buildSplitPaneChrome(paneFile, paneEntry.id, paneEditors[paneEntry.id] ?? null)
+                        : null;
                     return (
                       <div
                         key={paneEntry.id}
                         data-testid="editor-pane-secondary"
                         className="relative flex min-w-0 flex-1 flex-col overflow-hidden border-l border-stone-200 print:hidden"
                         style={{ flexGrow: paneGrow[paneEntry.id] ?? 1 }}
+                        onPointerDownCapture={() => {
+                          lastFocusedPaneIdRef.current = paneEntry.id;
+                          setFocusedPaneId(paneEntry.id);
+                        }}
                       >
                         {/* Boundary drag: resize this pane against its left
                             neighbor. Hidden during tab drags so the drop
@@ -10504,6 +15420,7 @@ export default function WorkspacePage() {
                             paneDropZone?.paneId === paneEntry.id ? paneDropZone.zone : undefined,
                           )}
                         >
+                        {desktopTabs ? (
                         <div
                           className="flex shrink-0 items-stretch"
                           // The rightmost strip runs under the pinned top-right
@@ -10516,7 +15433,6 @@ export default function WorkspacePage() {
                               : undefined
                           }
                         >
-                        {desktopTabs ? (
                         <EditorTabStrip
                           className="min-w-0 flex-1"
                           dragRegion={isDesktopApp}
@@ -10528,6 +15444,8 @@ export default function WorkspacePage() {
                           onCloseTab={(path) => handlePaneTabClose(paneEntry.id, path)}
                           onDropTab={(payload, index) => handlePaneTabDrop(paneEntry.id, payload, index)}
                           onTabDragChange={handleTabDragChange}
+                          onSplitRight={(path) => handleTabSplitRight(paneEntry.id, path)}
+                          canSplit={editorPanes.length < MAX_EDITOR_PANES}
                           renamingPath={
                             renameEntry?.source === 'tab' && renameEntry.paneId === paneEntry.id
                               ? renameEntry.path
@@ -10538,45 +15456,38 @@ export default function WorkspacePage() {
                           onRenameValueChange={handleTabRenameValueChange}
                           onCommitRename={() => void commitRename()}
                           onCancelRename={cancelRename}
+                          trailing={renderNewTabLauncher(paneEntry.id)}
                         />
-                        ) : (
-                          // Web shell: no strip — the chat pane's own header
-                          // (title + close ×) is the surface's chrome; this
-                          // empty segment keeps the one-bar line continuous.
-                          <div
-                            aria-hidden
-                            className="h-11 min-w-0 flex-1 border-b border-stone-200/60 bg-stone-100/70"
-                          />
-                        )}
                         </div>
+                        ) : null}
                         <div className="relative flex min-h-0 flex-1 flex-col">
-                          {isChatTab(paneEntry.active) ? renderChatSurface(false) : (
+                          {isChatTab(paneEntry.active) ? renderChatSurface(false) : isLauncherTab(paneEntry.active) ? renderLauncherPanel(paneEntry.id) : isReviewTab(paneEntry.active) ? renderChatEditsSurface(paneEntry.active) : isDiffTab(paneEntry.active) ? renderDiffSurface(paneEntry.active) : (
                           <SplitEditorPaneReviewBody
                             file={paneFile}
                             collabPath={paneCollabPath}
+                            onEditorFocused={handleEditorFocusedPath}
                             isMarkdown={isMarkdownFile(paneFile)}
                             isBinary={isBinaryFile(paneFile)}
                             workspaceId={projectId}
                             user={collabUser}
-                            // Viewing locks every split pane: unlike the
-                            // primary, a split has no per-pane mode picker to
-                            // surface a view→edit coercion, so an editable
-                            // code pane under a "Viewing" workspace would be
-                            // silent. Suggesting stages code edits as usual.
-                            readOnly={documentReadOnly || documentEditMode === 'view'}
-                            // Commenters are pinned to suggest synchronously —
-                            // never let a pre-pin render mount direct-edit.
-                            editMode={!canWrite || documentEditMode === 'suggest' ? 'suggest' : 'edit'}
-                            // Commenters may propose but never resolve — the
-                            // same gates the primary editors apply.
-                            canResolveSuggestions={canWrite}
-                            forceSuggesting={!canWrite}
+                            onMarkdownEditor={paneEditorSetter(paneEntry.id)}
+                            // The primary's doc chrome + mode semantics, per
+                            // file: header row, toolbar controls, and the
+                            // same commenter pins (suggest-only, never resolve).
+                            {...(paneChrome ?? {
+                              readOnly: documentReadOnly || documentEditMode === 'view',
+                              editMode: !canWrite || documentEditMode === 'suggest' ? 'suggest' : 'edit',
+                              canResolveSuggestions: canWrite,
+                              forceSuggesting: !canWrite,
+                            })}
                             // Each split fetches its own pending turns, so
                             // Sunny's diffs stay reviewable in a pane showing
                             // a file other than the page's selection.
-                            reviewWorkspaceId={cloudProjectId}
+                            reviewWorkspaceId={projectId}
+                            reviewApiFetch={apiFetch}
                             reviewInvalidationToken={pendingEditsInvalidationToken}
                             resolveAuthorLabel={resolvePendingEditAuthorLabel}
+                            resolveAuthorVisual={resolvePendingEditAuthorVisual}
                             onJumpToTurn={handleJumpToTurn}
                           />
                           )}
@@ -10598,11 +15509,16 @@ export default function WorkspacePage() {
               {!isMobile && rightDockView !== null ? (
                 <div
                   data-testid="right-dock"
-                  style={{ width: reviewPanelWidth }}
+                  style={panelViewActive ? undefined : { width: reviewPanelWidth }}
                   // max-lg:flex-1 gives it flex-basis 0, so the resized px width
                   // is ignored below lg and the flex-[2] editor keeps priority.
-                  className="order-3 relative flex min-h-0 min-w-[320px] max-lg:min-w-0 max-lg:flex-1 flex-col overflow-hidden bg-stone-50 border-l border-stone-200"
+                  // Panel view: the dock IS the one surface, overlaying the pane
+                  // full-width (the rail overlay at z-20 still wins above it).
+                  className={panelViewActive
+                    ? 'absolute inset-0 z-10 flex min-h-0 flex-col overflow-hidden bg-stone-50'
+                    : 'order-3 relative flex min-h-0 min-w-[320px] max-lg:min-w-0 max-lg:flex-1 flex-col overflow-hidden bg-stone-50 border-l border-stone-200'}
                 >
+                  {panelViewActive ? null : (
                   <ResizeHandle
                     side="left"
                     min={REVIEW_PANEL_MIN_WIDTH}
@@ -10614,6 +15530,7 @@ export default function WorkspacePage() {
                     // leave a dead, misleading target.
                     className="max-lg:hidden"
                   />
+                  )}
                   {/* The dock's own icon strip (Open Knowledge pattern): the
                       view switchers live ON the panel they change. The
                       deep-linked diff's Review link trails last — lower-key
@@ -10634,7 +15551,7 @@ export default function WorkspacePage() {
                         rightDockView === 'outline' ? 'bg-stone-100 text-stone-700' : 'text-stone-400 hover:text-stone-600'
                       }`}
                     >
-                      <ListIcon className="h-5 w-5" weight={rightDockView === 'outline' ? 'bold' : 'regular'} aria-hidden />
+                      <ListBulletsIcon className="h-5 w-5" weight={rightDockView === 'outline' ? 'bold' : 'regular'} aria-hidden />
                       <IconTooltip label="Outline" />
                     </button>
                     <button
@@ -10650,6 +15567,21 @@ export default function WorkspacePage() {
                       <ClockCounterClockwiseIcon className="h-5 w-5" weight={rightDockView === 'history' ? 'bold' : 'regular'} aria-hidden />
                       <IconTooltip label="History" />
                     </button>
+                    {savedFlags?.sundial_support_enabled === true ? (
+                      <button
+                        type="button"
+                        data-testid="dock-view-support"
+                        onClick={() => openRightDock('support')}
+                        aria-pressed={rightDockView === 'support'}
+                        aria-label="Sundial Support"
+                        className={`relative group/tip inline-flex h-8 w-8 items-center justify-center rounded-lg hover:bg-stone-100 ${
+                          rightDockView === 'support' ? 'bg-stone-100 text-stone-700' : 'text-stone-400 hover:text-stone-600'
+                        }`}
+                      >
+                        <ChatCircleDotsIcon className="h-5 w-5" weight={rightDockView === 'support' ? 'bold' : 'regular'} aria-hidden />
+                        <IconTooltip label="Support" />
+                      </button>
+                    ) : null}
                     {standaloneDiffHref && isSpaceMode && selectedFilePath ? (
                       <Link
                         href={standaloneDiffHref}
@@ -10659,7 +15591,13 @@ export default function WorkspacePage() {
                       </Link>
                     ) : null}
                   </div>
-                  {rightDockView === 'outline' ? (
+                  {rightDockView === 'support' ? (
+                    <div
+                      ref={setSupportPanelHost}
+                      data-testid="sundial-support-panel-host"
+                      className="flex min-h-0 flex-1 flex-col"
+                    />
+                  ) : rightDockView === 'outline' ? (
                     <div data-testid="outline-lane" className="flex min-h-0 flex-1 flex-col py-2">
                       <MarkdownTOC headings={outlineLaneOpen ? outlineHeadings : []} onSelect={handleOutlineSelect} />
                       {!outlineLaneOpen ? (
@@ -10702,6 +15640,11 @@ export default function WorkspacePage() {
                           ? activeWorkspaceFile.path
                           : null
                       }
+                      // Same Realtime `doc_edits` signal the inline diff overlay
+                      // rides, so the timeline reflects your own typing (and a
+                      // collaborator's) about a second after it persists,
+                      // instead of on the panel's 4s backstop poll.
+                      refreshKey={pendingEditsInvalidationToken}
                       onHandoffToChat={handleReviewHandoffToChat}
                       onOpenFile={handleOpenReviewFile}
                       onOpenChatTurn={handleOpenReviewChatTurn}
@@ -10712,8 +15655,15 @@ export default function WorkspacePage() {
                   )}
                 </div>
               ) : null}
-              {chatColumnVisible ? (
-                <div className="order-3 relative flex min-h-0 flex-1 flex-col bg-stone-50">
+              {/* Authorship lens hover card — before/after for the annotated run. */}
+      {!isMobile && showAuthorship ? <AuthorshipHoverCard onOpenTurn={handleJumpToTurn} /> : null}
+      {chatColumnVisible ? (
+                // min-w-0: without it this flex child bottoms out at its
+                // content's min width (the composer toolbar row), overflowing
+                // narrow phones — the send/mic/model controls clipped off the
+                // right edge, and the composer's own fold-into-＋ logic never
+                // engaged because it measured the inflated row.
+                <div className="order-3 relative flex min-h-0 min-w-0 flex-1 flex-col bg-stone-50">
                   {renderChatSurface(true)}
                 </div>
               ) : null}
@@ -10723,6 +15673,9 @@ export default function WorkspacePage() {
             {/* Pinned top-right cluster — absolute against this content row so
                 it survives splits, the right dock, and the commit diff view. */}
             {!isMobile ? topBarRightControls : null}
+            {!isMobile && !desktopTabs && openLeftRail === null && !docsHeaderOwnsTopLeft
+              ? topBarLeftFloat
+              : null}
           </div>
 
         </div>
@@ -10742,7 +15695,7 @@ export default function WorkspacePage() {
         }}
       />
 
-      <AddRepoModal
+      {showAddRepoModal ? <AddRepoModal
         open={showAddRepoModal}
         onClose={() => setShowAddRepoModal(false)}
         projectId={projectId}
@@ -10755,8 +15708,8 @@ export default function WorkspacePage() {
           // Land the user where push/pull/commit live for the repo they just added.
           openSyncSection();
         }}
-      />
-      <AddOverleafModal
+      /> : null}
+      {showAddOverleafModal ? <AddOverleafModal
         open={showAddOverleafModal}
         onClose={() => setShowAddOverleafModal(false)}
         projectId={projectId}
@@ -10767,17 +15720,100 @@ export default function WorkspacePage() {
         }}
         linkedProjects={linkedRepos
           .filter((r) => r.provider === 'overleaf')
-          .map((r) => ({ id: r.id, label: r.repoLabel }))}
+          .map((r) => ({ id: r.id, label: r.repoLabel, joinLink: r.bridgeState?.joinLink ?? null }))}
         onOpenSync={openSyncSection}
+      /> : null}
+      <OpenWithModal
+        open={showOpenWithModal}
+        onClose={() => setShowOpenWithModal(false)}
+        linkedRepos={linkedRepos.map((r) => ({
+          id: r.id,
+          provider: r.provider,
+          label: r.repoLabel,
+          htmlUrl: r.htmlUrl,
+        }))}
+        // Link flows hand off to the existing modals (sign-in gated, with the
+        // return-trip deep link reopening them after Clerk).
+        onLinkOverleaf={
+          canWrite
+            ? () => {
+                setShowOpenWithModal(false);
+                connectOrSignIn(() => setShowAddOverleafModal(true), { modal: 'addOverleaf' });
+              }
+            : undefined
+        }
+        onAddRepo={
+          canWrite
+            ? () => {
+                setShowOpenWithModal(false);
+                connectOrSignIn(() => setShowAddRepoModal(true), { modal: 'addRepo' });
+              }
+            : undefined
+        }
+        onAddRepoHover={() => prefetchRepositories(user?.id)}
       />
-      <LinkTextChatModal
+      {cloudSignInPrompt ? <CloudAgentSignInModal
+        open={cloudSignInPrompt !== null}
+        onCancel={() => setCloudSignInPrompt(null)}
+        onSignIn={() => {
+          const prompt = cloudSignInPrompt;
+          setCloudSignInPrompt(null);
+          if (!prompt) return;
+          // Clerk reloads the page on success, which would drop the in-memory
+          // draft — park it so the return trip rehydrates the composer.
+          stashPendingDraft(projectId, prompt.draft);
+          openSignIn(prompt.redirectUrl ? { redirectUrl: prompt.redirectUrl } : undefined);
+        }}
+      /> : null}
+      {showAddSkillModal && <AddSkillModal
+        open={showAddSkillModal}
+        onClose={() => setShowAddSkillModal(false)}
+        projectId={projectId}
+        canSaveSecrets={canAccessSecrets === true}
+        onAdded={(path) => {
+          // `skills/` is agent metadata, so the new file would land invisible
+          // if the eye toggle is off — reveal it, then open it.
+          setShowAgentMetaFiles(true);
+          setSelectedFilePath(path);
+          pollFilesUntilSettled();
+        }}
+      />}
+      {linkTextChatId ? <LinkTextChatModal
         open={Boolean(linkTextChatId)}
         chatId={linkTextChatId}
         chatLabel={chatEntries.find((entry) => entry.chat.id === linkTextChatId)?.chat.title ?? null}
         onClose={() => setLinkTextChatId(null)}
-      />
+      /> : null}
+      {projectId ? (
+        <SchedulesPanel
+          onRequireSignIn={() => {
+            setSchedulesPanelMode(null);
+            openSignIn({ redirectUrl: buildReturnPath({}) });
+          }}
+          open={schedulesPanelMode !== null}
+          startInCreate={schedulesPanelMode === 'create'}
+          onClose={() => setSchedulesPanelMode(null)}
+          projectId={projectId}
+          currentChatId={currentChatId && !isDraftChatId(currentChatId) ? currentChatId : null}
+          onOpenChat={(chatId) => {
+            setSchedulesPanelMode(null);
+            void openChatById(chatId, { sidePanel: true });
+          }}
+        />
+      ) : null}
 
-      <CommandPalette
+      {/* Embedded panel (?view=panel): the floating surface switcher — every
+          button REPLACES the single surface, mirroring the /g/show contract.
+          Mobile widths keep their own one-surface nav. */}
+      {panelViewActive && !isMobile ? (
+        <PanelSurfaceSwitcher
+          surfaces={panelSurfaces}
+          active={panelActiveSurface}
+          onSelect={showPanelSurface}
+        />
+      ) : null}
+
+      {commandPaletteOpen ? <CommandPalette
         open={commandPaletteOpen}
         onClose={() => setCommandPaletteOpen(false)}
         files={reviewFiles}
@@ -10786,10 +15822,61 @@ export default function WorkspacePage() {
           const file = workspaceFileByPath.get(path);
           if (!file || file.type === 'folder') return;
           setSidebarSections((prev) => expandSection(prev, 'files'));
+          // A chooser-launched palette fills the CHOOSER's pane — in a split,
+          // handleFileClick would claim whichever pane shows a file and
+          // strand the New tab. replaceActiveTab consumes the launcher there.
+          const targetPane = paletteTargetPaneId
+            ? editorPanesRef.current.find((p) => p.id === paletteTargetPaneId)
+            : undefined;
+          if (targetPane && isLauncherTab(targetPane.active) && !isMobile) {
+            setEditorPanes((prev) => {
+              const next = replaceActiveTab(prev, targetPane.id, file.path);
+              // Same withdrawal claimPrimaryWithFile does: a chooser opened
+              // over a chat tab leaves the legacy 'chat' reveal intent set,
+              // and a reload would re-cover the picked file with the chat.
+              const chatStillVisible = next.some((pane) => isChatTab(pane.active));
+              queueMicrotask(() => {
+                if (!chatStillVisible) setOpenPanels((op) => removePanel(op, 'chat'));
+              });
+              return next;
+            });
+            lastFocusedPaneIdRef.current = targetPane.id;
+            if (targetPane.id === PRIMARY_PANE_ID) {
+              setSelectedFilePath(file.path);
+              setSelectedCommit(null);
+            }
+            setWorkspaceViewMode('space');
+            return;
+          }
+          // Replace semantics — handleFileClick is what every other open path
+          // uses (an active launcher tab in the claimed pane is consumed).
           handleFileClick(file);
         }}
-        actions={paletteActions}
-      />
+        chats={paletteChats}
+        // Same semantics as clicking the chat in the rail — desktop shell
+        // opens the chat tab (sundial-chat://), web shell replaces on the
+        // right. A chooser-launched palette instead fills the CHOOSER's pane
+        // (handlePaneTabActivate's chat path), consuming its launcher tab.
+        onOpenChat={(chatId) => {
+          const targetPane = paletteTargetPaneId
+            ? editorPanesRef.current.find((p) => p.id === paletteTargetPaneId)
+            : undefined;
+          if (targetPane && isLauncherTab(targetPane.active) && !isMobile) {
+            lastFocusedPaneIdRef.current = targetPane.id;
+            setEditorPanes((prev) =>
+              enforceSingleActiveChat(openPaneTab(prev, targetPane.id, chatTab(chatId)), targetPane.id),
+            );
+            void openChatByIdRef.current(chatId);
+            return;
+          }
+          void openChatById(chatId, { sidePanel: true });
+        }}
+        // Chooser mode ("Open file" from a New-tab panel) is a file/chat
+        // SEARCH: the global action rows would bypass the target-pane
+        // consumption path (and the panel already offers create/chat/connect
+        // itself), so they hide.
+        actions={paletteTargetPaneId ? [] : paletteActions}
+      /> : null}
 
       <ModalShell
         open={!isMobile && showSettingsModal}
@@ -10816,16 +15903,15 @@ export default function WorkspacePage() {
           </div>
           <div className="space-y-0.5">
             <div className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-stone-400">
-              Workspace
-            </div>
-            {renderContextTabButton('workspace', 'Workspace', <WorkspaceInstructionsIcon />)}
-            {canAccessSecrets === true && renderContextTabButton('secrets', 'Secrets', <WorkspaceSecretsIcon />)}
-          </div>
-          <div className="space-y-0.5">
-            <div className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-stone-400">
               User
             </div>
-            {renderContextTabButton('preferences', 'Preferences', <WorkspacePreferencesIcon />)}
+            {renderContextTabButton('appearance', 'Appearance', <WorkspaceAppearanceIcon />)}
+            {renderContextTabButton('preferences', 'Advanced', <WorkspacePreferencesIcon />)}
+            {renderContextTabButton(
+              'shortcuts',
+              'Shortcuts',
+              <KeyboardIcon className="h-4 w-4" weight="fill" aria-hidden />,
+            )}
             {renderContextTabButton(
               'billing',
               'Billing',
@@ -10858,7 +15944,34 @@ export default function WorkspacePage() {
                 'ChatGPT & Claude.ai',
                 <SparkleIcon className="h-4 w-4" weight="fill" aria-hidden />,
               )}
+            {/* The onboarding checklist's home since it left the sidebar. */}
+            {renderContextTabButton(
+              'gettingStarted',
+              'Get set up',
+              <CheckCircleIcon className="h-4 w-4" weight="fill" aria-hidden />,
+            )}
           </div>
+          <div className="space-y-0.5">
+            <div className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-stone-400">
+              Workspace
+            </div>
+            {renderContextTabButton('workspace', 'Workspace', <WorkspaceInstructionsIcon />)}
+            {canAccessSecrets === true && renderContextTabButton('secrets', 'Secrets', <WorkspaceSecretsIcon />)}
+          </div>
+          {/* Absent without a Clerk session to end (see OptionalClerkMethods). */}
+          {clerkSignOut ? (
+            <div className="mt-auto border-t border-stone-200 pt-2">
+              <button
+                type="button"
+                onClick={() => void clerkSignOut({ redirectUrl: '/' })}
+                data-testid="settings-sign-out"
+                className="group/tab flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm font-medium text-stone-500 transition-colors hover:bg-stone-100 hover:text-stone-700"
+              >
+                <SignOutIcon className="h-4 w-4 shrink-0 text-stone-400 transition-colors group-hover/tab:text-orange" weight="regular" aria-hidden />
+                <span className="truncate">Sign out</span>
+              </button>
+            </div>
+          ) : null}
         </aside>
 
         <div className="flex min-h-0 flex-1 flex-col bg-white">
@@ -10890,6 +16003,7 @@ export default function WorkspacePage() {
             <WorkspaceTab
               workspaceId={projectId}
               canWrite={canWrite}
+              isOwner={isOwner}
               spaceInstructions={spaceInstructions}
               onSpaceInstructionsChange={setSpaceInstructions}
               agentsFile={agentsFile}
@@ -10910,7 +16024,19 @@ export default function WorkspacePage() {
             />
           )}
 
+          {settingsTab === 'appearance' && (
+            <div className="min-h-0 flex-1 overflow-auto px-4 py-4">
+              <AppearanceSection
+                // Tabs/No tabs is desktop-shell chrome — the web build is
+                // always tab-less, so the section hides there.
+                tabs={desktopTabs}
+                onSelectTabs={inDesktopShell ? setTabsEnabled : undefined}
+              />
+            </div>
+          )}
+
           {settingsTab === 'preferences' && renderPreferencesPanel('desktop')}
+          {settingsTab === 'shortcuts' && renderShortcutsPanel('desktop')}
 
           {settingsTab === 'billing' && (
             <div className="min-h-0 flex-1 overflow-y-auto p-4">
@@ -10925,6 +16051,11 @@ export default function WorkspacePage() {
           {settingsTab === 'apikeys' && <UserApiKeysTab />}
 
           {settingsTab === 'chatApps' && !isLocalWorkspace && <HostedConnectorTab />}
+          {settingsTab === 'gettingStarted' && (
+            <div className="max-w-xl px-6 py-8">
+              <GetSetUpCard config={localConfig} projectId={projectId} />
+            </div>
+          )}
         </div>
       </ModalShell>
 
@@ -11066,38 +16197,14 @@ export default function WorkspacePage() {
       </ModalShell>
 
       {/* Mobile overlay panels */}
-      {isMobile && mobilePanel === 'chats' && (
-        <div className="fixed inset-0 z-50 bg-white flex flex-col">
-          <div className="h-12 px-4 flex items-center justify-between border-b border-stone-100 shrink-0">
-            <div className="flex items-center gap-2">
-              <span className="text-sm font-semibold text-stone-800">Chats</span>
-            </div>
-            <div className="flex items-center gap-1">
-              {canWrite && (
-                <button
-                  type="button"
-                  onClick={guideAssistantPickerFromSidebar}
-                  aria-label="New chat"
-                  data-testid="new-chat-button"
-                  className="relative group/tip p-2 rounded-lg hover:bg-stone-100 text-stone-500"
-                >
-                  <PlusIcon className="w-5 h-5" weight="bold" aria-hidden />
-                  <IconTooltip label="New chat" />
-                </button>
-              )}
-              <button onClick={() => setMobilePanel(null)} aria-label="Close" className="p-2 -mr-1 rounded-lg hover:bg-stone-100 text-stone-400">
-                <XIcon className="w-5 h-5" weight="bold" aria-hidden />
-              </button>
-            </div>
-          </div>
-          <div className="flex-1 overflow-auto px-2.5 py-2.5 space-y-1">
-            {renderChatRail('mobile')}
-          </div>
-        </div>
-      )}
-
+      {/* The unified mobile side panel ('files' is a legacy name): files tree
+          + chats stacked, mirroring the desktop rail — the old separate chats
+          drawer folded in here (founder: one side panel, not two icons). */}
       {isMobile && mobilePanel === 'files' && (
-        <div className="fixed inset-0 z-50 bg-white flex flex-col">
+        // h-dvh (not inset-0): the visible-viewport height, so the bottom of
+        // the list can't hide behind iOS Safari's toolbar (inset-0 spans the
+        // taller layout viewport).
+        <div className="fixed inset-x-0 top-0 z-50 h-dvh bg-white flex flex-col">
           <div className="h-12 px-4 flex items-center justify-between border-b border-stone-100 shrink-0">
             {/* The files list is the workspace's contents, so its header
                 carries the workspace identity + switcher — the only workspace
@@ -11126,15 +16233,13 @@ export default function WorkspacePage() {
                   type="button"
                   onClick={toggleWorkspaceSwitcher}
                   data-workspace-switcher-trigger
-                  className="flex min-w-0 items-center gap-1 rounded-lg text-left"
+                  className="flex min-w-0 items-center gap-1.5 rounded-lg text-left"
                   title={projectTitle}
                 >
+                  {/* New identity style: kind icon + name, no caret — tap
+                      opens the workspace menu (mobile has no right-click). */}
+                  {workspaceKindIcon}
                   <span className="truncate text-sm font-semibold text-stone-800">{projectTitle}</span>
-                  <CaretDownIcon
-                    className={`w-3 h-3 shrink-0 text-stone-400 transition-transform ${showWorkspaceSwitcher ? 'rotate-180' : ''}`}
-                    weight="bold"
-                    aria-hidden
-                  />
                 </button>
               )}
               {workspaceSwitcherMenu}
@@ -11179,13 +16284,33 @@ export default function WorkspacePage() {
               {(foldersByParent.__root__ ?? []).length === 0 && rootFiles.length === 0 && filesLoaded && (
                 <div className="px-1 text-sm text-stone-400">No files yet.</div>
               )}
+              <div className="border-t border-stone-100 pt-3">
+                <div className="mb-1 flex items-center justify-between px-1">
+                  <span className="text-sm font-semibold text-stone-800">Chats</span>
+                  {canWrite && (
+                    <button
+                      type="button"
+                      onClick={guideAssistantPickerFromSidebar}
+                      aria-label="New chat"
+                      data-testid="new-chat-button"
+                      className="relative group/tip p-1.5 rounded-lg hover:bg-stone-100 text-stone-500"
+                    >
+                      <PlusIcon className="w-4 h-4" weight="bold" aria-hidden />
+                      <IconTooltip label="New chat" />
+                    </button>
+                  )}
+                </div>
+                <div className="space-y-1">{renderChatRail('mobile')}</div>
+              </div>
             </div>
           </div>
         </div>
       )}
 
       {isMobile && showReviewPanel && deepLinkedDiffId ? (
-        <div data-testid="mobile-diff-review" className="fixed inset-0 z-50 flex flex-col bg-white">
+        // h-dvh: same iOS visible-viewport rule as the files drawer — the
+        // review footer actions must not sit behind Safari's bottom bar.
+        <div data-testid="mobile-diff-review" className="fixed inset-x-0 top-0 z-50 flex h-dvh flex-col bg-white">
           <DiffReviewPanel
             assistantMessageId={deepLinkedDiffId}
             workspaceTitle={projectTitle}
@@ -11212,7 +16337,7 @@ export default function WorkspacePage() {
                 <h2 className="mt-2 truncate text-base font-semibold text-stone-800">{chatDetailsDisplayName}</h2>
                 {typeof chatDetailsEntry.chat.sunny_number === 'number' && (
                   <div className="mt-0.5 text-[11px] font-medium text-amber-700">
-                    Sunny #{chatDetailsEntry.chat.sunny_number}
+                    Agent #{chatDetailsEntry.chat.sunny_number}
                   </div>
                 )}
                 <p className="mt-1 truncate text-sm text-stone-500">{chatDetailsPreview}</p>
@@ -11294,15 +16419,57 @@ export default function WorkspacePage() {
           project={{ id: projectId, name: projectTitle || 'Local project', root: '', created_at: '' }}
           scope={localShareScope}
           shares={localShares}
-          onClose={() => setLocalShareScope(null)}
+          onClose={() => {
+            setLocalShareScope(null);
+            // The modal mutates the backing workspace's grants and ACL
+            // through its OWN reads — re-read ours or the header keeps
+            // reporting an audience the modal just emptied.
+            void refreshLocalBackingAudience();
+            void refreshLocalBackingAcl();
+          }}
           onShared={() => {
             void refreshLocalShares();
+            void refreshLocalBackingAudience();
+            void refreshLocalBackingAcl();
             void reloadFiles(false);
           }}
         />
       ) : null}
 
-      <WorkspaceShareModal
+      {!isLocalWorkspace && pathShareScope && cloudProjectId ? (
+        <PathShareModal
+          projectId={cloudProjectId}
+          scope={pathShareScope}
+          shares={cloudPathShares}
+          sharesLoaded={cloudPathSharesLoaded}
+          refresh={refreshCloudPathShares}
+          onClose={() => setPathShareScope(null)}
+          // A per-path grant is only as narrow as the workspace around it —
+          // its link, its own audience, and any grant above or inside this
+          // scope. Name them rather than let a scoped share imply scoped
+          // access; this modal lists none of them.
+          broaderAccess={(() => {
+            const label = broaderAccessLabel({
+              scopeKind: pathShareScope.kind,
+              linkShared: isLinkSharedInfo(shareInfo),
+              // NOT `shareStatus === 'shared'`: the status collapses to
+              // 'public' when a link is also on, and the named audience —
+              // still there after the link is revoked — would go unnamed.
+              workspaceAudience,
+              overlaps: overlappingPathShares(cloudPathShares, pathShareScope.path),
+            });
+            if (!label) return null;
+            return {
+              label,
+              ...(isLinkSharedInfo(shareInfo) && shareInfo?.isOwner
+                ? { onRestrict: () => handleVisibilityChange('private') }
+                : {}),
+            };
+          })()}
+        />
+      ) : null}
+
+      {canShowShareControls && showShareModal ? <WorkspaceShareModal
         open={canShowShareControls && showShareModal}
         projectTitle={projectTitle}
         userId={user?.id}
@@ -11334,14 +16501,14 @@ export default function WorkspacePage() {
         onOpenTeamPermissions={handleOpenTeamPermissions}
         onOpenLocalAgent={isLocalWorkspace ? undefined : openLocalAgentModal}
         formatRelativeTime={formatRelativeTimeShort}
-      />
+      /> : null}
 
       {/* Chat share — the full GDocs modal against the workspace ACL (chats
           inherit it): people, chat-targeted workspace invites, and the
           workspace's general access, which gates whether the chat link opens.
           Local chats never open this — openChatShare routes them to the local
           share modal. */}
-      <WorkspaceShareModal
+      {showChatShareModal && currentChatLink ? <WorkspaceShareModal
         open={showChatShareModal && Boolean(currentChatLink)}
         subject="chat"
         projectTitle={currentChatHeaderTitle}
@@ -11374,7 +16541,7 @@ export default function WorkspacePage() {
         onOpenTeamPermissions={handleOpenTeamPermissions}
         formatRelativeTime={formatRelativeTimeShort}
         accessCaption="General access applies to the whole workspace, including this chat."
-      />
+      /> : null}
 
       <WorkspaceLocalAgentModal
         open={showLocalAgentModal}
@@ -11407,6 +16574,17 @@ export default function WorkspacePage() {
           />
         );
       })()}
+
+      {chatPendingDelete ? <DeleteChatDialog
+        open={Boolean(chatPendingDelete)}
+        chatTitle={chatPendingDelete?.title ?? null}
+        onCancel={() => setChatPendingDelete(null)}
+        onConfirm={() => {
+          const target = chatPendingDelete;
+          setChatPendingDelete(null);
+          if (target) void deleteChat(target.id);
+        }}
+      /> : null}
 
       <WorkspaceNoticeToast notice={workspaceAppNotice} onClose={clearWorkspaceAppNotice} />
 

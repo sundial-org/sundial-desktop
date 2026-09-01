@@ -29,16 +29,20 @@ export function parseHarnessName(raw: unknown): HarnessName | null {
 /** Default harness when a chat/workspace hasn't pinned one. */
 export const DEFAULT_HARNESS: HarnessName = "vercel";
 
-// One agentic-loop cap across all three harnesses (steps for the Vercel loop,
-// `maxTurns` for the Claude/OpenAI SDKs). A runaway-loop backstop, not a work
-// budget — long autonomous runs must not be cut off mid-task.
-export const MAX_AGENT_STEPS = 200;
+// Invariant: agent runs are uncapped — only a user interrupt, the model
+// finishing, or the credit gate may end a run. Passed explicitly wherever the
+// Vercel AI SDK takes `stopWhen`, because OMITTING it silently defaults to
+// stepCountIs(20) (ToolLoopAgent) / stepCountIs(1) (bare streamText).
+export const neverStop = () => false;
 
 // Token usage in the exact shape `runner.drainAgentInto` reads: it sums
 // `inputTokens`/`outputTokens` for the messages row and prices the turn from
 // `inputTokenDetails` (cache reads/writes are billed at different rates;
-// `noCacheTokens` is the fresh-input count — Anthropic reports it exclusive of
-// cache, so when a provider omits the breakdown we fall back to `inputTokens`).
+// `noCacheTokens` is the fresh-input count). Only `inputTokenDetails` is
+// normalized across harnesses — `inputTokens` is whatever its producer reports
+// (fresh-only for the Claude harness, the cache-inclusive total for the Vercel
+// path), so it feeds the messages row, never the price. A producer that omits
+// the breakdown is read as an inclusive total (see `usageBreakdown`).
 export type HarnessUsage = {
   inputTokens: number;
   outputTokens: number;
@@ -75,6 +79,11 @@ export type HarnessUIStreamOptions = {
   sendReasoning: boolean;
   sendStart: boolean;
   sendFinish: boolean;
+  /** Maps a raw stream error to the client-facing errorText — the SDK default
+   *  masks everything as "An error occurred.", so the runner passes this to
+   *  see the raw error (gateway timeout classification) while keeping the
+   *  masked text on the wire. Custom harnesses may ignore it. */
+  onError?: (error: unknown) => string;
 };
 
 export type HarnessStreamResult = {

@@ -49,11 +49,14 @@ const tooltipClass =
  */
 export function IconTooltip({
   label,
+  shortcut,
   side = 'bottom',
   align = 'center',
   open = false,
 }: {
   label: string;
+  /** Keyboard hint (e.g. '⌘N') rendered dimmed after the label. */
+  shortcut?: string;
   side?: 'top' | 'bottom';
   align?: 'center' | 'left' | 'right';
   open?: boolean;
@@ -101,7 +104,33 @@ export function IconTooltip({
       if (e.target instanceof Node && trigger && e.target.contains(trigger)) setHovered(false);
     };
     window.addEventListener('scroll', hide, true);
-    return () => window.removeEventListener('scroll', hide, true);
+    // Desktop-shell strandings: ejecting a link to the system browser or a
+    // native title-bar drag/dialog steals the pointer with NO mouseleave, so
+    // the black label stays painted. A pointerdown on the trigger precedes all
+    // of them (and a plain click no longer needs the label); window blur /
+    // tab-hide catch the focus-loss cases. pointermove re-shows on recovery.
+    const hideNow = () => setHovered(false);
+    trigger?.addEventListener('pointerdown', hideNow);
+    window.addEventListener('blur', hideNow);
+    document.addEventListener('visibilitychange', hideNow);
+    // The trigger can VANISH without a mouseleave — clicking a bubble-menu
+    // button opens a popup and hides the whole bubble (display:none), which
+    // fires no boundary event, stranding a fixed tooltip on screen. Watch
+    // visibility directly while shown.
+    const observer =
+      trigger && typeof IntersectionObserver !== 'undefined'
+        ? new IntersectionObserver(([entry]) => {
+            if (!entry?.isIntersecting) setHovered(false);
+          })
+        : null;
+    if (trigger && observer) observer.observe(trigger);
+    return () => {
+      window.removeEventListener('scroll', hide, true);
+      trigger?.removeEventListener('pointerdown', hideNow);
+      window.removeEventListener('blur', hideNow);
+      document.removeEventListener('visibilitychange', hideNow);
+      observer?.disconnect();
+    };
   }, [hovered]);
 
   const visible = hovered && !open;
@@ -129,7 +158,7 @@ export function IconTooltip({
     let y = side === 'top' ? (fitsAbove ? above : below) : fitsBelow ? below : above;
     y = Math.min(Math.max(y, 4), window.innerHeight - tip.offsetHeight - 4);
     tip.style.top = `${y}px`;
-  }, [visible, side, align, label]);
+  }, [visible, side, align, label, shortcut]);
 
   return (
     <span ref={anchorRef} hidden>
@@ -143,6 +172,7 @@ export function IconTooltip({
               className="fixed whitespace-nowrap rounded bg-stone-900 px-2 py-1 text-[11px] text-white pointer-events-none z-[90] shadow-sm"
             >
               {label}
+              {shortcut ? <kbd className="ml-1.5 font-sans text-[10px] text-stone-400">{shortcut}</kbd> : null}
             </span>,
             document.body,
           )
@@ -174,10 +204,12 @@ interface HumanBubbleProps {
   /** Explicit swatch color (e.g. from Yjs awareness) — defaults to
    *  `pickColor(id)` so cursor and chip stay the same hue. */
   color?: string | null;
+  /** e.g. jump to this collaborator's cursor (workspace top bar). */
+  onClick?: () => void;
   className?: string;
 }
 
-export function HumanBubble({ id, name, imageUrl, initials, label, size = 'sm', color, className }: HumanBubbleProps) {
+export function HumanBubble({ id, name, imageUrl, initials, label, size = 'sm', color, onClick, className }: HumanBubbleProps) {
   const s = SIZE_MAP[size];
   const displayInitials = initials ?? getInitials(name);
   const tooltipLabel = label ?? name;
@@ -188,7 +220,7 @@ export function HumanBubble({ id, name, imageUrl, initials, label, size = 'sm', 
   useEffect(() => setImgFailed(false), [imageUrl]);
 
   return (
-    <div className={`relative group ${className ?? ''}`}>
+    <div className={`relative group ${className ?? ''}`} onClick={onClick}>
       {imageUrl && !imgFailed ? (
         <img
           src={imageUrl}

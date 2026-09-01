@@ -6,14 +6,17 @@ import {
   CopyIcon,
   FileTextIcon,
   GlobeIcon,
+  HashIcon,
   LinkBreakIcon,
   LinkSimpleIcon,
   LockSimpleIcon,
+  ParagraphIcon,
   PencilSimpleIcon,
 } from '@phosphor-icons/react';
 import { useAuth } from '@/lib/auth/optional-auth';
+import { getSpellcheckPreference } from '@/lib/spellcheck';
+import { usePathShareRealtimeAuthReady } from '@/lib/workspace/use-path-share-realtime-ready';
 import { EditorContent, useEditor, type Editor, Extension } from '@tiptap/react';
-import type { CommandProps } from '@tiptap/core';
 import StarterKit from '@tiptap/starter-kit';
 import Collaboration from '@tiptap/extension-collaboration';
 import { ySyncPluginKey } from '@tiptap/y-tiptap';
@@ -22,12 +25,29 @@ import { ySyncPluginKey } from '@tiptap/y-tiptap';
 // every file switch → renderer OOM "Aw Snap" on long math-heavy sessions), so
 // the former local leak-shim is gone.
 import { CollaborationCaret } from '@tiptap/extension-collaboration-caret';
-import { allowSuggestionBlockMarks, SuggestionDocument, SuggestionNodeAttributes, InsertionMark, DeletionMark, ModificationMark, SuggestionChanges, stripDeletedText, flattenSuggestions } from '@/lib/workspace/suggestion-marks';
-import { recordMarkdownSuggestionResolution } from '@/lib/crdt-js/markdown_yjs.mjs';
+import { attributionMatchKey } from '@/lib/workspace/authorship-lens';
+import type { SuggestionAuthorInfo } from '@/lib/workspace/pending-additions';
+import { allowSuggestionBlockMarks, SuggestionDocument, SuggestionNodeAttributes, InsertionMark, DeletionMark, ModificationMark, SuggestionChanges, stripDeletedText, flattenSuggestions, refreshSuggestionReview } from '@/lib/workspace/suggestion-marks';
+import { recordMarkdownSuggestionResolution, recordRejectCascadeOutcome, serializeDoc } from '@/lib/crdt-js/markdown_yjs.mjs';
+import {
+  buildAnchorSuggestions,
+  resolveAnchorNotePath,
+  splitAnchorQuery,
+  wikiAliasBase,
+  type WikiAnchorSuggestion,
+} from '@/lib/workspace/wiki-anchor-picker';
 import { setFreezeContext, fileTypeFromPath } from '@/lib/perf/freeze-monitor';
+import {
+  afterNextPaint,
+  finishFileSync,
+  finishFileVisible,
+  startFileOpen,
+} from '@/lib/perf/file-open-timing';
 import { useDocumentEditMode } from '@/lib/workspace/document-edit-mode-context';
 import { isEditorImageFile } from '@/lib/workspace/heic';
 import Highlight from '@tiptap/extension-highlight';
+import Subscript from '@tiptap/extension-subscript';
+import Superscript from '@tiptap/extension-superscript';
 import { Table } from '@tiptap/extension-table';
 import TableCell from '@tiptap/extension-table-cell';
 import TableHeader from '@tiptap/extension-table-header';
@@ -36,12 +56,15 @@ import Placeholder from '@tiptap/extension-placeholder';
 import Image, { type ImageOptions } from '@tiptap/extension-image';
 import TextAlign from '@tiptap/extension-text-align';
 import { TextStyle } from '@tiptap/extension-text-style';
-import FontFamily from '@tiptap/extension-font-family';
-import { Color } from '@tiptap/extension-color';
 // Decoration-based KaTeX (vendored from the v2 extension): math stays as plain
 // `$…$` text in the Y.Doc so the markdown round-trip is lossless. See the file
 // header for why we don't use v3's node-based mathematics extension.
+import AutolinkDecorations from '@/lib/tiptap/autolink-decorations';
+import BlockIdBadges from '@/lib/tiptap/block-id-decorations';
+import EmbedPreview from '@/lib/tiptap/embed-preview';
 import Mathematics, { MATH_TEXT_REGEX } from '@/lib/tiptap/math-decorations';
+import TagCommentDecorations, { outsideSourceComment } from '@/lib/tiptap/tag-comment-decorations';
+import FootnoteDecorations, { outsideFootnote } from '@/lib/tiptap/footnote-decorations';
 import CodeBlockShiki from '@/lib/tiptap/code-block-shiki';
 import MermaidPreview from '@/lib/tiptap/mermaid-preview';
 import { HocuspocusProvider } from '@hocuspocus/provider';
@@ -51,18 +74,52 @@ import { Plugin, PluginKey, Selection, TextSelection, type EditorState, type Tra
 import { Decoration, DecorationSet, type EditorView } from '@tiptap/pm/view';
 import { markdownToHtml } from '@/lib/markdown/html.mjs';
 import { isGoogleDocsClipboardHtml, normalizeGoogleDocsHtml } from '@/lib/markdown/google-docs-paste';
-import { isProseMirrorClipboardHtml, shouldDeferToHtmlPaste } from '@/lib/markdown/paste-routing';
+import {
+  isProseMirrorClipboardHtml,
+  pasteLooksLikeMarkdown,
+  shouldDeferToHtmlPaste,
+} from '@/lib/markdown/paste-routing';
+import { resolveLinkTargetToPath } from '@/lib/workspace/wiki-file-links';
 import { ObsidianBlockquote, ObsidianLink } from '@/lib/tiptap/obsidian';
-import { HardBreakMarker } from '@/lib/markdown/codec';
-import { FontSize } from '@/lib/tiptap/font-size';
-import { LocalCaretBlock } from '@/lib/tiptap/local-caret-block';
+import { CalloutFold } from '@/lib/tiptap/callout-fold';
+import { FoldGutter } from '@/lib/tiptap/fold';
+import { ListJoin } from '@/lib/tiptap/list-join';
+import { ListPaste, pasteListBesideChildren } from '@/lib/tiptap/list-paste';
+import { CHECKBOX_RE, checkboxStateAt } from '@/lib/markdown/checkbox';
+import { BulletMarker, HardBreakMarker, MarkdownSourceFidelity } from '@/lib/markdown/codec';
+import { Frontmatter } from '@/lib/tiptap/frontmatter';
+import { SuggestionReviewBar } from '@/components/workspace/suggestion-review-bar';
+import { FrontmatterPreview } from '@/lib/tiptap/frontmatter-preview';
+import { FrontmatterNormalize } from '@/lib/tiptap/frontmatter-normalize';
+import { HtmlPreview, type HtmlPreviewOptions } from '@/lib/tiptap/html-preview';
+import { PointerSelection } from '@/lib/tiptap/pointer-selection';
 import { ScopedSelectAll } from '@/lib/tiptap/scoped-select-all';
+import { CaretEdgeScroll } from '@/lib/tiptap/caret-edge-scroll';
+import { applyIncremental, changedBlockSpan } from '@/lib/tiptap/incremental-decorations';
+import { EditorTabGuard, UndoBoundaries } from '@/lib/tiptap/structural-keys';
 // Keeps the text selection visibly highlighted while DOM focus is elsewhere
 // (e.g. the chat input right after "Ask Sunny") — decoration-only.
 import { Selection as BlurSelectionHighlight } from '@tiptap/extensions';
-import { EditorBubbleMenu, EditorTableControls } from '@/components/workspace/editor-bubble-menu';
+import {
+  EditorBubbleMenu,
+  EditorCalloutControls,
+  EditorTableControls,
+} from '@/components/workspace/editor-bubble-menu';
 import { EditorSlashMenu } from '@/components/workspace/editor-slash-menu';
 import { EditorAskInput } from '@/components/workspace/editor-ask-input';
+// Static on purpose: the popup opens via a window event, and a lazily-mounted
+// listener races the first click (the event fires before the chunk mounts —
+// the user's first rewrite would silently no-op). The popup itself is a light
+// shell; it lazy-loads its heavy diff/codec internals on open.
+import { EditorRewritePopup } from '@/components/workspace/editor-rewrite-popup';
+// Same idiom for the whole AI-tools family (Prism / resize / factcheck /
+// pangram / image gen): static light shells, window-event opened, heavy
+// anchor/codec internals lazy-loaded on open.
+import { EditorPrismPopup } from '@/components/workspace/editor-prism-popup';
+import { EditorLengthResize } from '@/components/workspace/editor-length-resize';
+import { EditorFactcheckPopup } from '@/components/workspace/editor-factcheck-popup';
+import { EditorPangramPopup } from '@/components/workspace/editor-pangram-popup';
+import { EditorImageGenPopup } from '@/components/workspace/editor-image-gen';
 import {
   computeCommentScroll,
   pickCommentAtPos,
@@ -70,10 +127,12 @@ import {
   type ResolvedDocCommentRange,
 } from '@/lib/workspace/doc-comments';
 import { fetchWorkspaceHost, resolveCollabUrl, type ConnectionStatus } from '@/lib/workspace/collab-url';
+import { resolvePosition } from '@/lib/workspace/rewrite-anchor';
 import { selectWordAtCoords } from '@/lib/workspace/doc-comments-client';
 import { resolveWorkspaceImageSrc, unresolveWorkspaceImageSrc } from '@/lib/workspace/image-src';
-import { imageMarkdown, imageWidthAttribute } from '@/lib/markdown/image-attrs.mjs';
+import { imageMarkdown, imageWidthAttribute, parseAltSizeSpec } from '@/lib/markdown/image-attrs.mjs';
 import { trackYDocUserEdits } from '@/lib/analytics/document-edit-tracker';
+import { track } from '@/lib/analytics/track';
 import {
   buildDeletionWidgetHtml,
 } from '@/lib/workspace/diff-markdown-html';
@@ -82,12 +141,12 @@ import {
   acquireProvider,
   releaseProvider,
   useWorkspaceCollabSocket,
+  useWorkspaceCollabSocketPending,
 } from '@/lib/workspace/collab-socket-context';
 import { useCollabSyncWatchdog } from '@/lib/workspace/use-collab-sync-watchdog';
 import { AgentGhostCursor } from '@/components/workspace/agent-ghost-cursor';
 import { EditorSkeleton } from '@/components/workspace/editor-skeleton';
 import { buildCursorCaret, restartCursorLabelFade } from '@/components/workspace/cursor-fade';
-import { isWebKitEngineUA } from '@/lib/engine';
 import { brandForAgentId } from '@/lib/workspace/agent-brand';
 import { DIFF_CHECK_ICON_SVG, DIFF_X_ICON_SVG } from '@/lib/workspace/diff-action-icons';
 import { createBrowserClient } from '@/lib/supabase/browser';
@@ -95,6 +154,20 @@ import { createBrowserClient } from '@/lib/supabase/browser';
 type CollabUser = {
   name: string;
   color: string;
+  /** Presence-channel key (`user:<id>` / `anon:<id>`) broadcast into awareness
+   *  so a clicked presence bubble can find this client's caret. */
+  presenceKey?: string;
+};
+
+/** One-shot ask to scroll this editor to a remote collaborator's caret.
+ *  `seq` distinguishes repeat clicks on the same peer. */
+export type RevealPeerRequest = {
+  seq: number;
+  presenceKey?: string | null;
+  /** Fallback identity for peers with no presenceKey in awareness (older
+   *  clients, local-mode composites): the bubble's name/color pair. */
+  name?: string | null;
+  color?: string | null;
 };
 
 type ReadyPayload = {
@@ -123,6 +196,13 @@ export interface PendingAddition {
   deletedText?: string;
   /** Optional short author label (e.g. `Sunny #354`, `turboblitz`). */
   authorLabel?: string;
+  /** Avatar imagery for the author chip (Sunny face / brand mark / overrides). */
+  authorVisual?: {
+    imageUrl?: string | null;
+    imageRound?: boolean;
+    chipLabel?: string;
+    chipColor?: string;
+  };
   /** Assistant message id this addition came from — used to jump to the turn. */
   assistantMessageId?: string;
   /** Chat id that owns the assistant message — required to switch chats on jump. */
@@ -142,6 +222,24 @@ export interface AttributionPaintRange {
   authorLabel: string;
   toolCallId?: string | null;
   colorIndex: number;
+  /** Share-redacted occurrence: consumes its positional slot (so later
+   *  same-text copies stay aligned) but paints no band and no annotation. */
+  hidden?: boolean;
+  /** "Author · when" margin annotation (the authorship lens). Only rendered on
+   *  the first block of a consecutive same-annotation run. */
+  sideLabel?: string;
+  /** Avatar beside the margin label — same imagery as the chat list. */
+  avatarUrl?: string | null;
+  avatarRound?: boolean;
+  /** Chat turn behind this attribution; clicking the label jumps to it. */
+  assistantMessageId?: string | null;
+  chatId?: string | null;
+  onJump?: () => void;
+  /** File the ranges belong to — carried into the hover-card event. */
+  filePath?: string | null;
+  /** Which copy of a repeated block this is among the SAME turn's copies
+   *  (document order) — disambiguates duplicate-text hovers. */
+  occurrence?: number;
 }
 
 interface CollabEditorProps {
@@ -174,6 +272,14 @@ interface CollabEditorProps {
   codeMode?: boolean;
   wikiLinkSuggestions?: string[];
   onNavigateToFile?: (file: string | null) => void;
+  /** Raw wiki target (`note#Heading`, `note#^id`, `#Heading`, …) from a
+   *  Cmd-click / hover-card open. The workspace resolves path + anchor and
+   *  owns the scroll/toast; absent, wiki targets fall back to
+   *  `onNavigateToFile` with the raw string (legacy path-only behavior). */
+  onNavigateToWikiTarget?: (target: string) => void;
+  /** Markdown text of another workspace note, for `[[note#` anchor
+   *  autocomplete (the open file reads its own live doc instead). */
+  fetchWikiNoteText?: (path: string) => Promise<string | null>;
   style?: CSSProperties;
   /** Server-derived pending additions for a review surface. The markdown editor
    *  renders suggestions from live Y.Doc marks, so these are currently a no-op
@@ -183,6 +289,9 @@ interface CollabEditorProps {
   onKeepAddition?: (key: string) => void;
   onUndoAddition?: (key: string) => void;
   onJumpToTurn?: (assistantMessageId: string, chatId: string | null) => void;
+  /** Suggestion mark id → author + turn, for the review gutter's profile icon
+   *  (click = open that chat turn). Markdown only. */
+  suggestionAuthors?: Record<string, SuggestionAuthorInfo>;
   /** External comment ranges resolved against the current Yjs document. */
   commentRanges?: ResolvedDocCommentRange[];
   /** Temporary draft range for a new comment being composed. */
@@ -200,6 +309,14 @@ interface CollabEditorProps {
    * preventDefault + node insertion; the caller handles the upload.
    */
   onImageDrop?: (file: File) => Promise<{ src: string; alt: string } | null>;
+  /** Scroll to a remote collaborator's caret in this doc (bubble click). */
+  revealPeer?: RevealPeerRequest | null;
+  /** Reveal delivered (scrolled) or given up — the owner clears the request
+   *  so a later remount of this file can't replay it. */
+  onRevealPeerDone?: (seq: number) => void;
+  /** Editor gained focus — presence uses this to broadcast which file the
+   *  user is actually editing (split panes make "the selected file" wrong). */
+  onFocused?: () => void;
 }
 
 type LinkMenuRect = { left: number; right: number; top: number; bottom: number };
@@ -230,6 +347,16 @@ type LinkMenuState = {
   selectionText?: string;
   /** True when editing an existing link (vs creating a new one). */
   editing?: boolean;
+  /** Wiki mode only: the query contains `#`, so the menu lists the target
+   *  note's headings (`#`) or blocks (`#^`) instead of files. */
+  anchor?: {
+    path: string;
+    kind: 'heading' | 'block';
+    query: string;
+    /** The query had no file part (`[[#Intro]]`) — emit a PATHLESS target so
+     *  the self-link survives a rename, exactly like a hand-typed one. */
+    sameFile: boolean;
+  } | null;
 };
 
 type LinkHoverCardState = {
@@ -247,7 +374,18 @@ type LinkHoverCardState = {
 
 type LinkMenuItem =
   | { kind: 'file'; path: string }
-  | { kind: 'url'; url: string; label: string };
+  | { kind: 'url'; url: string; label: string }
+  | { kind: 'anchor'; suggestion: WikiAnchorSuggestion };
+
+/** Target note text backing the anchor items. `status` distinguishes a fetch
+ *  still in flight from one that came back empty — `content: null` alone made
+ *  an unreadable file (the picker lists every non-folder file) sit on
+ *  "Loading…" forever instead of saying there are no matches. */
+type AnchorNoteState = {
+  path: string;
+  content: string | null;
+  status: 'loading' | 'ready' | 'error';
+};
 
 const URL_RE = /^(?:https?:\/\/|mailto:|tel:)/i;
 
@@ -324,6 +462,65 @@ function activeWikiLinkQuery(view: EditorView): LinkMenuState | null {
   };
 }
 
+/**
+ * Typed-out wiki link: the closing `]]` of `[[target|alias]]` converts the
+ * whole token to a wiki link mark without the autocomplete menu — the same
+ * mark the picker inserts and exactly what the markdown codec produces for
+ * literal `[[…]]` on reload, so live and round-tripped docs agree. Dangling
+ * targets are allowed, matching the codec. Returns true when handled.
+ */
+export function linkifyTypedWikiLink(view: EditorView, from: number, to: number, text: string): boolean {
+  if (text !== ']') return false;
+  const { state } = view;
+  const linkMark = state.schema.marks.link;
+  if (!linkMark) return false;
+  const $from = state.doc.resolve(from);
+  if ($from.parent.type.spec.code) return false;
+  // Inline code too: the markdown parser keeps `[[…]]` inside code spans
+  // literal, so live typing must as well (Codex P2).
+  const codeMark = state.schema.marks.code;
+  if (codeMark && (state.storedMarks ?? $from.marks()).some((mark) => mark.type === codeMark)) {
+    return false;
+  }
+  const blockStart = $from.start();
+  // Same position arithmetic as activeWikiLinkQuery: 1 char per position.
+  const withClose = state.doc.textBetween(blockStart, from, '\n', '\0') + text;
+  if (!withClose.endsWith(']]')) return false;
+  const open = withClose.lastIndexOf('[[');
+  if (open === -1) return false;
+  const inner = withClose.slice(open + 2, withClose.length - 2);
+  if (!inner.trim() || /[\[\]\n]/.test(inner)) return false;
+  // `![[…]]` is an embed token — leave it as text (the codec renders it as an
+  // embed on reload; linkifying here would silently drop the `!` semantics).
+  if (open > 0 && withClose[open - 1] === '!') return false;
+
+  const [rawTarget, rawAlias] = inner.split('|', 2);
+  const target = rawTarget.trim();
+  const alias = rawAlias?.trim() ?? '';
+  if (!target) return false;
+  // Display alias || target — what the markdown parser shows for this token.
+  // Keep the OTHER active marks (bold/italic/…): the parser keeps surrounding
+  // marks for `**[[foo]]**`, so live typing must too (Codex P2).
+  const display = alias || target;
+  const carried = (state.storedMarks ?? $from.marks()).filter(
+    (mark) => mark.type !== linkMark,
+  );
+  const node = state.schema.text(display, [
+    ...carried,
+    linkMark.create({
+      href: '#',
+      obsidianType: 'wiki',
+      obsidianTarget: target,
+      obsidianAlias: alias || null,
+      obsidianEmbed: false,
+    }),
+  ]);
+  const tr = state.tr.replaceWith(blockStart + open, to, node);
+  tr.setSelection(TextSelection.create(tr.doc, blockStart + open + display.length));
+  view.dispatch(tr.scrollIntoView());
+  return true;
+}
+
 function fileMatches(paths: string[], query: string): string[] {
   const q = query.trim().toLowerCase();
   return paths
@@ -336,7 +533,19 @@ function fileMatches(paths: string[], query: string): string[] {
     .slice(0, 200);
 }
 
-function buildLinkMenuItems(state: LinkMenuState, suggestions: string[]): LinkMenuItem[] {
+function buildLinkMenuItems(
+  state: LinkMenuState,
+  suggestions: string[],
+  anchorNote?: AnchorNoteState | null,
+): LinkMenuItem[] {
+  if (state.mode === 'wiki' && state.anchor) {
+    if (!anchorNote || anchorNote.path !== state.anchor.path || anchorNote.content == null) return [];
+    return buildAnchorSuggestions(anchorNote.content, state.anchor.path, {
+      filePart: '',
+      kind: state.anchor.kind,
+      anchorQuery: state.anchor.query,
+    }).map((suggestion) => ({ kind: 'anchor' as const, suggestion }));
+  }
   const items: LinkMenuItem[] = [];
   const trimmed = state.query.trim();
   if (state.mode === 'link' && trimmed.length > 0) {
@@ -400,6 +609,29 @@ function resolveLinkTarget(mark: ProseMirrorMark): string {
   return (mark.attrs.href as string | undefined) ?? '';
 }
 
+/** Replace the trigger/selection range with wiki-marked `text` (shared by the
+ *  file and anchor picker branches — includes the leading-`!` embed guard). */
+function insertWikiLinkText(view: EditorView, state: LinkMenuState, text: string, attrs: Record<string, unknown>) {
+  const schema = view.state.schema;
+  const linkMark = schema.marks.link;
+  if (!linkMark) return;
+  // Guard against a wiki link landing immediately after `!` — when the doc
+  // round-trips through markdown that becomes `![[…]]`, the parser flags it
+  // as an embed and the embed CSS turns the link into a yellow chip. Strip
+  // a single leading `!` so the inserted link can't accidentally become an
+  // embed on reload.
+  let insertFrom = state.from;
+  if (state.from > 0) {
+    const prevChar = view.state.doc.textBetween(state.from - 1, state.from, '\n', '\0');
+    if (prevChar === '!') insertFrom = state.from - 1;
+  }
+  const node = schema.text(text, [linkMark.create(attrs)]);
+  const tr = view.state.tr.replaceWith(insertFrom, state.to, node);
+  tr.setSelection(TextSelection.create(tr.doc, insertFrom + text.length));
+  view.dispatch(tr.scrollIntoView());
+  view.focus();
+}
+
 function applyLinkChoice(
   view: EditorView,
   state: LinkMenuState,
@@ -408,6 +640,31 @@ function applyLinkChoice(
   const schema = view.state.schema;
   const linkMark = schema.marks.link;
   if (!linkMark) return;
+
+  if (item.kind === 'anchor') {
+    const s = item.suggestion;
+    // `[[#Intro]]` must stay pathless: baking in the current path would break
+    // the self-link the moment the note is renamed or moved.
+    const prefix = state.anchor?.sameFile ? '' : s.path;
+    let target: string;
+    let text: string;
+    if (s.kind === 'heading') {
+      target = `${prefix}#${s.heading}`;
+      text = s.heading;
+    } else {
+      // Only blocks that already carry an ID are listed — see listBlockAnchors.
+      target = `${prefix}#^${s.id}`;
+      text = `${wikiAliasBase(s.path)} ^${s.id}`;
+    }
+    insertWikiLinkText(view, state, text, {
+      href: '#',
+      obsidianType: 'wiki',
+      obsidianTarget: target,
+      obsidianAlias: text,
+      obsidianEmbed: false,
+    });
+    return;
+  }
 
   const isFile = item.kind === 'file';
   // Show just the file's basename in the doc — the full path goes on the
@@ -465,36 +722,6 @@ function applyLinkChoice(
 }
 
 // Keep browser hard reload available in the editor by not binding Mod-Shift-r.
-// Mod-Shift-j is intentionally not bound here so the workspace can use it
-// for "open fresh chat" (see ChatContextShortcut below). Justify is still
-// reachable via the toolbar / menu.
-// Images support only left/center/right — the codec encodes center/right and
-// the NodeView ignores `justify`, so writing it would be a no-op collab edit
-// that's lost on reload. Everything else keeps the full alignment set.
-const IMAGE_ALIGNMENTS = new Set(['left', 'center', 'right']);
-const WorkspaceTextAlign = TextAlign.extend({
-  addKeyboardShortcuts() {
-    return {
-      'Mod-Shift-l': () => this.editor.commands.setTextAlign('left'),
-      'Mod-Shift-e': () => this.editor.commands.setTextAlign('center'),
-    };
-  },
-  addCommands() {
-    return {
-      ...this.parent?.(),
-      setTextAlign:
-        (alignment: string) =>
-        ({ commands }: CommandProps) => {
-          if (!this.options.alignments.includes(alignment)) return false;
-          return this.options.types
-            .filter((type: string) => type !== 'image' || IMAGE_ALIGNMENTS.has(alignment))
-            .map((type: string) => commands.updateAttributes(type, { textAlign: alignment }))
-            .every(Boolean);
-        },
-    };
-  },
-});
-
 /* ── Cached decoration plugins ─────────────────────────────────────────
  *  ProseMirror calls a plugin's `decorations` prop on *every* view update —
  *  selection moves, remote cursor / awareness updates and IME ticks included.
@@ -510,7 +737,10 @@ function cachedDecorations<D extends object>(
   pluginKey: PluginKey<DecoState<D>>,
   initData: () => D,
   build: (doc: ProseMirrorNode, data: D) => DecorationSet,
-  rebuildOnDocChange: boolean,
+  // true: full rebuild per doc change; false: map positions only; a scan
+  // function: incremental — only the changed top-level blocks rescan (see
+  // lib/tiptap/incremental-decorations).
+  rebuildOnDocChange: boolean | ((doc: ProseMirrorNode, from: number, to: number) => Decoration[]),
 ) {
   return {
     state: {
@@ -518,7 +748,7 @@ function cachedDecorations<D extends object>(
         const data = initData();
         return { ...data, decorations: build(instance.doc, data) };
       },
-      apply(tr: Transaction, value: DecoState<D>, _old: EditorState, newState: EditorState): DecoState<D> {
+      apply(tr: Transaction, value: DecoState<D>, oldState: EditorState, newState: EditorState): DecoState<D> {
         const meta = tr.getMeta(pluginKey) as Partial<D> | undefined;
         if (meta) {
           const next: DecoState<D> = { ...value, ...meta };
@@ -526,10 +756,31 @@ function cachedDecorations<D extends object>(
           return next;
         }
         if (tr.docChanged) {
+          if (typeof rebuildOnDocChange === 'function') {
+            return { ...value, decorations: applyIncremental(tr, value.decorations, rebuildOnDocChange) };
+          }
+          if (rebuildOnDocChange) {
+            return { ...value, decorations: build(newState.doc, value) };
+          }
+          // y-prosemirror's `_forceRerender` (fired whenever the plugin set is
+          // reconfigured — e.g. the Suggest toggle unmounting the bubble/slash
+          // menus, whose mount registers editor plugins) replaces the WHOLE doc
+          // even when nothing changed. Mapping across that replace collapses
+          // every decoration to nothing, blanking comment highlights until the
+          // next server reload pushes fresh ranges. `binding` on the y-sync
+          // meta marks the re-render, but does NOT imply identical content — a
+          // remote update can also arrive through a full re-render — so carry
+          // the current (already-mapped) decorations onto the new doc verbatim
+          // ONLY when the replacement is content-equal; a content-changing
+          // re-render maps like any other edit (stale absolute positions must
+          // never be recreated onto a changed document).
+          const rerender = Boolean(
+            (tr.getMeta(ySyncPluginKey) as { binding?: unknown } | undefined)?.binding,
+          );
           return {
             ...value,
-            decorations: rebuildOnDocChange
-              ? build(newState.doc, value)
+            decorations: rerender && newState.doc.eq(oldState.doc)
+              ? DecorationSet.create(tr.doc, value.decorations.find())
               : value.decorations.map(tr.mapping, tr.doc),
           };
         }
@@ -549,7 +800,6 @@ function cachedDecorations<D extends object>(
  * ─────────────────────────────────────────────────────────────────── */
 
 const checkboxPluginKey = new PluginKey<DecoState<Record<string, never>>>('markdownCheckbox');
-const CHECKBOX_RE = /^\[([ xX])\]/; // matches [ ] or [x] at start of text
 
 // Checklist items are plain `[ ]`/`[x]` text decorations inside ordinary
 // listItems (no TaskList node), so checklist NESTING is just list nesting:
@@ -573,7 +823,7 @@ const MarkdownCheckbox = Extension.create({
           if ($from.node(d).type.name !== 'listItem') continue;
           const para = $from.node(d).firstChild;
           if (!para || para.type.name !== 'paragraph') break;
-          if (!CHECKBOX_RE.test(para.textContent)) break;
+          if (!checkboxStateAt(para.textContent)) break;
 
           // If the item is an empty checkbox (no real text after [ ]), clear and exit list
           const afterCheckbox = para.textContent.slice(3).trim();
@@ -605,29 +855,40 @@ const MarkdownCheckbox = Extension.create({
   },
 
   addProseMirrorPlugins() {
+    const scanCheckboxes = (doc: ProseMirrorNode, rangeFrom: number, rangeTo: number) => {
+      const decos: Decoration[] = [];
+      doc.nodesBetween(rangeFrom, rangeTo, (node, pos, parent) => {
+        if (node.type.name !== 'paragraph') return true;
+        const cb = checkboxStateAt(node.textContent);
+        if (!cb) return false;
+        const { state, classic } = cb;
+        // Custom states only inside list items — keeps a standalone
+        // paragraph citation like `[1] Ref` from growing a checkbox.
+        // `parent` comes free from the walk; resolving here was O(doc)
+        // per checkbox (the math-decorations O(n²) lesson).
+        if (!classic && parent?.type.name !== 'listItem') return false;
+        const from = pos + 1;          // start of paragraph content
+        const to = from + 3;           // [<state>] is always 3 chars
+        const checked = state.toLowerCase() === 'x';
+        const variant = checked ? 'md-checkbox-checked'
+          : classic ? 'md-checkbox-unchecked' : 'md-checkbox-custom';
+        decos.push(
+          Decoration.inline(from, to, {
+            class: `md-checkbox ${variant}`,
+            nodeName: 'span',
+            // The custom state char, surfaced for CSS (`content: attr(…)`).
+            ...(classic ? {} : { 'data-state': state }),
+          }),
+        );
+        return false;
+      });
+      return decos;
+    };
     const cache = cachedDecorations<Record<string, never>>(
       checkboxPluginKey,
       () => ({}),
-      (doc) => {
-        const decos: Decoration[] = [];
-        doc.descendants((node, pos) => {
-          if (node.type.name !== 'paragraph') return;
-          const text = node.textContent;
-          const m = text.match(CHECKBOX_RE);
-          if (!m) return;
-          const from = pos + 1;          // start of paragraph content
-          const to = from + 3;           // [ ] is always 3 chars
-          const checked = m[1].toLowerCase() === 'x';
-          decos.push(
-            Decoration.inline(from, to, {
-              class: `md-checkbox ${checked ? 'md-checkbox-checked' : 'md-checkbox-unchecked'}`,
-              nodeName: 'span',
-            }),
-          );
-        });
-        return DecorationSet.create(doc, decos);
-      },
-      true,
+      (doc) => DecorationSet.create(doc, scanCheckboxes(doc, 0, doc.content.size)),
+      scanCheckboxes,
     );
     return [
       new Plugin({
@@ -857,8 +1118,14 @@ const WorkspaceImage = Image.extend<ImageOptions & { workspaceId?: string }>({
         img.src = resolveWorkspaceImageSrc(String(n.attrs.src ?? ''), workspaceId);
         img.alt = String(n.attrs.alt ?? '');
         const w = Number(n.attrs.width);
+        // Obsidian sizing in the alt (`![alt|640x480](src)`) renders when no
+        // explicit width attr is set; the alt bytes stay verbatim.
+        const altSize = Number.isFinite(w) && w > 0 ? null : parseAltSizeSpec(img.alt);
         if (Number.isFinite(w) && w > 0) img.style.width = `${w}px`;
+        else if (altSize) img.style.width = `${altSize.width}px`;
         else img.style.removeProperty('width');
+        if (altSize?.height) img.style.height = `${altSize.height}px`;
+        else img.style.removeProperty('height');
         // Alignment (center/right) — `left`/default leaves the image inline.
         const align = n.attrs.textAlign;
         if (align === 'center' || align === 'right') dom.dataset.align = align;
@@ -1008,7 +1275,14 @@ export const CommentDecorationsExtension = Extension.create({
               {
                 class: [
                   'doc-comment-range',
-                  range.status === 'resolved' ? 'doc-comment-range-resolved' : 'doc-comment-range-open',
+                  // Reactions are a lighter touch than a comment: the chip after
+                  // the words carries the signal, so the text keeps a faint tint
+                  // instead of the full comment highlight.
+                  range.reaction
+                    ? 'doc-comment-range-reaction'
+                    : range.status === 'resolved'
+                      ? 'doc-comment-range-resolved'
+                      : 'doc-comment-range-open',
                   isActive ? 'doc-comment-range-active' : '',
                 ]
                   .filter(Boolean)
@@ -1105,18 +1379,85 @@ const AttributionPaintExtension = Extension.create({
       (doc, data) => {
         if (!data.ranges.length) return DecorationSet.empty;
 
-        const byText = new Map<string, AttributionPaintRange>();
+        // text → every range with that text, in document order. Same-text
+        // blocks are consumed one occurrence at a time below, so repeated
+        // lines keep their own author instead of all taking the first's.
+        const byText = new Map<string, AttributionPaintRange[]>();
         for (const range of data.ranges) {
           const key = range.text.trim();
-          if (key && !byText.has(key)) byText.set(key, range);
+          if (!key) continue;
+          const list = byText.get(key);
+          if (list) list.push(range);
+          else byText.set(key, [range]);
         }
         if (byText.size === 0) return DecorationSet.empty;
+        const consumed = new Map<string, number>();
+        const takeRange = (key: string): AttributionPaintRange | undefined => {
+          const list = byText.get(key);
+          if (!list) return undefined;
+          const index = consumed.get(key) ?? 0;
+          consumed.set(key, index + 1);
+          // More rendered copies than blame rows (an unsaved edit duplicated a
+          // line): extras go dark rather than guessing — reusing a neighbor's
+          // attribution painted the wrong author, and under a share bound it
+          // could resurrect provenance the redaction buried.
+          return list[index];
+        };
 
+        // A block's text as it will read once its suggestions resolve: inserted
+        // text kept, struck (deletion-marked) text dropped. The ranges being
+        // matched are the ADDED lines of pending edits, and a block under
+        // review still holds the old text beside the new — the raw textContent
+        // would never match, leaving the highlight lens dark on exactly the
+        // blocks it exists to light up.
+        const acceptedText = (node: ProseMirrorNode): string => {
+          let out = '';
+          node.descendants((child: ProseMirrorNode) => {
+            if (child.isText && !child.marks.some((mark) => mark.type.name === 'deletion')) {
+              out += child.text ?? '';
+            }
+            return true;
+          });
+          return out;
+        };
         const decos: Decoration[] = [];
+        // Margin labels only where the annotation CHANGES — a five-line run by
+        // one author reads as one label, not five repeats.
+        let lastSideLabel: string | null = null;
         doc.descendants((node, pos) => {
-          if (!node.isBlock) return;
-          const range = byText.get(node.textContent.trim());
-          if (!range) return;
+          // TEXTBLOCKS only (paragraph, heading, code block). A listItem or
+          // blockquote and its inner paragraph share one textContent, so
+          // matching every block made a single rendered item consume TWO
+          // occurrences from the per-occurrence queue — the first duplicate's
+          // inner paragraph stole the second duplicate's range and painted the
+          // wrong author on both. Containers still descend into their children.
+          // A line that is exactly one image becomes a LEAF `image` node, not a
+          // textblock, so the skip below hid it from the lens even though blame
+          // emits its literal `![alt](src)` (Codex, PR #1104 round 27).
+          const isImageLeaf = node.type.name === 'image';
+          if (!isImageLeaf && !node.isTextblock) return;
+          // A leaf under a pending DELETION isn't in the accepted document, so
+          // it claims no range — otherwise a struck image could consume a
+          // surviving copy's attribution and leave the real one dark (Codex,
+          // PR #1104 round 33). Textblocks express this through acceptedText.
+          if (isImageLeaf && node.attrs.suggestionDeletionId != null) return false;
+          const rendered = isImageLeaf
+            ? imageMarkdown(node.attrs.alt ?? '', node.attrs.src ?? '', {
+                width: node.attrs.width,
+                align: node.attrs.textAlign,
+              })
+            : node.textContent.trim();
+          // A block under review matches ONLY on its accepted projection, and
+          // one a deletion emptied matches nothing — see attributionMatchKey.
+          // A leaf image carries no marks, so its literal IS the key.
+          const key = isImageLeaf
+            ? rendered || null
+            : attributionMatchKey(rendered, acceptedText(node).trim());
+          const range = key ? takeRange(key) : undefined;
+          if (!range || range.hidden) {
+            if (rendered) lastSideLabel = null;
+            return;
+          }
           const title = range.toolCallId
             ? `${range.authorLabel} via ${range.toolCallId}`
             : range.authorLabel;
@@ -1126,6 +1467,78 @@ const AttributionPaintExtension = Extension.create({
               title,
             }),
           );
+          if (range.sideLabel && (node.isTextblock || isImageLeaf)) {
+            // Dedup by annotation AND turn: two same-author runs from different
+            // turns keep separate labels so each jumps to its own turn.
+            const dedupKey = `${range.sideLabel}|${range.assistantMessageId ?? ''}`;
+            if (dedupKey !== lastSideLabel) {
+              const label = range.sideLabel;
+              const colorIndex = range.colorIndex % 6;
+              const { avatarUrl, avatarRound, onJump } = range;
+              decos.push(
+                Decoration.widget(
+                  // Inside the block for a textblock; a leaf image has no
+                  // content position, so the label rides just before it.
+                  isImageLeaf ? pos : pos + 1,
+                  () => {
+                    const el = document.createElement('span');
+                    el.className = `attribution-side-label attribution-side-label-${colorIndex}`;
+                    if (avatarUrl) {
+                      const img = document.createElement('img');
+                      img.src = avatarUrl;
+                      img.alt = '';
+                      img.draggable = false;
+                      img.className = avatarRound === false ? 'is-mark' : '';
+                      el.append(img);
+                    }
+                    el.append(document.createTextNode(label));
+                    el.contentEditable = 'false';
+                    if (onJump) {
+                      // Same affordance as the suggestion chip: the annotation
+                      // opens the chat turn that wrote these lines.
+                      el.classList.add('is-jumpable');
+                      el.title = 'Open the chat turn';
+                      el.addEventListener('mousedown', (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        onJump();
+                      });
+                    }
+                    if (range.assistantMessageId && range.filePath) {
+                      // Hovering the annotation opens the before/after card
+                      // (AuthorshipHoverCard listens on window; the page owns
+                      // the React side of the exchange).
+                      el.addEventListener('mouseenter', () => {
+                        const rect = el.getBoundingClientRect();
+                        window.dispatchEvent(
+                          new CustomEvent('sundial:authorship-hover', {
+                            detail: {
+                              occurrence: range.occurrence,
+                              assistantMessageId: range.assistantMessageId,
+                              chatId: range.chatId ?? null,
+                              filePath: range.filePath,
+                              lineText: range.text,
+                              sideLabel: label,
+                              avatarUrl: range.avatarUrl,
+                              avatarRound: range.avatarRound,
+                              x: rect.left,
+                              y: rect.bottom,
+                            },
+                          }),
+                        );
+                      });
+                      el.addEventListener('mouseleave', () => {
+                        window.dispatchEvent(new CustomEvent('sundial:authorship-hover', { detail: null }));
+                      });
+                    }
+                    return el;
+                  },
+                  { side: -1, key: `side-${pos}-${dedupKey}` },
+                ),
+              );
+            }
+            lastSideLabel = dedupKey;
+          }
         });
         return DecorationSet.create(doc, decos);
       },
@@ -1260,10 +1673,6 @@ const TrailingParagraphAfterTable = Extension.create({
   },
 });
 
-/* ── Markdown paste helpers ────────────────────────────────────────── */
-
-const MD_PATTERN = /^\s*(?:[-*+](\s+\[[ xX]\])?\s+|#{1,6}\s+|\d+\.\s+|>\s+|>\s*\[!|`{3,}|~{3,}|\[\[|!\[\[|==.+==|\|.*\||[^|\n]+\|[^|\n]+)/m;
-
 /* ── Inner editor ──────────────────────────────────────────────────────
  *  Owns the Tiptap editor. Mounted by `CollabEditor` only once the Y.Doc
  *  (and provider, when collaborative) are ready — so the editor is built
@@ -1273,6 +1682,7 @@ const MD_PATTERN = /^\s*(?:[-*+](\s+\[[ xX]\])?\s+|#{1,6}\s+|\d+\.\s+|>\s+|>\s*\
 type CollabEditorInnerProps = CollabEditorProps & {
   ydoc: Y.Doc;
   provider: HocuspocusProvider | null;
+  onEditorMountedForTiming?: () => void | (() => void);
 };
 
 /**
@@ -1283,7 +1693,9 @@ type CollabEditorInnerProps = CollabEditorProps & {
  * drift. The live editor spreads this, then appends its decoration + collab
  * extensions; the harness uses it standalone with content seeded by the codec.
  */
-export function markdownFormattingExtensions({ workspaceId }: { workspaceId?: string } = {}) {
+export function markdownFormattingExtensions(
+  { workspaceId, filePath }: { workspaceId?: string; filePath?: HtmlPreviewOptions['filePath'] } = {},
+) {
   return [
     allowSuggestionBlockMarks(StarterKit.configure({
       // v3 renamed `history` → `undoRedo`; collab provides undo/redo so it stays
@@ -1308,18 +1720,53 @@ export function markdownFormattingExtensions({ workspaceId }: { workspaceId?: st
     })),
     SuggestionDocument,
     SuggestionNodeAttributes,
+    // Structural keys are their own undo steps; Tab never leaves the editor
+    // while editing (lib/tiptap/structural-keys.ts).
+    UndoBoundaries,
+    EditorTabGuard,
+    // Double/triple click select a word / the clicked block at the ProseMirror
+    // level instead of falling through to the engine's native expansion — which
+    // on WebKit grabs the whole editable when the pointer misses a text run
+    // (lib/tiptap/pointer-selection.ts).
+    PointerSelection,
+    // Backspace at the start of a list line, and Delete at its end, join it
+    // with the neighbouring line instead of ListKeymap's structural lift /
+    // bullet-strip (see lib/tiptap/list-join.ts).
+    ListJoin,
+    // Pasting list lines at the end of a bullet that has children must not hand
+    // those children to the pasted content (see lib/tiptap/list-paste.ts).
+    ListPaste,
     // Same hardBreak `marker` attr the codec emits, so editing a doc with
     // `  ` / `\` hard breaks doesn't drop the marker on round trip.
     HardBreakMarker,
+    // Same bulletList `marker` attr (source `*` / `+` bullet style).
+    BulletMarker,
+    // HR marker / indented-codeBlock / table-cell align attrs (codec parity;
+    // `align` also renders column alignment in the editor).
+    MarkdownSourceFidelity,
+    // Raw YAML frontmatter block (must match the codec's markdownSchema).
+    Frontmatter,
+    // Frontmatter is only valid at the doc start; an interior node (mid-document
+    // paste) is rewritten to ordinary markdown via the shared codec.
+    FrontmatterNormalize,
     NormalizeNbsp,
     allowSuggestionBlockMarks(ObsidianBlockquote),
+    // Chevron / `•••` that toggle `calloutCollapsed` on a `[!type][-+]` callout.
+    // Doc state, not view state: the toggle round-trips as the markdown marker.
+    CalloutFold,
     Highlight.configure({ multicolor: true }),
+    // Inline-HTML subset marks (`<sub>`/`<sup>`; `<u>` comes from StarterKit).
+    // Must match the codec's markdownSchema so the round-trip is lossless.
+    Subscript,
+    Superscript,
     TextStyle,
-    FontFamily,
-    FontSize,
-    Color,
-    WorkspaceTextAlign.configure({
-      types: ['heading', 'paragraph', 'image'],
+    // Alignment only round-trips for images (`{align=…}`); paragraph/heading
+    // alignment has no markdown form, so it is not in the schema at all. No
+    // shortcuts: the stock Mod-Shift-r/j/l/e bindings would eat hard-reload
+    // and the workspace's Mod-Shift-j (fresh chat) while an image is selected.
+    TextAlign.extend({ addKeyboardShortcuts: () => ({}) }).configure({
+      types: ['image'],
+      alignments: ['left', 'center', 'right'],
     }),
     ObsidianLink.configure({
       openOnClick: false,
@@ -1333,6 +1780,9 @@ export function markdownFormattingExtensions({ workspaceId }: { workspaceId?: st
       // are already stripped by the markdown codec's `sanitizeUrl`.
       isAllowedUri: (url) => !/^\s*(?:javascript|vbscript|data):/i.test(url ?? ''),
     }),
+    // Bare `https://…` / `www.…` text renders as a clickable link (GFM autolink
+    // literals) without a link mark, so the markdown bytes stay untouched.
+    AutolinkDecorations,
     WorkspaceImage.configure({ workspaceId }),
     // `resizable` enables prosemirror-tables' columnResizing plugin so users
     // can drag column borders. Works with `table-layout: fixed` (globals.css)
@@ -1348,9 +1798,27 @@ export function markdownFormattingExtensions({ workspaceId }: { workspaceId?: st
     Mathematics.configure({
       regex: MATH_TEXT_REGEX,
       katexOptions: { throwOnError: false, strict: 'ignore' as const },
+      // Math inside a %%…%% source comment stays dimmed literal source; math
+      // inside a footnote's own span must not paint over the folded chip.
+      shouldRenderMatch: (state, from, to) =>
+        outsideSourceComment(state, from, to) && outsideFootnote(state, from, to),
     }),
+    // Doc-wide comment fold state (the icon toggles ALL comments), persisted
+    // per workspace as a local view preference — never written to the Y.Doc.
+    TagCommentDecorations.configure({
+      storageKey: workspaceId ? `sd-source-comments:${workspaceId}` : null,
+    }),
+    // Obsidian-style footnotes ([^ref], [^ref]: definitions, ^[inline]) as
+    // view-layer decorations over literal source text.
+    FootnoteDecorations,
     CodeBlockShiki,
     MermaidPreview,
+    // Obsidian-style read-only Properties view over the frontmatter node;
+    // cursor inside (or click) reveals the raw YAML — display-only parse,
+    // the text is never re-serialized.
+    FrontmatterPreview,
+    HtmlPreview.configure({ workspaceId, filePath }),
+    BlockIdBadges,
     // Suggestion marks live in the schema (must match the codec's markdownSchema).
     // The active suggestChanges plugin + toggle wiring is added in the editor.
     InsertionMark,
@@ -1433,13 +1901,28 @@ function CollabEditorInner({
   activeCommentThreadId,
   onSelectComment,
   attributionRanges,
+  suggestionAuthors,
+  onJumpToTurn,
   onNavigateToFile,
+  onNavigateToWikiTarget,
+  fetchWikiNoteText,
   onImageDrop,
   wikiLinkSuggestions,
+  revealPeer,
+  onRevealPeerDone,
+  onFocused,
   ydoc,
   provider,
+  onEditorMountedForTiming,
 }: CollabEditorInnerProps) {
+  // Clerk-only ON PURPOSE (not useAuthReady): this effect runs an RLS-read
+  // SELECT + postgres_changes subscribe, and sd_ desktop credentials carry no
+  // Supabase JWT — subscribing would just join as anon and receive nothing.
+  // Desktop parity needs an sd_ -> Realtime-token path first (follow-up).
   const { isLoaded: isClerkLoaded } = useAuth();
+  // Anonymous ?pshare= guests: wait for the minted realtime JWT before any
+  // channel joins — a claims-less join never receives events.
+  const pshareRealtimeReady = usePathShareRealtimeAuthReady();
   const { mode: documentEditMode } = useDocumentEditMode();
   // Local (sidecar) docs must not open cloud Realtime channels (ghost cursors).
   const isLocalDoc = Boolean(useWorkspaceCollabSocket(workspaceId)?.isLocal);
@@ -1448,6 +1931,10 @@ function CollabEditorInner({
   // has no text-match overlay.
   const onNavigateToFileRef = useRef(onNavigateToFile);
   onNavigateToFileRef.current = onNavigateToFile;
+  const onNavigateToWikiTargetRef = useRef(onNavigateToWikiTarget);
+  onNavigateToWikiTargetRef.current = onNavigateToWikiTarget;
+  const fetchWikiNoteTextRef = useRef(fetchWikiNoteText);
+  fetchWikiNoteTextRef.current = fetchWikiNoteText;
   const onImageDropRef = useRef(onImageDrop);
   onImageDropRef.current = onImageDrop;
   const wikiLinkSuggestionsRef = useRef(wikiLinkSuggestions ?? []);
@@ -1492,17 +1979,90 @@ function CollabEditorInner({
   onSelectCommentRef.current = onSelectComment;
   const attributionRangesRef = useRef(attributionRanges ?? []);
   attributionRangesRef.current = attributionRanges ?? [];
+  const suggestionAuthorsRef = useRef(suggestionAuthors);
+  suggestionAuthorsRef.current = suggestionAuthors;
+  const onJumpToTurnRef = useRef(onJumpToTurn);
+  onJumpToTurnRef.current = onJumpToTurn;
 
   const closeLinkMenu = useCallback(() => {
     setLinkMenu(null);
     setLinkMenuIndex(0);
   }, []);
 
+  // Target-note text behind `[[note#` anchor suggestions. The open file always
+  // re-serializes its live doc (fresh, includes unsynced keystrokes); other
+  // notes fetch once per picker session with a short TTL.
+  const [anchorNote, setAnchorNote] = useState<AnchorNoteState | null>(null);
+  const anchorNoteRef = useRef<AnchorNoteState | null>(null);
+  anchorNoteRef.current = anchorNote;
+  const anchorNoteCacheRef = useRef(new Map<string, { content: string | null; at: number }>());
+  const anchorNoteSeqRef = useRef(0);
+  const ANCHOR_NOTE_TTL_MS = 15_000;
+  const ensureAnchorNote = useCallback(
+    (path: string) => {
+      const seq = ++anchorNoteSeqRef.current;
+      if (path === filePath) {
+        setAnchorNote({ path, content: serializeDoc(ydoc), status: 'ready' });
+        return;
+      }
+      const cached = anchorNoteCacheRef.current.get(path);
+      if (cached && Date.now() - cached.at < ANCHOR_NOTE_TTL_MS) {
+        setAnchorNote({ path, content: cached.content, status: cached.content == null ? 'error' : 'ready' });
+        return;
+      }
+      const fetcher = fetchWikiNoteTextRef.current;
+      setAnchorNote({ path, content: null, status: fetcher ? 'loading' : 'error' });
+      if (!fetcher) return;
+      void fetcher(path)
+        .catch(() => null)
+        .then((content) => {
+          anchorNoteCacheRef.current.set(path, { content, at: Date.now() });
+          if (anchorNoteSeqRef.current === seq) {
+            setAnchorNote({ path, content, status: content == null ? 'error' : 'ready' });
+          }
+        });
+    },
+    [filePath, ydoc],
+  );
+
   /** Re-derive the wiki-mode menu from the doc. Leaves an open link-mode menu alone. */
   const refreshWikiLinkMenu = useCallback((view: EditorView) => {
     if (linkMenuRef.current?.mode === 'link') return;
     const active = activeWikiLinkQuery(view);
-    if (!active || fileMatches(wikiLinkSuggestionsRef.current, active.query).length === 0) {
+    if (!active) {
+      setLinkMenu(null);
+      setLinkMenuIndex(0);
+      return;
+    }
+    // `note#…` / `note#^…` → anchor mode: list the target note's headings or
+    // blocks. The menu stays open while the note text loads; an unresolvable
+    // file part closes it (same as zero file matches below).
+    const anchorMode = splitAnchorQuery(active.query);
+    if (anchorMode) {
+      const notePath = resolveAnchorNotePath(anchorMode, wikiLinkSuggestionsRef.current, filePath);
+      if (!notePath) {
+        setLinkMenu(null);
+        setLinkMenuIndex(0);
+        return;
+      }
+      const next = {
+        ...active,
+        anchor: {
+          path: notePath,
+          kind: anchorMode.kind,
+          query: anchorMode.anchorQuery,
+          sameFile: anchorMode.filePart === '',
+        },
+      };
+      setLinkMenu(next);
+      // Clamp (never reset) so arrow-key position survives list refreshes,
+      // matching the file-mode behavior below.
+      const count = buildLinkMenuItems(next, [], anchorNoteRef.current).length;
+      setLinkMenuIndex((current) => Math.max(0, Math.min(current, count - 1)));
+      if (anchorNoteRef.current?.path !== notePath || notePath === filePath) ensureAnchorNote(notePath);
+      return;
+    }
+    if (fileMatches(wikiLinkSuggestionsRef.current, active.query).length === 0) {
       setLinkMenu(null);
       setLinkMenuIndex(0);
       return;
@@ -1511,7 +2071,7 @@ function CollabEditorInner({
     setLinkMenuIndex((current) =>
       Math.min(current, fileMatches(wikiLinkSuggestionsRef.current, active.query).length - 1),
     );
-  }, []);
+  }, [ensureAnchorNote, filePath]);
 
   /** Open the link-mode popover for the current selection (new link).
    *  Deliberately no clipboard read here: navigator.clipboard.readText() on
@@ -1630,8 +2190,30 @@ function CollabEditorInner({
   const openExternalHrefRef = useRef(openExternalHref);
   openExternalHrefRef.current = openExternalHref;
 
+  const filePathRef = useRef<string | null>(filePath ?? null);
+  filePathRef.current = filePath ?? null;
+
+  // Map a link target to an existing workspace file (Obsidian-style: exact
+  // path, else basename/stem match anywhere) so pasted/imported links like
+  // [[My Note]] open `notes/My Note.md` instead of a dead verbatim path.
+  // Markdown hrefs (`documentRelative`) resolve against the open document's
+  // directory first — Obsidian semantics; wikilink targets stay vault-wide.
+  const resolveNavigationPath = useCallback(
+    (target: string, documentRelative = false) =>
+      resolveLinkTargetToPath(
+        target,
+        wikiLinkSuggestionsRef.current,
+        documentRelative ? filePathRef.current : null,
+      ),
+    [],
+  );
+
   const navigateToHref = useCallback((href: string, isWiki: boolean) => {
     if (isWiki) {
+      if (onNavigateToWikiTargetRef.current) {
+        onNavigateToWikiTargetRef.current(href);
+        return;
+      }
       const normalized = href.replace(/^\.\//, '').replace(/^\/+/, '');
       onNavigateToFileRef.current?.(normalized);
       return;
@@ -1647,8 +2229,8 @@ function CollabEditorInner({
       return;
     }
     if (href.startsWith('#')) return;
-    onNavigateToFileRef.current?.(href.replace(/^\.\//, '').replace(/^\/+/, ''));
-  }, [openExternalHref]);
+    onNavigateToFileRef.current?.(resolveNavigationPath(href, true));
+  }, [openExternalHref, resolveNavigationPath]);
 
   const removeLinkAt = useCallback((view: EditorView, range: { from: number; to: number }) => {
     const linkMark = view.state.schema.marks.link;
@@ -1671,7 +2253,10 @@ function CollabEditorInner({
     {
       immediatelyRender: false,
       extensions: [
-        ...markdownFormattingExtensions({ workspaceId }),
+        // Getter, not the value: a rename keeps this editor mounted (and
+        // `filePath` is not a useEditor dep), so relative media must resolve
+        // against the CURRENT directory.
+        ...markdownFormattingExtensions({ workspaceId, filePath: () => filePathRef.current }),
         // Suggestions-as-marks: in Suggest mode, a human's edits become
         // insertion/deletion marks in the Y.Doc (instant, position-stable,
         // synced) instead of being reconstructed by the server text-match
@@ -1681,6 +2266,33 @@ function CollabEditorInner({
           canResolve: canResolveSuggestions,
           onResolved: (ids, action) => {
             if (ydoc) recordMarkdownSuggestionResolution(ydoc, ids, action);
+          },
+          // Stacked-suggestion reject cascade outcome (dependent ids): same
+          // recorder as the headless resolver, so surfaces converge.
+          onCascade: (outcome) => {
+            if (ydoc) recordRejectCascadeOutcome(ydoc, outcome);
+          },
+          // Read through refs: the map arrives from a fetch after the editor
+          // (and usually the marks) already exist, and the effect below nudges
+          // the decorations to rebuild once it lands.
+          resolveAuthor: (ids) => {
+            const authors = suggestionAuthorsRef.current;
+            if (!authors) return null;
+            for (const id of ids) {
+              const author = authors[String(id)];
+              if (!author) continue;
+              const { chatId, assistantMessageId } = author;
+              return {
+                label: author.label,
+                color: author.color,
+                imageUrl: author.imageUrl,
+                imageRound: author.imageRound,
+                chipLabel: author.chipLabel,
+                chipColor: author.chipColor,
+                onJump: () => onJumpToTurnRef.current?.(assistantMessageId, chatId),
+              };
+            }
+            return null;
           },
         }),
         ImageUploadPlaceholder,
@@ -1694,9 +2306,34 @@ function CollabEditorInner({
           ranges: attributionRangesRef.current,
         }),
         TrailingParagraphAfterTable,
+        // ![[note]] / ![[note#…]] transclusion cards (inert without a fetcher).
+        EmbedPreview.configure({
+          getPaths: () => wikiLinkSuggestionsRef.current,
+          fetchNoteText: fetchWikiNoteText
+            ? (path: string) => fetchWikiNoteTextRef.current?.(path) ?? Promise.resolve(null)
+            : undefined,
+          resolveImageSrc: (src: string) => resolveWorkspaceImageSrc(src, workspaceId),
+          onOpen: (target: string) => onNavigateToWikiTargetRef.current?.(target),
+          // Same-file embeds (`![[#Section]]`) resolve against the open file
+          // and render from the LIVE doc, so they track unsynced edits.
+          getCurrentPath: () => filePath ?? null,
+          getCurrentText: () => {
+            try {
+              return serializeDoc(ydoc);
+            } catch {
+              return null;
+            }
+          },
+        }),
         ChatContextShortcut.configure({ filePath: filePath ?? null }),
+        // View-only Obsidian fold: collapse headings / bullets locally without
+        // touching the Y.Doc (see lib/tiptap/fold.ts). Editor-surface concern,
+        // so it lives here rather than in the codec-shared formatting set.
+        FoldGutter,
         ScopedSelectAll,
-        LocalCaretBlock,
+        // After the menu-owning extensions above: its keydown handler must only
+        // see arrows no menu consumed. See lib/tiptap/caret-edge-scroll.ts.
+        CaretEdgeScroll,
         BlurSelectionHighlight.configure({ className: 'sd-blur-selection' }),
         AgentGhostCursor,
         ...(ydoc ? [Collaboration.configure({ document: ydoc })] : []),
@@ -1719,7 +2356,7 @@ function CollabEditorInner({
       editorProps: {
         attributes: {
           class: `tiptap min-h-[360px] focus:outline-none ${codeMode ? 'tiptap-code' : ''} ${className ?? ''}`,
-          spellcheck: codeMode ? 'false' : 'true',
+          spellcheck: !codeMode && getSpellcheckPreference() ? 'true' : 'false',
         },
         clipboardTextSerializer: imageAwareClipboardText,
         // Copy/cut yields the accepted projection: drop struck text and strip
@@ -1731,6 +2368,7 @@ function CollabEditorInner({
           // Slice with open depth over empty content is invalid, so emptied.
           return content.size ? new Slice(content, slice.openStart, slice.openEnd) : Slice.empty;
         },
+        handleTextInput: (view, from, to, text) => linkifyTypedWikiLink(view, from, to, text),
         handleDOMEvents: {
           keydown: (view, event) => {
             const menu = linkMenuRef.current;
@@ -1759,7 +2397,15 @@ function CollabEditorInner({
 
             if (!menu || menu.mode !== 'wiki') return false;
 
-            const items = buildLinkMenuItems(menu, wikiLinkSuggestionsRef.current);
+            // Escape must close even with zero items — anchor mode keeps the
+            // menu open while the target note loads (or matches nothing).
+            if (event.key === 'Escape') {
+              event.preventDefault();
+              closeLinkMenu();
+              return true;
+            }
+
+            const items = buildLinkMenuItems(menu, wikiLinkSuggestionsRef.current, anchorNoteRef.current);
             if (items.length === 0) return false;
 
             if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
@@ -1772,11 +2418,6 @@ function CollabEditorInner({
               event.preventDefault();
               const chosen = items[linkMenuIndexRef.current] ?? items[0];
               applyLinkChoice(view, menu, chosen);
-              closeLinkMenu();
-              return true;
-            }
-            if (event.key === 'Escape') {
-              event.preventDefault();
               closeLinkMenu();
               return true;
             }
@@ -1806,30 +2447,36 @@ function CollabEditorInner({
             return true;
           },
           click: (_view, event) => {
-            // Plain clicks place the caret in the link and let the hover card
-            // surface (with Copy / Edit / Remove). Cmd/Ctrl-click is the
-            // explicit "open the target now" shortcut; the hover card's URL
-            // preview is the other navigation affordance.
+            // A plain click that didn't select text (caret already placed by
+            // ProseMirror on mouseup) opens the link, like Cmd/Ctrl-click.
+            // Drag-selecting inside link text only selects. Deliberate: a
+            // double-click opens on its first click too (no delayed-open
+            // timer, and Safari/WKWebView popup-block window.open outside the
+            // click handler); the hover card keeps Copy / Edit / Remove.
             const target = event.target as HTMLElement | null;
             if (!target) return false;
             const anchor = target.closest('a') as HTMLAnchorElement | null;
             if (!anchor) return false;
             const href = anchor.getAttribute('href');
             if (!href) return false;
-            if (href.startsWith('?') && queryHrefModal(href)) {
-              // Workspace-UI deep-link — a plain click works: the starter docs'
-              // "Connect it to this workspace" CTA targets brand-new users who
-              // don't know the Cmd-click convention. Query links WITHOUT a
-              // modal value fall through to normal editor click behavior.
+            if (href.startsWith('?')) {
+              // Workspace-UI deep-link (the starter docs' "Connect it to this
+              // workspace" CTA). Query links WITHOUT a modal value are not a
+              // file: fall through to normal editor click behavior.
+              if (!queryHrefModal(href)) return false;
               event.preventDefault();
               applyQueryHref(href);
               return true;
             }
-            if (!(event.metaKey || event.ctrlKey)) return false;
+            // DOM selection, not view.state: on a plain click ProseMirror lets
+            // the browser place the caret and syncs state on selectionchange.
+            const collapsed = document.getSelection()?.isCollapsed !== false;
+            if (!(event.metaKey || event.ctrlKey || collapsed)) return false;
             const wikiTarget = anchor.dataset.obsidianTarget;
             if (wikiTarget) {
               event.preventDefault();
-              onNavigateToFileRef.current?.(wikiTarget);
+              if (onNavigateToWikiTargetRef.current) onNavigateToWikiTargetRef.current(wikiTarget);
+              else onNavigateToFileRef.current?.(wikiTarget);
               return true;
             }
             const isExternal = /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('//');
@@ -1840,8 +2487,7 @@ function CollabEditorInner({
             }
             if (href.startsWith('#')) return false;
             event.preventDefault();
-            const normalized = href.replace(/^\.\//, '').replace(/^\/+/, '');
-            onNavigateToFileRef.current?.(normalized);
+            onNavigateToFileRef.current?.(resolveNavigationPath(href, true));
             return true;
           },
           drop: (view, event) => {
@@ -1908,7 +2554,9 @@ function CollabEditorInner({
             const slice = parseHtmlSlice(view, normalizeGoogleDocsHtml(html));
             if (slice.content.size) {
               event.preventDefault();
-              view.dispatch(view.state.tr.replaceSelection(slice).scrollIntoView());
+              if (!pasteListBesideChildren(view, slice)) {
+                view.dispatch(view.state.tr.replaceSelection(slice).scrollIntoView());
+              }
               return true;
             }
           }
@@ -1919,11 +2567,11 @@ function CollabEditorInner({
           if (isProseMirrorClipboardHtml(html)) return false;
 
           const text = event.clipboardData?.getData('text/plain');
-          if (!text || !MD_PATTERN.test(text)) return false;
+          if (!text || !pasteLooksLikeMarkdown(text)) return false;
 
           // Notion/web copies put rich HTML *and* a lossy text/plain on the
-          // clipboard: the plain text keeps list/heading markers (so it matches
-          // MD_PATTERN) but DROPS hyperlink URLs. Routing those through the
+          // clipboard: the plain text keeps list/heading markers (so it passes
+          // the markdown gate) but DROPS hyperlink URLs. Routing those through the
           // markdown path would silently delete the links (fix #7). Defer to
           // ProseMirror's native HTML paste so links + nesting survive; markdown
           // source (Obsidian, code editors) keeps `](` and stays on this path.
@@ -1931,6 +2579,7 @@ function CollabEditorInner({
 
           const slice = parseHtmlSlice(view, markdownToHtml(text, { renderImages: false }));
           if (!slice.content.size) return false;
+          if (pasteListBesideChildren(view, slice)) return true;
           view.dispatch(view.state.tr.replaceSelection(slice).scrollIntoView());
           return true;
         },
@@ -1955,14 +2604,25 @@ function CollabEditorInner({
     // only mounts it once they're ready, and keys it on the doc), so they are
     // intentionally not deps — that's what keeps the editor from being built
     // twice per file open. canResolveSuggestions is a dep so a mid-session
-    // permission downgrade drops the installed ✓/✕ review controls.
-    [fileId, readOnly, codeMode, canResolveSuggestions]
+    // permission downgrade drops the installed ✓/✕ review controls. readOnly
+    // is NOT a dep: Edit↔View flips go through setEditable below, so the view
+    // (and its scroll position) survives the toggle.
+    [fileId, codeMode, canResolveSuggestions]
   );
 
   useEffect(() => {
     if (!editor) return;
     editor.setEditable(!readOnly);
   }, [editor, readOnly]);
+
+  // A rename/move keeps this editor mounted and touches no document state, so
+  // nothing would tell the HTML previews that their relative `./media` refs now
+  // point somewhere else. Nudge the view; the extension re-resolves if the
+  // directory actually changed.
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    editor.view.dispatch(editor.state.tr);
+  }, [editor, filePath]);
 
   // Drive suggestion (Google-Docs "suggesting") mode from the document edit
   // mode. When on, a human's edits become tracked insertion/deletion marks.
@@ -1974,27 +2634,47 @@ function CollabEditorInner({
   }, [editor, suggesting]);
 
   // Track whether any suggestion mark is live, so the whole-doc accept/reject
-  // control only shows when there's something to review. Recompute on every
-  // transaction (typed marks, agent marks synced in, accept/reject).
+  // control only shows when there's something to review. A full-doc walk per
+  // doc change is O(doc) per keystroke, so scan only the changed blocks: a
+  // mark can only APPEAR inside an edit, and only a doc that currently has
+  // suggestions can lose its last one (that rare path takes the full walk).
   useEffect(() => {
     if (!editor || codeMode) return;
-    const recompute = () => {
-      if (editor.isDestroyed) return;
+    const hasMarkBetween = (from: number, to: number) => {
       let found = false;
-      editor.state.doc.descendants((node) => {
+      editor.state.doc.nodesBetween(from, to, (node) => {
         if (found) return false;
         if (node.isText && node.marks.some((m) => m.type.name === 'insertion' || m.type.name === 'deletion')) {
           found = true;
-          return false;
         }
-        return true;
+        return !found;
       });
-      setHasSuggestions(found);
+      return found;
     };
-    recompute();
-    editor.on('transaction', recompute);
+    // The effect's own copy is the source of truth between renders — state
+    // updates are mirrored from it, never read back.
+    let current = false;
+    const recomputeFull = () => {
+      if (editor.isDestroyed) return;
+      current = hasMarkBetween(0, editor.state.doc.content.size);
+      setHasSuggestions(current);
+    };
+    recomputeFull();
+    const onTransaction = ({ transaction }: { transaction: Transaction }) => {
+      if (!transaction.docChanged || editor.isDestroyed) return;
+      const span = changedBlockSpan(transaction);
+      if (span && hasMarkBetween(span.from, span.to)) {
+        current = true;
+        setHasSuggestions(true);
+      } else if (current || !span) {
+        // Suggestions might have vanished with the edit (accept/reject,
+        // deletion), or an attr-only step hid the range — re-walk.
+        recomputeFull();
+      }
+    };
+    editor.on('transaction', onTransaction);
     return () => {
-      editor.off('transaction', recompute);
+      editor.off('transaction', onTransaction);
     };
   }, [editor, codeMode]);
 
@@ -2182,7 +2862,7 @@ function CollabEditorInner({
   useEffect(() => {
     if (!editor || !workspaceId || !filePath) return;
     if (isLocalDoc) return; // no cloud agent presence for sidecar docs
-    if (!isClerkLoaded) return; // ensure Realtime subscribes with the Clerk JWT
+    if (!isClerkLoaded || !pshareRealtimeReady) return; // realtime needs the Clerk or pshare JWT
     const supabase = createBrowserClient();
     if (!supabase) return;
 
@@ -2267,7 +2947,7 @@ function CollabEditorInner({
       supabase.removeChannel(channel);
       if (editorRef && !editorRef.isDestroyed) editorRef.commands.setAgentGhostCursors({});
     };
-  }, [editor, workspaceId, filePath, isClerkLoaded, isLocalDoc]);
+  }, [editor, workspaceId, filePath, isClerkLoaded, pshareRealtimeReady, isLocalDoc]);
 
   // Drop our caret on everyone else's screen once this tab goes idle. Blurring
   // lets y-prosemirror clear (and keep clearing) our awareness cursor; the
@@ -2353,22 +3033,132 @@ function CollabEditorInner({
     );
   }, [activeCommentThreadId, commentRanges, editor]);
 
+  // The editor is NOT rebuilt when `user` changes (useEditor keys on
+  // fileId/codeMode/…), so an identity that resolves after mount — an anon
+  // visitor's cookie fetch upgrading "Guest" to their name/color/presenceKey —
+  // must be pushed into awareness directly, or remote bubble-click matching
+  // (and the caret's name flag) keeps the stale identity until a remount.
   useEffect(() => {
+    provider?.awareness?.setLocalStateField('user', user);
+  }, [provider, user]);
+
+  // Report focus upward for presence: the file whose editor was last focused
+  // is what this user is "in", regardless of which split pane holds it.
+  const onFocusedRef = useRef(onFocused);
+  onFocusedRef.current = onFocused;
+  useEffect(() => {
+    if (!editor) return;
+    const handler = () => onFocusedRef.current?.();
+    editor.on('focus', handler);
+    return () => {
+      editor.off('focus', handler);
+    };
+  }, [editor]);
+
+  // Jump-to-peer (bubble click): find the peer's caret in this doc's awareness
+  // and center it. Right after the file opens, awareness/binding are still
+  // syncing — retry across frames (~10s) and give up silently: a peer who
+  // blurred (y-tiptap nulls `cursor`) or left has no caret to jump to.
+  // Delivery AND give-up report via onRevealPeerDone so the owner clears the
+  // request — a kept request would replay the scroll on a later remount.
+  const revealPeerSeqRef = useRef(0);
+  const onRevealPeerDoneRef = useRef(onRevealPeerDone);
+  onRevealPeerDoneRef.current = onRevealPeerDone;
+  useEffect(() => {
+    const req = revealPeer;
+    if (!req || req.seq === revealPeerSeqRef.current) return;
     if (!editor || editor.isDestroyed) return;
-    const tr = editor.state.tr.setMeta(attributionPaintKey, {
-      ranges: attributionRanges ?? [],
-    });
-    editor.view.dispatch(tr);
-  }, [attributionRanges, editor]);
+    const awareness = provider?.awareness;
+    if (!awareness) return;
+    revealPeerSeqRef.current = req.seq;
+    let attempts = 0;
+    return retryUntilDone(
+      () => {
+        if (editor.isDestroyed) return true;
+        // Give-up must run BEFORE retryUntilDone's own frame cap (700 below)
+        // exhausts, or the request would survive unreported and replay later.
+        if (++attempts >= 600) {
+          onRevealPeerDoneRef.current?.(req.seq);
+          return true;
+        }
+        for (const [clientId, state] of awareness.getStates()) {
+          if (clientId === awareness.clientID) continue;
+          const peer = (state as { user?: { name?: string; color?: string; presenceKey?: string } })
+            .user;
+          if (!peer) continue;
+          const matched =
+            req.presenceKey && peer.presenceKey
+              ? peer.presenceKey === req.presenceKey
+              : Boolean(req.name) &&
+                peer.name === req.name &&
+                (!req.color || peer.color === req.color);
+          if (!matched) continue;
+          const cursor = (state as { cursor?: { anchor?: unknown; head?: unknown } | null }).cursor;
+          const rel = (cursor?.head ?? cursor?.anchor) as Record<string, unknown> | undefined;
+          if (!rel) continue; // caret cleared (blur) — keep retrying until timeout
+          const pos = resolvePosition(editor, rel);
+          if (pos === null) return false; // y-sync binding not ready yet
+          const view = editor.view;
+          let top: number;
+          try {
+            top = view.coordsAtPos(Math.min(pos, view.state.doc.content.size)).top;
+          } catch {
+            return false; // position not laid out yet
+          }
+          const scroller = findScrollableAncestor(view.dom);
+          if (!scroller) return false;
+          const rect = scroller.getBoundingClientRect();
+          scroller.scrollTo({
+            top: Math.max(scroller.scrollTop + top - rect.top - scroller.clientHeight * 0.4, 0),
+            behavior: 'smooth',
+          });
+          // Replay the caret's name flag so the arrival point is unmistakable.
+          restartCursorLabelFade(view.dom, [clientId]);
+          onRevealPeerDoneRef.current?.(req.seq);
+          return true;
+        }
+        return false; // peer not in this room's awareness yet — retry
+      },
+      requestAnimationFrame,
+      cancelAnimationFrame,
+      700,
+    );
+  }, [revealPeer, editor, provider]);
 
   useEffect(() => {
-    // A readOnly flip rebuilds the editor (it's a useEditor dep): this effect
-    // re-runs while `editor` is still the destroyed instance — reporting it
-    // would crash consumers that read it (e.g. getText). The rebuilt editor
-    // re-fires the effect and reports itself.
+    if (!editor || editor.isDestroyed) return;
+    const ranges = attributionRanges ?? [];
+    const tr = editor.state.tr.setMeta(attributionPaintKey, { ranges });
+    editor.view.dispatch(tr);
+    // The authorship lens writes margin annotations — widen the right margin
+    // while it's on so labels don't overlap the text. Explicit toggle, so the
+    // reflow happens on a deliberate action, never mid-typing.
+    editor.view.dom.classList.toggle('authorship-lens-on', ranges.some((range) => range.sideLabel));
+  }, [attributionRanges, editor]);
+
+  // The suggestion attribution fetch resolves after the marks are already
+  // painted, and the review controls are built once per block — repaint them so
+  // the author icon appears without waiting for the next keystroke. Gated on the
+  // CONTENT, not the prop identity: the pending-turns poll hands us a fresh
+  // object about once a second while anyone types, and each repaint re-walks the
+  // doc and re-creates every control's DOM (dropping the hover you were aiming at).
+  const lastAuthorsSigRef = useRef('');
+  useEffect(() => {
+    if (!editor || editor.isDestroyed || !suggestionAuthors) return;
+    const signature = JSON.stringify(suggestionAuthors);
+    if (signature === lastAuthorsSigRef.current) return;
+    lastAuthorsSigRef.current = signature;
+    refreshSuggestionReview(editor.view);
+  }, [suggestionAuthors, editor]);
+
+  useEffect(() => {
+    // Skip a destroyed instance (a rebuild re-runs this while `editor` is
+    // still the old one); the rebuilt editor re-fires and reports itself.
     if (!editor || editor.isDestroyed || !ydoc) return;
+    const cancelTiming = onEditorMountedForTiming?.();
     onReady?.({ editor, ydoc });
-  }, [editor, fileId, onReady, ydoc, readOnly]);
+    return cancelTiming;
+  }, [editor, fileId, onEditorMountedForTiming, onReady, ydoc]);
 
   useEffect(() => {
     if (!editor) return;
@@ -2418,7 +3208,7 @@ function CollabEditorInner({
   }
 
   const linkMenuItems = linkMenu
-    ? buildLinkMenuItems(linkMenu, wikiLinkSuggestions ?? [])
+    ? buildLinkMenuItems(linkMenu, wikiLinkSuggestions ?? [], anchorNote)
     : [];
 
   const pickLinkItem = (item: LinkMenuItem) => {
@@ -2457,9 +3247,22 @@ function CollabEditorInner({
             hiddenRef={linkMenuRef}
           />
           <EditorTableControls editor={editor} />
+          <EditorCalloutControls editor={editor} />
           <EditorSlashMenu
             editor={editor}
             pickImage={onImageDrop ? pickImage : undefined}
+            // "/image <description>" — workspaces with an uploader wired
+            // (the picked candidate goes through the same pipeline).
+            generateImage={
+              onImageDrop && workspaceId
+                ? ({ prompt }) =>
+                    window.dispatchEvent(
+                      new CustomEvent('sundial:open-image-gen', {
+                        detail: { prompt, source: editor.view.dom },
+                      }),
+                    )
+                : undefined
+            }
             // "/ai <instruction>" sends a turn right away; a bare "/ai" opens
             // the same inline popup as the bubble's Ask Sunny button.
             askSunny={({ text, instruction, caret }) => {
@@ -2473,35 +3276,55 @@ function CollabEditorInner({
             }}
           />
           <EditorAskInput editor={editor} />
+          <EditorRewritePopup
+            editor={editor}
+            projectId={workspaceId ?? null}
+            filePath={filePath ?? null}
+          />
+          <EditorPrismPopup
+            editor={editor}
+            projectId={workspaceId ?? null}
+            filePath={filePath ?? null}
+          />
+          <EditorLengthResize
+            editor={editor}
+            projectId={workspaceId ?? null}
+            filePath={filePath ?? null}
+          />
+          <EditorFactcheckPopup
+            editor={editor}
+            projectId={workspaceId ?? null}
+            filePath={filePath ?? null}
+          />
+          <EditorPangramPopup
+            editor={editor}
+            projectId={workspaceId ?? null}
+            filePath={filePath ?? null}
+          />
+          <EditorImageGenPopup
+            editor={editor}
+            projectId={workspaceId ?? null}
+            filePath={filePath ?? null}
+            upload={onImageDrop}
+            insertAt={(pos, image) => insertImages(editor.view, pos, [image])}
+          />
         </>
       )}
       {hasSuggestions && !readOnly && canResolveSuggestions && editor && (
-        // `onMouseDown` preventDefault (keep the editor's focus, so typing/undo
-        // still land in ProseMirror right after) + NO `.focus()` in the chain
-        // (TipTap's focus() scrolls its selection into view, yanking a reader
-        // who never placed a caret to doc start/end). Together: focus is
-        // preserved when you had it, and the scroll position is never touched —
-        // mirroring the per-suggestion accept/reject buttons.
-        <div className="sticky bottom-4 z-30 mt-2 flex justify-end gap-1.5 pr-1">
-          <button
-            type="button"
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => editor.chain().rejectAllSuggestions().run()}
-            className="flex items-center gap-1 rounded-lg border border-[var(--diff-del-border)] bg-white/95 px-2.5 py-1.5 text-xs font-medium text-[var(--diff-del-text)] shadow-sm backdrop-blur transition-colors hover:bg-[var(--diff-del-bg)]"
-          >
-            <span className="text-sm leading-none">✕</span> Reject all
-          </button>
-          <button
-            type="button"
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => editor.chain().acceptAllSuggestions().run()}
-            className="flex items-center gap-1 rounded-lg border border-[var(--diff-add-border)] bg-white/95 px-2.5 py-1.5 text-xs font-medium text-[var(--diff-add-text)] shadow-sm backdrop-blur transition-colors hover:bg-[var(--diff-add-bg)]"
-          >
-            <span className="text-sm leading-none">✓</span> Accept all
-          </button>
-        </div>
+        // NO `.focus()` in the chains (TipTap's focus() scrolls its selection
+        // into view, yanking a reader who never placed a caret to doc
+        // start/end) — the bar itself preserves editor focus via onMouseDown.
+        <SuggestionReviewBar
+          className="sticky bottom-4 z-30 mt-2 pr-1"
+          onAcceptAll={() => editor.chain().acceptAllSuggestions().run()}
+          onRejectAll={() => editor.chain().rejectAllSuggestions().run()}
+        />
       )}
-      {linkMenu && (linkMenu.mode === 'link' || linkMenuItems.length > 0) && (
+      {/* Anchor mode keeps the popover open with no items: it renders
+          "Loading…" while the target note is fetched and "No matches"
+          afterwards. Without `linkMenu.anchor` here the menu vanishes in
+          exactly those states and the user gets no feedback at all. */}
+      {linkMenu && (linkMenu.mode === 'link' || linkMenu.anchor || linkMenuItems.length > 0) && (
         <div
           ref={linkMenuDomRef}
           role="listbox"
@@ -2612,19 +3435,37 @@ function CollabEditorInner({
             className="max-h-72 overflow-y-auto overscroll-contain"
           >
             {linkMenuItems.length === 0 ? (
-              <div className="px-3 py-2 text-[13px] text-stone-500">No matches</div>
+              <div className="px-3 py-2 text-[13px] text-stone-500">
+                {linkMenu.anchor &&
+                (anchorNote?.path !== linkMenu.anchor.path || anchorNote?.status === 'loading')
+                  ? 'Loading…'
+                  : linkMenu.anchor && anchorNote?.status === 'error'
+                    ? "Couldn't read that note"
+                    : 'No matches'}
+              </div>
             ) : (
               linkMenuItems.map((item, index) => {
                 const active = index === linkMenuIndex;
                 const primary = item.kind === 'file'
                   ? item.path.split('/').pop() ?? item.path
-                  : item.label;
+                  : item.kind === 'anchor'
+                    ? (item.suggestion.kind === 'heading' ? item.suggestion.heading : item.suggestion.preview)
+                    : item.label;
                 const secondary = item.kind === 'file'
                   ? (item.path.includes('/') ? item.path.slice(0, item.path.lastIndexOf('/')) : '')
-                  : item.url;
+                  : item.kind === 'anchor'
+                    ? (item.suggestion.kind === 'heading'
+                        ? `H${item.suggestion.level}`
+                        : `^${item.suggestion.id}`)
+                    : item.url;
+                const key = item.kind === 'file'
+                  ? `file:${item.path}`
+                  : item.kind === 'anchor'
+                    ? `anchor:${index}:${item.suggestion.kind === 'heading' ? item.suggestion.heading : item.suggestion.preview}`
+                    : `url:${item.url}`;
                 return (
                   <button
-                    key={item.kind === 'file' ? `file:${item.path}` : `url:${item.url}`}
+                    key={key}
                     type="button"
                     role="option"
                     aria-selected={active}
@@ -2647,6 +3488,12 @@ function CollabEditorInner({
                   >
                     {item.kind === 'file' ? (
                       <FileTextIcon className="h-4 w-4 shrink-0 text-stone-500" weight="regular" />
+                    ) : item.kind === 'anchor' ? (
+                      item.suggestion.kind === 'heading' ? (
+                        <HashIcon className="h-4 w-4 shrink-0 text-stone-500" weight="regular" />
+                      ) : (
+                        <ParagraphIcon className="h-4 w-4 shrink-0 text-stone-500" weight="regular" />
+                      )
                     ) : (
                       <GlobeIcon className="h-4 w-4 shrink-0 text-stone-500" weight="regular" />
                     )}
@@ -2792,6 +3639,7 @@ export function CollabEditor(props: CollabEditorProps) {
 
   const fallbackCollabUrl = resolveCollabUrl();
   const sharedSocket = useWorkspaceCollabSocket(workspaceId);
+  const sharedSocketPending = useWorkspaceCollabSocketPending();
   const [hostCollabUrl, setHostCollabUrl] = useState<string | undefined>(undefined);
   const [hostToken, setHostToken] = useState<string | undefined>(undefined);
   const [hostDocNamePrefix, setHostDocNamePrefix] = useState<string | null>(null);
@@ -2802,19 +3650,10 @@ export function CollabEditor(props: CollabEditorProps) {
   // the file changes — otherwise it stays resident for the whole session.
   useEffect(() => () => localYdoc.destroy(), [localYdoc]);
 
-  // WebKit engine stamp, runtime fallback: the root layout's inline script
-  // normally sets this before first paint, but a cached document (WKWebView
-  // caches aggressively) can miss it — and without the attribute, the
-  // content-visibility scroll optimization stays on and WebKit drops paint on
-  // blocks the caret leaves (the desktop disappearing-text bug). Idempotent.
   useEffect(() => {
-    if (isWebKitEngineUA(navigator.userAgent)) {
-      document.documentElement.dataset.engine = 'webkit';
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!workspaceId || sharedSocket) {
+    // A shared socket that is still opening makes this fallback redundant
+    // (and it would otherwise fire one throwaway /host request per mount).
+    if (!workspaceId || sharedSocket || sharedSocketPending) {
       setHostCollabUrl(undefined);
       setHostToken(undefined);
       return;
@@ -2834,7 +3673,7 @@ export function CollabEditor(props: CollabEditorProps) {
       cancelled = true;
       controller.abort();
     };
-  }, [workspaceId, sharedSocket]);
+  }, [workspaceId, sharedSocket, sharedSocketPending]);
 
   const effectiveHostCollabUrl = sharedSocket?.collabUrl ?? hostCollabUrl;
   const effectiveDocNamePrefix = sharedSocket?.docNamePrefix ?? hostDocNamePrefix;
@@ -2852,10 +3691,40 @@ export function CollabEditor(props: CollabEditorProps) {
   const [provider, setProvider] = useState<HocuspocusProvider | null>(null);
   const [ydoc, setYdoc] = useState<Y.Doc | null>(null);
   const [initialSyncReady, setInitialSyncReady] = useState(!collabUrl);
+  const [syncVerified, setSyncVerified] = useState(!collabUrl);
+  const [openedFromBootstrap, setOpenedFromBootstrap] = useState(false);
+  const openTimingRef = useRef<ReturnType<typeof startFileOpen> | null>(null);
+  if (!openTimingRef.current || openTimingRef.current.fileId !== fileId) {
+    openTimingRef.current = startFileOpen(fileId, undefined, !hidden);
+  }
+
+  const reportEditorMounted = useCallback(() => {
+    const timing = openTimingRef.current;
+    if (!timing || hidden || timing.fileId !== fileId || timing.visible) return;
+    return afterNextPaint(() => {
+      if (openTimingRef.current !== timing || hidden) return;
+      const measurement = finishFileVisible(timing);
+      if (!measurement) return;
+      track('file_open_performance', {
+        projectId: workspaceId,
+        fileId,
+        path: filePath,
+        editor: 'markdown',
+        phase: 'visible',
+        bootstrap: openedFromBootstrap,
+        elapsedMs: measurement.elapsedMs,
+        openKind: measurement.openKind,
+        ...(measurement.navigationElapsedMs !== undefined
+          ? { navigationToVisibleMs: measurement.navigationElapsedMs }
+          : {}),
+      });
+    });
+  }, [fileId, filePath, hidden, openedFromBootstrap, workspaceId]);
 
   useEffect(() => {
     setConnectionStatus(collabUrl ? 'connecting' : 'local');
     setInitialSyncReady(!collabUrl);
+    setSyncVerified(!collabUrl);
     if (!sharedSocket) {
       setYdoc(localYdoc);
     }
@@ -2886,6 +3755,9 @@ export function CollabEditor(props: CollabEditorProps) {
     const entry = acquireProvider(sharedSocket.socket, docName, fileId, sharedSocket.getToken);
     setProvider(entry.provider);
     setYdoc(entry.ydoc);
+    setOpenedFromBootstrap(entry.bootstrapped);
+    setInitialSyncReady(entry.bootstrapped || entry.provider.synced);
+    setSyncVerified(entry.provider.synced);
     return () => {
       releaseProvider(sharedSocket.socket, docName, fileId);
     };
@@ -2969,19 +3841,23 @@ export function CollabEditor(props: CollabEditorProps) {
   useEffect(() => {
     if (!collabUrl) {
       setInitialSyncReady(true);
+      setSyncVerified(true);
       return;
     }
     if (!provider) {
       setInitialSyncReady(false);
+      setSyncVerified(false);
       return;
     }
     if (provider.synced) {
       setInitialSyncReady(true);
+      setSyncVerified(true);
       return;
     }
-    setInitialSyncReady(false);
+    setSyncVerified(false);
     const markReady = () => {
       setInitialSyncReady(true);
+      setSyncVerified(true);
     };
     const handleSync = (synced: boolean) => {
       if (synced) markReady();
@@ -3000,12 +3876,32 @@ export function CollabEditor(props: CollabEditorProps) {
     enabled: !!collabUrl,
     provider,
     reconnect: sharedSocket?.reconnect,
-    syncSignal: initialSyncReady,
+    syncSignal: syncVerified,
   });
 
   useEffect(() => {
     onConnectionStatusChange?.(connectionStatus);
   }, [connectionStatus, onConnectionStatusChange]);
+
+  useEffect(() => {
+    const timing = openTimingRef.current;
+    if (!timing || !syncVerified || !provider || timing.fileId !== fileId || timing.synced) return;
+    const measurement = finishFileSync(timing);
+    if (!measurement) return;
+    track('file_open_performance', {
+      projectId: workspaceId,
+      fileId,
+      path: filePath,
+      editor: 'markdown',
+      phase: 'sync_verified',
+      bootstrap: openedFromBootstrap,
+      elapsedMs: measurement.elapsedMs,
+      openKind: measurement.openKind,
+      ...(measurement.navigationElapsedMs !== undefined
+        ? { navigationToSyncMs: measurement.navigationElapsedMs }
+        : {}),
+    });
+  }, [fileId, filePath, openedFromBootstrap, provider, syncVerified, workspaceId]);
 
   useEffect(() => {
     // Local (sidecar) projects: edit telemetry would upload local file paths —
@@ -3016,10 +3912,10 @@ export function CollabEditor(props: CollabEditorProps) {
       fileId,
       filePath,
       mode: 'collab',
-      readOnly,
+      readOnly: readOnly || !syncVerified,
       provider,
     });
-  }, [ydoc, provider, workspaceId, fileId, filePath, readOnly, sharedSocket?.isLocal]);
+  }, [ydoc, provider, workspaceId, fileId, filePath, readOnly, syncVerified, sharedSocket?.isLocal]);
 
   // Mount the editor only once the Y.Doc is ready — and the provider too when
   // this file is collaborative. Keyed on the doc guid so a doc swap (host
@@ -3033,5 +3929,14 @@ export function CollabEditor(props: CollabEditorProps) {
     );
   }
 
-  return <CollabEditorInner key={ydoc.guid} {...props} ydoc={ydoc} provider={provider} />;
+  return (
+    <CollabEditorInner
+      key={ydoc.guid}
+      {...props}
+      readOnly={readOnly || (!!collabUrl && !syncVerified)}
+      ydoc={ydoc}
+      provider={provider}
+      onEditorMountedForTiming={reportEditorMounted}
+    />
+  );
 }

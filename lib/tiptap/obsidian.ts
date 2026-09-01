@@ -1,5 +1,6 @@
 import Blockquote from '@tiptap/extension-blockquote';
 import Link from '@tiptap/extension-link';
+import { resolveCalloutType } from '@/lib/markdown/callout-types.mjs';
 
 function parseBooleanAttribute(value: string | null) {
   return value === 'true' || value === '1';
@@ -12,8 +13,19 @@ export const ObsidianBlockquote = Blockquote.extend({
       calloutType: {
         default: null,
         parseHTML: (element) => element.getAttribute('data-callout'),
-        renderHTML: (attributes) =>
-          attributes.calloutType ? { 'data-callout': attributes.calloutType } : {},
+        // `data-callout` is the type AS TYPED (the round-trip source, and what
+        // parseHTML reads back on paste); `data-callout-resolved` is the
+        // render-only canonical type an alias maps to — the hook CSS uses for
+        // the color group and the icon. Unknown types emit no resolved attr and
+        // keep the default styling.
+        renderHTML: (attributes) => {
+          if (!attributes.calloutType) return {};
+          const resolved = resolveCalloutType(attributes.calloutType as string);
+          return {
+            'data-callout': attributes.calloutType,
+            ...(resolved ? { 'data-callout-resolved': resolved } : {}),
+          };
+        },
       },
       calloutFoldable: {
         default: false,

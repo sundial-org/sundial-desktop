@@ -4,8 +4,8 @@ import { LOW_BALANCE_MICROS } from '@/lib/credits/constants';
 
 // Sidebar-footer indicator. Stays hidden unless the signed-in user's credit
 // balance is low — no chrome for the common (healthy-balance / anon) case.
-export function CreditBalancePill({ onOpenBilling }: { onOpenBilling?: () => void }) {
-  const { summary, ready } = useCreditSummary();
+export function CreditBalancePill({ onOpenBilling, enabled = true }: { onOpenBilling?: () => void; enabled?: boolean }) {
+  const { summary, ready } = useCreditSummary(enabled);
   if (!ready || !summary) return null; // anon (401) or not yet loaded
   if (summary.balanceMicros > LOW_BALANCE_MICROS) return null;
 

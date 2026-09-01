@@ -1,0 +1,22 @@
+diff --git a/dist/replaceStep.js b/dist/replaceStep.js
+index 384c02d27667921a4f2e6c495b118f035fa86162..26b12ff550b396fac2696a62f0afc6f85f893668 100644
+--- a/dist/replaceStep.js
++++ b/dist/replaceStep.js
+@@ -175,7 +175,16 @@ import { getSuggestionMarks } from "./utils.js";
+         // Don't allow inserting content within an existing deletion
+         // mark. Instead, shift the proposed insertion to the end
+         // of the deletion.
+-        const insertFrom = findSuggestionMarkEnd($to, deletion);
++        //
++        // Sundial patch: "within" means STRICTLY inside a run — the same
++        // deletion id on both sides. At a run boundary (notably the START of a
++        // struck run, where the caret rests right after deleting) the insert
++        // stays in place, so newly typed text lands before the struck text
++        // (Google Docs behavior) instead of being shifted past it.
++        const deletionBefore = $to.nodeBefore?.marks.find((mark)=>mark.type === deletion);
++        const deletionAfter = $to.nodeAfter?.marks.find((mark)=>mark.type === deletion);
++        const strictlyInsideDeletion = deletionBefore && deletionAfter && deletionBefore.attrs["id"] === deletionAfter.attrs["id"];
++        const insertFrom = strictlyInsideDeletion ? findSuggestionMarkEnd($to, deletion) : $to.pos;
+         // We execute the insertion normally, on top of all of the existing
+         // tracked changes.
+         trackedTransaction.replace(insertFrom, insertFrom, step.slice);

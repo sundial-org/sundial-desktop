@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, type Dispatch, type MutableRefObject, type SetStateAction } from 'react';
+import { isInFloatingActionMenu } from '@/components/workspace/anchored-dropdown';
 import type { WorkspaceFileRow } from '@/lib/workspace/types';
 import { isOfficeFile } from './workspace-file-helpers';
 
@@ -287,9 +288,8 @@ export function useWorkspaceFileInputEffects({
   useEffect(() => {
     if (!openMenuPath) return;
     const handleClick = (event: MouseEvent) => {
-      const target = event.target as Node;
-      const targetElement = target instanceof Element ? target : null;
-      if (!fileMenuRef.current?.contains(target) && !targetElement?.closest('[data-floating-action-menu]')) {
+      if (isInFloatingActionMenu(event.target)) return;
+      if (!fileMenuRef.current?.contains(event.target as Node)) {
         setOpenMenuPath(null);
       }
     };

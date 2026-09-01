@@ -62,7 +62,7 @@ export function CopyLinkButton({
   }, [url, onClickOverride]);
 
   const buttonLabel =
-    state === 'copied' ? `${label} — copied`
+    state === 'copied' ? `${label} · copied`
     : state === 'failed' ? 'Copy failed'
     : label;
 

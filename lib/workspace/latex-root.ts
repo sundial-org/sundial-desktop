@@ -84,6 +84,15 @@ function containsPath(dir: string, path: string): boolean {
   return dir === '' || path === dir || path.startsWith(`${dir}/`);
 }
 
+// The seeded onboarding doc (lib/workspace/welcome-doc WELCOME_TEX_PATH,
+// hardcoded here to keep this module dependency-free): a compilable
+// \documentclass file every new workspace carries. It must never become the
+// project's root by default — without this, a fragment-only workspace
+// (section.tex, no real root yet) would silently compile the welcome PDF via
+// the single-candidate fallback. It stays a candidate only for itself and
+// for files inside its own folder.
+const ONBOARDING_TEX_PATH = 'onboarding/welcome.tex';
+
 export function resolveLatexRoot(input: ResolveLatexRootInput): LatexRootResolution {
   const byPath = new Map<string, string>();
   for (const file of input.texFiles) {
@@ -91,9 +100,16 @@ export function resolveLatexRoot(input: ResolveLatexRootInput): LatexRootResolut
       byPath.set(file.path, file.content);
     }
   }
+  const active = input.activeFile ?? null;
   const candidates = Array.from(byPath.entries())
     .filter(([, content]) => hasDocumentClass(content))
     .map(([path]) => path)
+    .filter(
+      (path) =>
+        path !== ONBOARDING_TEX_PATH ||
+        path === active ||
+        (active !== null && containsPath(dirname(path), active)),
+    )
     .sort();
 
   // 1. `% !TEX root` in the active file, resolved relative to it.

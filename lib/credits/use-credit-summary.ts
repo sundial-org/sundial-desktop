@@ -18,10 +18,19 @@ type State = {
   loading: boolean;
   /** true once a fetch has completed (success or 401) — lets callers avoid a flash. */
   ready: boolean;
+  /** true when the fetch came back 401 — the only case that means "not signed
+   *  in". A 5xx/network failure leaves this false so callers don't tell a
+   *  signed-in user to sign in. */
+  signedOut: boolean;
 };
 
-export function useCreditSummary(): State & { refresh: () => void } {
-  const [state, setState] = useState<State>({ summary: null, loading: true, ready: false });
+export function useCreditSummary(enabled = true): State & { refresh: () => void } {
+  const [state, setState] = useState<State>({
+    summary: null,
+    loading: true,
+    ready: false,
+    signedOut: false,
+  });
   // Monotonic request id so the LATEST fetch always wins, even if an earlier
   // (slower) one resolves after it — e.g. a manual Refresh racing the mount
   // fetch, which would otherwise paint a stale balance.
@@ -31,20 +40,21 @@ export function useCreditSummary(): State & { refresh: () => void } {
     const id = ++reqId.current;
     setState((s) => ({ ...s, loading: true }));
     fetch('/api/stripe/customers', { headers: { Accept: 'application/json' } })
-      .then((res) => (res.ok ? (res.json() as Promise<CreditSummary>) : null))
-      .then((summary) => {
+      .then(async (res) => {
         if (id !== reqId.current) return; // superseded by a newer refresh
-        setState({ summary, loading: false, ready: true });
+        const summary = res.ok ? ((await res.json()) as CreditSummary) : null;
+        setState({ summary, loading: false, ready: true, signedOut: res.status === 401 });
       })
       .catch(() => {
         if (id !== reqId.current) return;
-        setState({ summary: null, loading: false, ready: true });
+        setState({ summary: null, loading: false, ready: true, signedOut: false });
       });
   }, []);
 
   useEffect(() => {
+    if (!enabled) return;
     refresh();
-  }, [refresh]);
+  }, [enabled, refresh]);
 
   return { ...state, refresh };
 }

@@ -1,6 +1,6 @@
 [package]
 name = "sundial-desktop"
-version = "0.1.3"
+version = "0.1.12"
 description = "Sundial desktop wrapper"
 authors = ["Sundial"]
 edition = "2021"

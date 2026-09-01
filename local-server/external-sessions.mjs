@@ -32,6 +32,28 @@ const underRoots = (cwd, roots) =>
   typeof cwd === 'string' &&
   roots.some((entry) => cwd === entry.root || cwd.startsWith(`${entry.root}${path.sep}`));
 
+/** Transcripts record the canonical cwd (e.g. /private/var/…) while a project
+ *  may be opened through a symlink or alternate spelling of the same directory
+ *  — match against both spellings of every root. */
+const withCanonicalRoots = (roots) => {
+  const seen = new Set();
+  const out = [];
+  for (const entry of roots) {
+    let real = null;
+    try {
+      real = fs.realpathSync.native(entry.root);
+    } catch {
+      /* root missing/unreadable — keep the raw spelling only */
+    }
+    for (const root of [entry.root, real]) {
+      if (!root || seen.has(root)) continue;
+      seen.add(root);
+      out.push({ ...entry, root });
+    }
+  }
+  return out;
+};
+
 /** Claude Code harness plumbing injected as user content — never something
  *  the user typed. A real prompt may legitimately start with '<' (XML/JSX),
  *  so only these known wrappers are dropped. */
@@ -85,6 +107,44 @@ function parseLines(text) {
   return lines;
 }
 
+/** A user line's typed text. The CLI writes it as a plain string; SDK-driven
+ *  sessions (Sundial, Claude Desktop, scripts) write content blocks — a
+ *  tool_result line joins to '' and drops out as non-text. */
+const claudeUserContentText = (line) => {
+  const content = line.message?.content;
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.filter((block) => block?.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text)
+    .join('\n');
+};
+
+/** Tool calls into Sundial's in-process MCP server — only OUR local engine
+ *  exposes it, so a transcript that called one is a Sundial chat's own turn,
+ *  not a session to import. Guards installs predating the engine-session
+ *  ledger (store.recordEngineSession), which excludes new runs by id even
+ *  when the turn calls no tools.
+ *
+ *  Matched by exact name, NOT by shape: Sundial's user-installable MCP server
+ *  registers under the same `sundial` server name, so a prefix rule would
+ *  hide a genuinely external session that connected it. Its tools are all
+ *  `sundial_*`-prefixed, which this list must never contain — kept in sync
+ *  with createLocalTools by tests/local/external-sessions.e2e.test.ts. */
+export const SUNDIAL_ENGINE_TOOLS = new Set(
+  ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash',
+   'list_comments', 'add_comment', 'reply_comment', 'resolve_comment', 'listen_comments',
+  ].map((name) => `mcp__sundial__${name}`),
+);
+const isSundialEngineRun = (lines) =>
+  lines.some(
+    (line) =>
+      line.type === 'assistant' &&
+      Array.isArray(line.message?.content) &&
+      line.message.content.some(
+        (block) => block?.type === 'tool_use' && SUNDIAL_ENGINE_TOOLS.has(String(block.name ?? '')),
+      ),
+  );
+
 /** Session head metadata for one Claude jsonl: real cwd, first prompt, and
  *  whether the file is a sidechain (subagent) transcript. */
 function claudeHeadMeta(lines) {
@@ -95,16 +155,15 @@ function claudeHeadMeta(lines) {
     if (!cwd && typeof line.cwd === 'string') cwd = line.cwd;
     if (line.type !== 'user') continue;
     if (line.isSidechain === true) sidechain = true;
-    const content = line.message?.content;
-    if (!firstPrompt && typeof content === 'string' && isClaudeUserText(line, content)) {
-      firstPrompt = content;
-    }
+    const content = claudeUserContentText(line);
+    if (!firstPrompt && isClaudeUserText(line, content)) firstPrompt = content;
     if (cwd && (firstPrompt || sidechain)) break;
   }
   return { cwd, firstPrompt, sidechain };
 }
 
-async function listClaudeSessions(roots, exclude = new Set()) {
+async function listClaudeSessions(rawRoots, exclude = new Set(), onEngineSession = null) {
+  const roots = withCanonicalRoots(rawRoots);
   const projectsDir = claudeProjectsDir();
   const dirs = await fsp.readdir(projectsDir).catch(() => []);
   const encoded = roots.map((entry) => encodeClaudeDir(entry.root));
@@ -158,6 +217,8 @@ async function listClaudeSessions(roots, exclude = new Set()) {
     if (exclude.has(`claude:${candidate.id}`)) continue;
     parsed += 1;
     const entry = (await indexFor(candidate.dirPath)).get(candidate.id);
+    let head = null;
+    const headLines = async () => (head ??= parseLines(await readHead(candidate.file).catch(() => '')));
     let meta;
     if (entry && entry.fileMtime >= candidate.mtimeMs && typeof entry.projectPath === 'string') {
       meta = {
@@ -166,9 +227,17 @@ async function listClaudeSessions(roots, exclude = new Set()) {
         sidechain: entry.isSidechain === true,
       };
     } else {
-      meta = claudeHeadMeta(parseLines(await readHead(candidate.file).catch(() => '')));
+      meta = claudeHeadMeta(await headLines());
     }
     if (meta.sidechain || !underRoots(meta.cwd, roots)) continue;
+    // Only sessions that would actually be listed pay for this read (≤ the
+    // match cap), so the index fast path still covers the scan-wide budget —
+    // and claiming the file moves it into `exclude`, so each legacy run is
+    // read at most once per install.
+    if (isSundialEngineRun(await headLines())) {
+      onEngineSession?.('claude', candidate.id);
+      continue;
+    }
     sessions.push({
       id: candidate.id,
       agent: 'claude',
@@ -212,7 +281,8 @@ export async function codexSessionFileExists(id) {
   return false;
 }
 
-async function listCodexSessions(roots, exclude = new Set()) {
+async function listCodexSessions(rawRoots, exclude = new Set()) {
+  const roots = withCanonicalRoots(rawRoots);
   const sessions = [];
   let scanned = 0;
   for await (const [dayDir, files] of codexDayDirs()) {
@@ -248,11 +318,13 @@ async function listCodexSessions(roots, exclude = new Set()) {
 }
 
 /** All external sessions under the project's roots, newest first. `exclude` is
- *  a Set of `${agent}:${sessionId}` already adopted as local chats (an adopted
- *  session lives on as a real chat row — listing it again would duplicate it). */
-export async function listExternalSessions({ roots, exclude = new Set() }) {
+ *  a Set of `${agent}:${sessionId}` that is already a chat here — adopted
+ *  imports and our own engines' runs (listing either would duplicate it).
+ *  `onEngineSession(agent, id)` receives a run detected as ours from the
+ *  transcript itself, so the caller can add it to `exclude` for good. */
+export async function listExternalSessions({ roots, exclude = new Set(), onEngineSession = null }) {
   const [claude, codex] = await Promise.all([
-    listClaudeSessions(roots, exclude),
+    listClaudeSessions(roots, exclude, onEngineSession),
     listCodexSessions(roots, exclude),
   ]);
   return [...claude, ...codex].sort((a, b) =>
@@ -266,9 +338,12 @@ export function claudeSessionFileExists(cwd, id) {
   return fs.existsSync(path.join(claudeProjectsDir(), encodeClaudeDir(cwd), `${id}.jsonl`));
 }
 
-/** Re-locate one session by id — endpoints never trust client-sent paths. */
-export async function findExternalSession({ roots, agent, id }) {
-  const sessions = agent === 'codex' ? await listCodexSessions(roots) : await listClaudeSessions(roots);
+/** Re-locate one session by id — endpoints never trust client-sent paths.
+ *  Same `exclude` as the listing: a stale row (second window, or a session
+ *  claimed since the list was fetched) must not import a second time. */
+export async function findExternalSession({ roots, agent, id, exclude = new Set() }) {
+  const sessions =
+    agent === 'codex' ? await listCodexSessions(roots, exclude) : await listClaudeSessions(roots, exclude);
   return sessions.find((session) => session.id === id) ?? null;
 }
 

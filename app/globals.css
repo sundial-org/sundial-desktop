@@ -165,44 +165,23 @@
   border-color: #3d3831;
   box-shadow: none;
 }
-.dark .tiptap blockquote[data-callout='note'],
-.dark .tiptap blockquote[data-callout='info'],
-.dark .tiptap blockquote[data-callout='abstract'],
-.dark .markdown-content blockquote[data-callout='note'],
-.dark .markdown-content blockquote[data-callout='info'],
-.dark .markdown-content blockquote[data-callout='abstract'] {
+.dark :is(.tiptap, .markdown-content) blockquote:is([data-callout-resolved='note'], [data-callout-resolved='info'], [data-callout-resolved='abstract'], [data-callout-resolved='todo']) {
   background: #1c2430;
   border-color: #33507a;
 }
-.dark .tiptap blockquote[data-callout='tip'],
-.dark .tiptap blockquote[data-callout='success'],
-.dark .tiptap blockquote[data-callout='question'],
-.dark .markdown-content blockquote[data-callout='tip'],
-.dark .markdown-content blockquote[data-callout='success'],
-.dark .markdown-content blockquote[data-callout='question'] {
+.dark :is(.tiptap, .markdown-content) blockquote:is([data-callout-resolved='tip'], [data-callout-resolved='success'], [data-callout-resolved='question']) {
   background: #1e2617;
   border-color: #4c661f;
 }
-.dark .tiptap blockquote[data-callout='warning'],
-.dark .tiptap blockquote[data-callout='caution'],
-.dark .tiptap blockquote[data-callout='example'],
-.dark .markdown-content blockquote[data-callout='warning'],
-.dark .markdown-content blockquote[data-callout='caution'],
-.dark .markdown-content blockquote[data-callout='example'] {
+.dark :is(.tiptap, .markdown-content) blockquote:is([data-callout-resolved='warning'], [data-callout-resolved='example']) {
   background: #2b2211;
   border-color: #8a6116;
 }
-.dark .tiptap blockquote[data-callout='danger'],
-.dark .tiptap blockquote[data-callout='failure'],
-.dark .tiptap blockquote[data-callout='bug'],
-.dark .markdown-content blockquote[data-callout='danger'],
-.dark .markdown-content blockquote[data-callout='failure'],
-.dark .markdown-content blockquote[data-callout='bug'] {
+.dark :is(.tiptap, .markdown-content) blockquote:is([data-callout-resolved='danger'], [data-callout-resolved='failure'], [data-callout-resolved='bug']) {
   background: #2d191d;
   border-color: #8a3a48;
 }
-.dark .tiptap blockquote[data-callout='quote'],
-.dark .markdown-content blockquote[data-callout='quote'] {
+.dark :is(.tiptap, .markdown-content) blockquote[data-callout-resolved='quote'] {
   background: #262320;
   border-color: #474138;
 }
@@ -237,6 +216,24 @@
   background: rgba(59, 130, 246, 0.16);
   color: #93c5fd;
 }
+.dark .tiptap .sd-source-comment {
+  background: rgba(168, 162, 158, 0.14);
+  color: rgba(190, 185, 180, 0.72);
+}
+.dark .tiptap .sd-fn-chip,
+.dark .tiptap .sd-fn--raw,
+.dark .tiptap .sd-fn-backref {
+  background: rgba(59, 130, 246, 0.22);
+  color: #93c5fd;
+}
+.dark .tiptap .sd-fn-backref {
+  background: transparent;
+}
+.dark .tiptap .sd-fn--orphan,
+.dark .tiptap .sd-fn-marker--unref,
+.dark .tiptap .sd-fn-def {
+  color: rgba(190, 185, 180, 0.72);
+}
 } /* end @media not print */
 
 /* Hide SSR-only fallback content for JS-enabled browsers.
@@ -255,7 +252,17 @@ html.js .ssr-only {
 }
 
 .tiptap > * + * {
-  margin-top: 0.9em;
+  margin-top: 0.4em;
+}
+
+/* Adjacent same-type lists are NOT representable in markdown — the codec
+   merges them into one list on any round-trip — so a doc that transiently
+   holds `ul + ul` (e.g. after deleting a middle bullet lifts/splits the list)
+   must READ as one list: no extra margin, the 0.1rem li margins alone set the
+   gap, same as between items inside a single list. */
+.tiptap ul + ul,
+.tiptap ol + ol {
+  margin-top: 0;
 }
 
 
@@ -279,51 +286,6 @@ html.js .ssr-only {
    unlike normal editor links which need Cmd-click. */
 .ProseMirror a[href^='?'][href*='modal='] {
   cursor: pointer;
-}
-
-/* Skip layout + paint for off-screen blocks of the main document editor so
-   scrolling a long page doesn't repaint every KaTeX/table/code block at once
-   (the "scrolling lags on a large page" report). Scoped to [data-print-root]
-   (the markdown editor card) so chat-rendered markdown is untouched.
-   `contain-intrinsic-size: auto` lets the browser remember each block's real
-   height after it renders once, keeping the scrollbar stable. The @media print
-   block below forces full rendering so export/print never drops off-screen
-   content.
-
-   content-visibility implies `contain: paint`, which (a) clips anything a block
-   paints OUTSIDE its box and (b) makes the block the containing block for its
-   absolutely-positioned descendants. The diff/suggestion chrome relies on both:
-   the pending-diff rail paints into the left margin gutter (::before at
-   left:-13px) and the review controls are absolutely positioned in the reserved
-   right gutter. So exclude pending-diff blocks, and turn the optimization off
-   while the doc has live suggestions (.has-suggestions) — both are transient
-   review states where correctness beats the scroll win. The :has() also
-   excludes lists/blockquotes whose pending-diff class sits on a descendant
-   (the <li>), whose rail reaches further into the gutter, and blocks holding a
-   remote/agent cursor — whose name flag (.sundial-cursor__label) sits above the
-   line and would be clipped during normal multiplayer editing.
-
-   Blink-only (`:root:not([data-engine="webkit"])`, stamped by the root
-   layout's inline script — lib/engine.ts): the cursor carve-out means a block
-   flips in and out of content-visibility as a collaborator's caret enters and
-   leaves it, and WKWebView/Safari mishandle that toggle — the on-screen block
-   stops PAINTING (typed text "disappears" until selected forces a repaint),
-   and ProseMirror can then misread the skipped subtree and commit REAL CRDT
-   deletions of the just-typed text (the desktop-shell sentence-loss bug,
-   July 2026). Correctness beats the scroll win on WebKit.
-
-   `.sd-caret-block` (LocalCaretBlock decoration, lib/tiptap/local-caret-block)
-   is the LOCAL caret's block: Blink can leave the DOM caret behind a character
-   typed into a freshly created c-v:auto block (still in the skipped state
-   until the next frame), and ProseMirror then re-anchors the caret BEFORE the
-   typed char — the "/ai" slash rotation bug, July 2026. The native caret has
-   no DOM node for :has() to see, hence the decoration class. */
-:root:not([data-engine='webkit'])
-  [data-print-root]
-  .tiptap:not(.has-suggestions)
-  > *:not(.sd-caret-block):not(.diff-pending-addition):not(.diff-pending-deletion):not(.diff-block-add):not(.diff-block-del):not(:has(.diff-pending-addition, .diff-pending-deletion, .diff-block-add, .diff-block-del, .sundial-cursor, .sundial-agent-ghost-cursor)) {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 3rem;
 }
 
 /* Inline links: regular-markdown styling so users can spot a link and click
@@ -367,6 +329,14 @@ html.js .ssr-only {
   margin-top: 0.4em;
 }
 
+/* A heading that OPENS the document sits flush with the page top — the frame
+   padding alone is the gap (Obsidian-style), not padding + heading margin. */
+.tiptap > h1:first-child,
+.tiptap > h2:first-child,
+.tiptap > h3:first-child {
+  margin-top: 0;
+}
+
 .tiptap h2 {
   font-size: 1.5rem;
   line-height: 1.3;
@@ -404,7 +374,16 @@ html.js .ssr-only {
 
 .tiptap ul,
 .tiptap ol {
-  padding-left: 1.5rem;
+  /* An Obsidian-style left gutter wide enough to host the fold chevron beside
+     the marker, while keeping the chevron inside the list's own clickable area
+     (a chevron pushed into the editor's outer padding stops receiving clicks).
+     ONE value for both list types: bulleted and numbered content has to land in
+     the same column, so the gutter can't flex with marker width.
+     Exposed as a custom property because the list diff rails have to CANCEL this
+     gutter to stay in one column with paragraph rails — they used to hard-code
+     `-1.5rem`, which silently drifted the moment this value changed. */
+  --sd-list-gutter: 2.75rem;
+  padding-left: var(--sd-list-gutter);
   list-style-position: outside;
 }
 
@@ -476,10 +455,127 @@ html.js .ssr-only {
   line-height: 14px;
   text-align: center;
 }
+/* Custom task states ([?], [-], …): a box showing the state char. Clicking
+   toggles to [x] like an unchecked box. */
+.md-checkbox-custom::before {
+  content: attr(data-state);
+  border: 1.5px solid var(--color-stone-400, #a8a29e);
+  background: var(--color-stone-100, #f5f5f4);
+  color: var(--color-stone-600, #57534e);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 14px;
+  text-align: center;
+}
 /* Dim checked item text */
 .tiptap li:has(> p > .md-checkbox-checked) > p {
   color: var(--color-stone-400, #a8a29e);
   text-decoration: line-through;
+}
+
+/* ── Obsidian-style fold (lib/tiptap/fold.ts) ──────────────────────────
+   A gutter chevron on any heading / list item that has hideable children.
+   Hidden by default; revealed on hover of the block, and kept visible while
+   collapsed. `.sd-foldable` is `position: relative` so the absolutely-placed
+   chevron anchors to its own block. `.sd-fold-hidden` is a node decoration on
+   the descendants a fold hides — display:none is purely local (no doc edit). */
+.tiptap .sd-foldable {
+  position: relative;
+}
+.tiptap .sd-fold-hidden {
+  display: none;
+}
+/* Block-level preview WIDGETS (the sandboxed HTML iframe, mermaid, …) are
+   side:-1 siblings placed just BEFORE the source block they replace — a fold
+   hides the source node but the widget isn't inside it. Hide any widget whose
+   next sibling the fold hid, so collapsed sections take their previews along. */
+.tiptap .ProseMirror-widget:has(+ .sd-fold-hidden) {
+  display: none;
+}
+.tiptap .sd-fold-toggle {
+  position: absolute;
+  top: 0.15em;
+  width: 0.85em;
+  height: 1.1em;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  user-select: none;
+}
+/* Headings have no natural left gutter, and the far margin belongs to the
+   opaque editor card (a fold chevron placed there paints *behind* it). Carve a
+   hanging gutter INSIDE the heading's own box — padding shifts the text right,
+   the equal negative margin pulls the box back so the text doesn't move — and
+   drop the chevron at its left edge. List items already hang in the ul marker
+   gutter (the same one checkboxes use), so a small negative offset suffices. */
+.tiptap :is(h1, h2, h3, h4, h5, h6).sd-foldable {
+  padding-left: 1.3em;
+  margin-left: -1.3em;
+}
+.tiptap :is(h1, h2, h3, h4, h5, h6).sd-foldable > .sd-fold-toggle {
+  left: 0;
+}
+/* List items KEEP their marker; the chevron sits in its OWN column at the left
+   edge of the gutter (Obsidian-style), so foldable and plain items stay
+   pixel-aligned — the marker is never replaced. Read the offset from the gutter
+   variable rather than repeating the number: hard-coding it is how this
+   silently drifted the last time the gutter changed.
+   The gutter is sized so the chevron clears the WIDEST marker, because an
+   ordered marker is right-aligned to the content edge and so reaches into the
+   gutter by its own width ("10." is ~3x a disc). Sizing for two digits is what
+   lets both list types share one gutter — a bullet simply gets more air on its
+   left, which is empty space either way. */
+.tiptap li.sd-foldable > .sd-fold-toggle {
+  left: calc(-1 * var(--sd-list-gutter));
+  width: 0.85rem;
+  /* A list disc renders a touch below the line-box centre (headings have no
+     marker, so their default `top` already lines up) — drop the list chevron to
+     sit level with the disc. rem, not em, to stay stable across list depths. */
+  top: 0.25rem;
+}
+/* Reveal on hovering anywhere on the block's line — heading or list item — and
+   keep it visible while collapsed (Obsidian-style discoverability, not
+   bullet-gutter-only). Nested items live INSIDE the parent <li>, so hovering a
+   child also matches the ancestor's :hover; suppress an ancestor's chevron
+   whenever a foldable descendant is hovered, so only the innermost one shows. */
+.tiptap :is(h1, h2, h3, h4, h5, h6).sd-foldable:hover > .sd-fold-toggle,
+.tiptap li.sd-foldable:hover > .sd-fold-toggle,
+.tiptap .sd-collapsed > .sd-fold-toggle {
+  opacity: 1;
+}
+.tiptap li.sd-foldable:has(li.sd-foldable:hover) > .sd-fold-toggle {
+  opacity: 0;
+}
+/* Thin stroke chevron (Obsidian-style), not a filled triangle: two borders of
+   a rotated square. Points down when expanded, right when collapsed; the
+   collapsed chevron stays visible (see the opacity rules above) and is the
+   expand affordance — there is no end-of-line `•••`. */
+.tiptap .sd-fold-toggle {
+  color: var(--color-stone-400, #a8a29e);
+}
+.tiptap .sd-fold-toggle:hover {
+  color: var(--color-stone-600, #57534e);
+}
+.tiptap .sd-fold-toggle::before {
+  content: '';
+  display: block;
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  /* Down-pointing ⌄: rotate the corner 45°; lift 1px so the visual centre of
+     the stroke (not its box) aligns with the disc / heading text. */
+  transform: translateY(-1px) rotate(45deg);
+  transition: transform 0.12s ease;
+}
+.tiptap .sd-fold-toggle-collapsed {
+  color: var(--color-stone-500, #78716c); /* darker: reads as an active "expand" affordance */
+}
+.tiptap .sd-fold-toggle-collapsed::before {
+  transform: translateX(-1px) rotate(-45deg); /* points right when collapsed */
 }
 
 /* Images are @tiptap Image nodes (Google-Docs style). The WorkspaceImage
@@ -590,6 +686,13 @@ html.js .ssr-only {
   background: rgba(232, 234, 237, 0.95);
 }
 
+/* Emoji reactions: the emoji itself lives in the side lane (Google-Docs style),
+ * so the reacted text only gets a faint tint — a full comment highlight on
+ * every 👍 would repaint the document. */
+.tiptap .doc-comment-range-reaction {
+  background: rgba(255, 121, 0, 0.12);
+}
+
 /* A reply that lands while a comment thread is open (an agent answering, a
  * teammate replying) eases in instead of popping blankly into the card. */
 @keyframes comment-message-enter {
@@ -609,6 +712,73 @@ html.js .ssr-only {
 
 @media (prefers-reduced-motion: reduce) {
   .comment-message-enter {
+    animation: none;
+  }
+}
+
+/* A thread whose agent is mid-run breathes a warm halo, and its caption dot
+ * pulses — the card is alive without rotating anything. */
+@keyframes comment-thread-working {
+  0%,
+  100% {
+    border-color: rgba(201, 165, 122, 0.35);
+    box-shadow: 0 0 0 0 rgba(201, 165, 122, 0.35);
+  }
+  50% {
+    border-color: rgba(201, 165, 122, 0.95);
+    box-shadow: 0 0 0 7px rgba(201, 165, 122, 0.06);
+  }
+}
+
+@keyframes comment-agent-dot {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.3;
+    transform: scale(0.75);
+  }
+}
+
+.comment-thread-working {
+  animation: comment-thread-working 2.6s ease-in-out infinite;
+}
+
+.comment-agent-dot {
+  animation: comment-agent-dot 1.5s ease-in-out infinite;
+}
+
+/* Comment-watch composer underline. The bar lives inside a clipper that repeats
+ * the composer's rounded rect, so its ends taper with the corners instead of
+ * reading as a chopped rectangle. */
+@keyframes composer-watch-shimmer {
+  0% {
+    background-position: -140% 0;
+  }
+  100% {
+    background-position: 240% 0;
+  }
+}
+
+.composer-watch-bar {
+  background-image: linear-gradient(
+    90deg,
+    rgba(201, 165, 122, 0.05) 0%,
+    rgba(201, 165, 122, 0.9) 42%,
+    rgba(242, 194, 206, 0.85) 58%,
+    rgba(201, 165, 122, 0.05) 100%
+  );
+  background-size: 55% 100%;
+  background-repeat: no-repeat;
+  animation: composer-watch-shimmer 2.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .comment-thread-working,
+  .comment-agent-dot,
+  .composer-watch-bar {
     animation: none;
   }
 }
@@ -642,7 +812,171 @@ html.js .ssr-only {
   background: rgba(255, 121, 0, 0.44);
 }
 
-.tiptap .doc-attribution-paint {
+/* Obsidian-style inline tokens (lib/tiptap/tag-comment-decorations.ts).
+ * View-layer only — the `#tag` / `%%…%%` source text stays verbatim in the
+ * Y.Doc; these classes are painted over it. Tags render as pills (the text IS
+ * the source, nothing hidden). Source comments render as a dimmed chip with
+ * their `%%` delimiters zero-width-hidden (revealed while the caret is inside
+ * — the `--raw` state — or when the span carries suggestion marks); the icon
+ * widget toggles the doc-wide collapsed state. */
+/* Brand-orange chip: the orange scale's chip tints (50–200) and chip text
+   (600–800) remap in .dark, so one var-based rule serves both themes. */
+.tiptap .sd-tag {
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  background: var(--color-orange-100, #ffedd5);
+  border-radius: 9999px;
+  color: var(--color-orange-700, #c2410c);
+  padding: 0.05em 0.5em;
+  font-size: 0.92em;
+  font-weight: 500;
+}
+.tiptap .sd-source-comment {
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  background: rgba(120, 113, 108, 0.09);
+  border-radius: 0.4em;
+  color: rgba(87, 83, 78, 0.78);
+  font-style: italic;
+  padding: 0.06em 0.3em;
+}
+/* Raw state (caret inside / suggestion review): delimiters visible, softer. */
+.tiptap .sd-source-comment-delim {
+  font-style: normal;
+  opacity: 0.45;
+}
+.tiptap .sd-source-comment-icon {
+  cursor: pointer;
+}
+.tiptap .sd-source-comment-icon::before {
+  content: '💬';
+  filter: grayscale(1);
+  font-size: 0.72em;
+  font-style: normal;
+  margin-right: 0.25em;
+  opacity: 0.55;
+}
+.tiptap .sd-source-comment-icon:hover::before {
+  opacity: 0.9;
+}
+.tiptap .sd-source-comment-icon--collapsed::before {
+  margin-right: 0;
+}
+
+/* Obsidian-style footnotes (lib/tiptap/footnote-decorations.ts). View-layer
+ * only — `[^label]`, `[^label]: …` and `^[inline]` stay verbatim in the
+ * Y.Doc; the number chips are widget decorations painted over the zero-width-
+ * hidden source (revealed while the caret is inside — the `--raw` state — or
+ * when the span carries suggestion marks). Definitions stay where they are in
+ * the doc, styled as footnote blocks with a ↩ back-reference. */
+.tiptap .sd-fn-chip {
+  background: rgba(59, 130, 246, 0.12);
+  border-radius: 0.45em;
+  color: #2563eb;
+  cursor: pointer;
+  font-size: 0.72em;
+  font-style: normal;
+  font-weight: 600;
+  padding: 0.05em 0.35em;
+  user-select: none;
+}
+.tiptap .sd-fn-chip:hover {
+  background: rgba(59, 130, 246, 0.22);
+}
+.tiptap .sd-fn-chip--def {
+  font-size: 0.85em;
+  vertical-align: baseline;
+}
+.tiptap .sd-fn--raw {
+  background: rgba(59, 130, 246, 0.08);
+  border-radius: 0.3em;
+  color: #2563eb;
+}
+.tiptap .sd-fn--orphan {
+  color: rgba(87, 83, 78, 0.55);
+  text-decoration: underline dotted rgba(87, 83, 78, 0.45);
+}
+.tiptap .sd-fn-marker--unref {
+  color: rgba(87, 83, 78, 0.55);
+}
+.tiptap .sd-fn-marker--dup {
+  background: rgba(185, 28, 28, 0.08);
+  border-radius: 0.3em;
+  color: #b91c1c;
+  text-decoration: underline wavy rgba(185, 28, 28, 0.45);
+}
+/* Factcheck squiggles (spellchecker-for-facts) + AI-detection washes —
+   inline decorations painted by the factcheck / pangram popups. */
+.tiptap .sd-factcheck-underline {
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 2px;
+}
+.tiptap .sd-factcheck-inaccurate {
+  text-decoration: underline wavy rgba(220, 38, 38, 0.6);
+}
+.tiptap .sd-factcheck-unsupported {
+  text-decoration: underline wavy rgba(217, 119, 6, 0.55);
+}
+.tiptap .sd-pangram-ai {
+  background: rgba(147, 51, 234, 0.1);
+  border-radius: 0.2em;
+  box-shadow: 0 1.5px 0 rgba(147, 51, 234, 0.45);
+}
+.tiptap .sd-pangram-assisted {
+  background: rgba(147, 51, 234, 0.05);
+  border-radius: 0.2em;
+  box-shadow: 0 1.5px 0 rgba(147, 51, 234, 0.25);
+}
+
+.tiptap .sd-fn-def {
+  border-left: 2px solid rgba(59, 130, 246, 0.3);
+  color: rgba(87, 83, 78, 0.85);
+  font-size: 0.92em;
+  padding-left: 0.6em;
+}
+.tiptap .sd-fn-def--dup {
+  border-left-color: rgba(185, 28, 28, 0.4);
+}
+.tiptap .sd-fn-backref {
+  color: #2563eb;
+  cursor: pointer;
+  font-size: 0.8em;
+  margin-left: 0.35em;
+  opacity: 0.55;
+  user-select: none;
+}
+.tiptap .sd-fn-backref:hover {
+  opacity: 1;
+}
+.sd-fn-popover {
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+  color: #292524;
+  font-size: 0.875rem;
+  line-height: 1.45;
+  max-height: 40vh;
+  max-width: 360px;
+  overflow: auto;
+  padding: 8px 12px;
+  position: fixed;
+  z-index: 60;
+}
+.sd-fn-popover p {
+  margin: 0.25em 0;
+}
+.dark .sd-fn-popover {
+  background: #1c1917;
+  border-color: rgba(255, 255, 255, 0.14);
+  color: #e7e5e4;
+}
+
+/* The band stripe + gutter offset apply to TOP-LEVEL blocks only: on nested
+   blocks (list-item paragraphs, blockquote bodies) the -11px pull dragged the
+   stripe over list markers and mid-indent — indented content keeps just the
+   background band at its natural indent. */
+.tiptap > .doc-attribution-paint {
   border-left: 3px solid transparent;
   margin-left: -11px;
   padding-left: 8px;
@@ -655,9 +989,76 @@ html.js .ssr-only {
 .tiptap .doc-attribution-paint-4 { background: rgba(139, 92, 246, 0.12); border-left-color: rgba(124, 58, 237, 0.55); }
 .tiptap .doc-attribution-paint-5 { background: rgba(20, 184, 166, 0.12); border-left-color: rgba(13, 148, 136, 0.55); }
 
+/* Authorship lens margin annotations — "Author · when" beside the first block
+ * of each same-author run. The lens widens the editor's right margin while
+ * it's on (an explicit toggle, so the reflow is deliberate), and the label
+ * text picks up the run's band color. */
+/* Outranks the editor's permanent 4rem gutter reservation
+ * (`.tiptap[contenteditable='true']:not(.tiptap-code)`, specificity 0,3,0). */
+.tiptap.authorship-lens-on,
+.tiptap.tiptap.tiptap.authorship-lens-on {
+  padding-right: 11rem;
+}
+.attribution-side-label {
+  position: absolute;
+  right: 0.25rem;
+  width: 10rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--color-stone-500, rgb(120, 113, 108));
+  user-select: none;
+  pointer-events: none;
+}
+.attribution-side-label img {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  border-radius: 999px;
+  object-fit: cover;
+}
+.attribution-side-label img.is-mark {
+  border-radius: 0;
+  object-fit: contain;
+}
+/* Clickable annotations (they open the chat turn) — same affordance as the
+ * suggestion chips. */
+.attribution-side-label.is-jumpable {
+  pointer-events: auto;
+  cursor: pointer;
+}
+.attribution-side-label.is-jumpable:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.attribution-side-label-0 { color: rgba(37, 99, 235, 0.9); }
+.attribution-side-label-1 { color: rgba(5, 150, 105, 0.9); }
+.attribution-side-label-3 { color: rgba(219, 39, 119, 0.9); }
+.attribution-side-label-4 { color: rgba(124, 58, 237, 0.9); }
+.attribution-side-label-5 { color: rgba(13, 148, 136, 0.9); }
+
 .tiptap li {
   display: list-item;
   margin: 0.1rem 0;
+}
+
+/* A bullet's INNER blocks had no spacing rules of their own: a nested list or
+   a second paragraph sat flush against the item's first line (0 gap) while
+   sibling bullets sit 0.1rem apart — reading as inconsistent bullet padding.
+   Give inner blocks the same 0.1rem rhythm the items themselves use (the
+   nested list's own first-li margin collapses into it, so nested and
+   top-level gaps match). Explicit margin: 0 on the single-paragraph case pins
+   what preflight implied. */
+.tiptap li > p {
+  margin: 0;
+}
+.tiptap li > p + p,
+.tiptap li > :is(ul, ol) {
+  margin-top: 0.1rem;
 }
 
 .tiptap hr {
@@ -702,48 +1103,151 @@ html.js .ssr-only {
   margin-bottom: 0.45rem;
 }
 
-.tiptap blockquote[data-callout='note'],
-.tiptap blockquote[data-callout='info'],
-.tiptap blockquote[data-callout='abstract'],
-.markdown-content blockquote[data-callout='note'],
-.markdown-content blockquote[data-callout='info'],
-.markdown-content blockquote[data-callout='abstract'] {
+/* Per-type Lucide icon (the set the app already ships) on the title row, drawn
+   as a mask so it inherits the title's own color and size — no extra palette,
+   same typography. `--sd-callout-icon` defaults to `note`'s pencil, which also
+   covers unknown types (they carry no `data-callout-resolved`). */
+:is(.tiptap, .markdown-content) blockquote[data-callout] > p:first-child::before,
+.sd-callout-icon {
+  content: '';
+  display: inline-block;
+  width: 1.05em;
+  height: 1.05em;
+  vertical-align: -0.18em;
+  background-color: currentColor;
+  -webkit-mask: var(--sd-callout-icon) center / contain no-repeat;
+  mask: var(--sd-callout-icon) center / contain no-repeat;
+}
+/* Only the in-document icon needs a gap before the title text; the standalone
+   `.sd-callout-icon` swatch (callout controls bar) is spaced by its own layout. */
+:is(.tiptap, .markdown-content) blockquote[data-callout] > p:first-child::before {
+  margin-right: 0.4em;
+}
+[data-callout] {
+  --sd-callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z'/%3E%3Cpath d='m15 5 4 4'/%3E%3C/svg%3E");
+}
+[data-callout-resolved='abstract'] {
+  --sd-callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='8' height='4' x='8' y='2' rx='1' ry='1'/%3E%3Cpath d='M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2'/%3E%3Cpath d='M12 11h4'/%3E%3Cpath d='M12 16h4'/%3E%3Cpath d='M8 11h.01'/%3E%3Cpath d='M8 16h.01'/%3E%3C/svg%3E");
+}
+[data-callout-resolved='info'] {
+  --sd-callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cpath d='M12 16v-4'/%3E%3Cpath d='M12 8h.01'/%3E%3C/svg%3E");
+}
+[data-callout-resolved='todo'] {
+  --sd-callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cpath d='m9 12 2 2 4-4'/%3E%3C/svg%3E");
+}
+[data-callout-resolved='tip'] {
+  --sd-callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3q1 4 4 6.5t3 5.5a1 1 0 0 1-14 0 5 5 0 0 1 1-3 1 1 0 0 0 5 0c0-2-1.5-3-1.5-5q0-2 2.5-4'/%3E%3C/svg%3E");
+}
+[data-callout-resolved='success'] {
+  --sd-callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E");
+}
+[data-callout-resolved='question'] {
+  --sd-callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cpath d='M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3'/%3E%3Cpath d='M12 17h.01'/%3E%3C/svg%3E");
+}
+[data-callout-resolved='warning'] {
+  --sd-callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3'/%3E%3Cpath d='M12 9v4'/%3E%3Cpath d='M12 17h.01'/%3E%3C/svg%3E");
+}
+[data-callout-resolved='failure'] {
+  --sd-callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M18 6 6 18'/%3E%3Cpath d='m6 6 12 12'/%3E%3C/svg%3E");
+}
+[data-callout-resolved='danger'] {
+  /* octagon-alert, not Obsidian's `zap`: a lightning bolt reads as "power" or
+     "fast" next to the other status glyphs, and warning already owns the
+     triangle — the stop-sign octagon is the one that reads as danger. */
+  --sd-callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 16h.01'/%3E%3Cpath d='M12 8v4'/%3E%3Cpath d='M15.312 2a2 2 0 0 1 1.414.586l4.688 4.688A2 2 0 0 1 22 8.688v6.624a2 2 0 0 1-.586 1.414l-4.688 4.688a2 2 0 0 1-1.414.586H8.688a2 2 0 0 1-1.414-.586l-4.688-4.688A2 2 0 0 1 2 15.312V8.688a2 2 0 0 1 .586-1.414l4.688-4.688A2 2 0 0 1 8.688 2z'/%3E%3C/svg%3E");
+}
+[data-callout-resolved='bug'] {
+  --sd-callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 20v-9'/%3E%3Cpath d='M14 7a4 4 0 0 1 4 4v3a6 6 0 0 1-12 0v-3a4 4 0 0 1 4-4z'/%3E%3Cpath d='M14.12 3.88 16 2'/%3E%3Cpath d='M21 21a4 4 0 0 0-3.81-4'/%3E%3Cpath d='M21 5a4 4 0 0 1-3.55 3.97'/%3E%3Cpath d='M22 13h-4'/%3E%3Cpath d='M3 21a4 4 0 0 1 3.81-4'/%3E%3Cpath d='M3 5a4 4 0 0 0 3.55 3.97'/%3E%3Cpath d='M6 13H2'/%3E%3Cpath d='m8 2 1.88 1.88'/%3E%3Cpath d='M9 7.13V6a3 3 0 1 1 6 0v1.13'/%3E%3C/svg%3E");
+}
+[data-callout-resolved='example'] {
+  --sd-callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 5h.01'/%3E%3Cpath d='M3 12h.01'/%3E%3Cpath d='M3 19h.01'/%3E%3Cpath d='M8 5h13'/%3E%3Cpath d='M8 12h13'/%3E%3Cpath d='M8 19h13'/%3E%3C/svg%3E");
+}
+[data-callout-resolved='quote'] {
+  --sd-callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M16 3a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2 1 1 0 0 1 1 1v1a2 2 0 0 1-2 2 1 1 0 0 0-1 1v2a1 1 0 0 0 1 1 6 6 0 0 0 6-6V5a2 2 0 0 0-2-2z'/%3E%3Cpath d='M5 3a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2 1 1 0 0 1 1 1v1a2 2 0 0 1-2 2 1 1 0 0 0-1 1v2a1 1 0 0 0 1 1 6 6 0 0 0 6-6V5a2 2 0 0 0-2-2z'/%3E%3C/svg%3E");
+}
+
+/* ── Callout folding (lib/tiptap/callout-fold.ts) ──────────────────────
+   A chevron on the title row of a `> [!type]-` / `[!type]+` callout, plus the
+   `•••` shown while collapsed. The `.sd-fold-toggle` / `.sd-fold-hidden`
+   chevron primitives are SHARED with the heading/list fold (lib/tiptap/fold.ts,
+   styled above) so the two read as one feature; only the callout-specific
+   placement and the `•••` live here. Unlike that fold, this one is DOC state:
+   the chevron flips `calloutCollapsed`, which serializes back as `-`/`+`. */
+.tiptap .sd-fold-ellipsis {
+  margin-left: 0.35em;
+  color: var(--color-stone-400, #a8a29e);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  font-size: 0.7em;
+  line-height: 1;
+  vertical-align: middle;
+  cursor: pointer;
+  user-select: none;
+}
+.tiptap .sd-fold-ellipsis:hover {
+  color: var(--color-stone-600, #57534e);
+}
+/* The chevron anchors to the END of the title row (Obsidian's placement for
+   callouts — the left of the row belongs to the type icon). It lives inside the
+   title paragraph, so `top` alone keeps it on the first line at any title
+   length; the padding reserves its column so a long title can't run under it. */
+.tiptap .sd-callout-foldable > p:first-child {
+  position: relative;
+  padding-right: 1.2em;
+}
+.tiptap .sd-callout-foldable > p:first-child > .sd-fold-toggle {
+  position: absolute;
+  right: 0;
+  top: 0.3em;
+  width: 0.85em;
+  height: 1.1em;
+  opacity: 0.55;
+  transition: opacity 0.12s ease;
+}
+/* Foldable state is explicit in the markdown, so the affordance is always on —
+   just dim until hovered (or while collapsed, where it's the way back). Callouts
+   nest, so every rule is scoped to the block's OWN title row. */
+.tiptap .sd-callout-foldable:hover > p:first-child > .sd-fold-toggle,
+.tiptap .sd-callout-collapsed > p:first-child > .sd-fold-toggle {
+  opacity: 1;
+}
+/* A collapsed callout has only its title row: drop the body gap under it. */
+.tiptap .sd-callout-collapsed > p:first-child {
+  margin-bottom: 0;
+}
+/* Read-only (review panel, previews): no CALLOUT chevron — toggling a callout
+   is a doc edit. The `•••` stays, since the callout really is collapsed in the
+   document. Heading/list fold toggles are LOCAL VIEW state (lib/tiptap/fold.ts)
+   and deliberately keep working in read-only views, so the hide is scoped. */
+.tiptap[contenteditable='false'] .sd-callout-foldable .sd-fold-toggle {
+  display: none;
+}
+
+/* Color groups key off `data-callout-resolved` — the canonical type an alias
+   maps to (lib/markdown/callout-types.mjs). `data-callout` stays the type as
+   typed so the markdown round-trips, and an unknown type resolves to nothing
+   and keeps the neutral default above. */
+:is(.tiptap, .markdown-content) blockquote:is([data-callout-resolved='note'], [data-callout-resolved='info'], [data-callout-resolved='abstract'], [data-callout-resolved='todo']) {
   background: linear-gradient(180deg, #f8fafc, #eff6ff);
   border-color: #bfdbfe;
 }
 
-.tiptap blockquote[data-callout='tip'],
-.tiptap blockquote[data-callout='success'],
-.tiptap blockquote[data-callout='question'],
-.markdown-content blockquote[data-callout='tip'],
-.markdown-content blockquote[data-callout='success'],
-.markdown-content blockquote[data-callout='question'] {
+:is(.tiptap, .markdown-content) blockquote:is([data-callout-resolved='tip'], [data-callout-resolved='success'], [data-callout-resolved='question']) {
   background: linear-gradient(180deg, #f7fee7, #ecfccb);
   border-color: #bef264;
 }
 
-.tiptap blockquote[data-callout='warning'],
-.tiptap blockquote[data-callout='caution'],
-.tiptap blockquote[data-callout='example'],
-.markdown-content blockquote[data-callout='warning'],
-.markdown-content blockquote[data-callout='caution'],
-.markdown-content blockquote[data-callout='example'] {
+:is(.tiptap, .markdown-content) blockquote:is([data-callout-resolved='warning'], [data-callout-resolved='example']) {
   background: linear-gradient(180deg, #fffbeb, #fef3c7);
   border-color: #fbbf24;
 }
 
-.tiptap blockquote[data-callout='danger'],
-.tiptap blockquote[data-callout='failure'],
-.tiptap blockquote[data-callout='bug'],
-.markdown-content blockquote[data-callout='danger'],
-.markdown-content blockquote[data-callout='failure'],
-.markdown-content blockquote[data-callout='bug'] {
+:is(.tiptap, .markdown-content) blockquote:is([data-callout-resolved='danger'], [data-callout-resolved='failure'], [data-callout-resolved='bug']) {
   background: linear-gradient(180deg, #fff1f2, #ffe4e6);
   border-color: #fda4af;
 }
 
-.tiptap blockquote[data-callout='quote'],
-.markdown-content blockquote[data-callout='quote'] {
+:is(.tiptap, .markdown-content) blockquote[data-callout-resolved='quote'] {
   background: linear-gradient(180deg, var(--color-stone-50, #fafaf9), var(--color-stone-100, #f5f5f4));
   border-color: var(--color-stone-300, #d6d3d1);
 }
@@ -838,6 +1342,152 @@ html.js .ssr-only {
   background: #1c1917;
   border-color: #292524;
 }
+/* YAML frontmatter — raw metadata rendered as a dimmed monospace block (still
+   editable in the editor). Applies to the editor node and to markdownToHtml
+   output (chat/diff surfaces), which share the [data-frontmatter] marker. */
+.tiptap:not(.tiptap-code) pre[data-frontmatter],
+pre[data-frontmatter] {
+  background: transparent;
+  border: 1px dashed var(--color-stone-200, #e7e5e4);
+  border-radius: 0.6rem;
+  padding: 0.5rem 0.9rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: var(--color-stone-400, #a8a29e);
+  overflow-x: auto;
+}
+pre[data-frontmatter] code {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  font-size: inherit;
+}
+.dark .tiptap:not(.tiptap-code) pre[data-frontmatter],
+.dark pre[data-frontmatter] {
+  background: transparent;
+  border-color: #44403c;
+  color: #78716c;
+}
+/* Frontmatter Properties view (FrontmatterPreview extension) — the raw YAML
+   hides behind an Obsidian-style read-only key/value grid when the selection
+   is outside the block; clicking a row reveals the raw text for editing. */
+.tiptap pre.sd-frontmatter-source-hidden {
+  display: none;
+}
+.tiptap .sd-frontmatter-preview {
+  margin: 0 0 1.25rem;
+  font-size: 0.85rem;
+  font-family: var(--font-sans, ui-sans-serif);
+}
+.tiptap .sd-fm-header {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: var(--color-stone-400, #a8a29e);
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+  padding: 0.15rem 0;
+}
+.tiptap .sd-fm-header svg {
+  width: 0.85rem;
+  height: 0.85rem;
+  transform: rotate(90deg);
+  transition: transform 120ms ease;
+}
+.tiptap .sd-fm-collapsed .sd-fm-header svg {
+  transform: rotate(0deg);
+}
+.tiptap .sd-fm-body {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 1.25rem;
+  row-gap: 0.15rem;
+  padding: 0.35rem 0 0 1.15rem;
+  cursor: pointer;
+}
+.tiptap .sd-fm-key {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--color-stone-500, #78716c);
+  min-height: 1.6rem;
+}
+.tiptap .sd-fm-key svg {
+  width: 0.9rem;
+  height: 0.9rem;
+  color: var(--color-stone-400, #a8a29e);
+}
+.tiptap .sd-fm-value {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  color: var(--color-stone-700, #44403c);
+  min-height: 1.6rem;
+}
+.tiptap .sd-fm-value code {
+  background: var(--color-stone-100, #f5f5f4);
+  border-radius: 0.35rem;
+  padding: 0.05rem 0.35rem;
+  font-size: 0.8em;
+}
+.tiptap .sd-fm-pill {
+  background: rgba(99, 102, 241, 0.09);
+  color: #4f46e5;
+  border-radius: 9999px;
+  padding: 0.1rem 0.55rem;
+  font-size: 0.78rem;
+}
+.tiptap .sd-fm-checkbox {
+  width: 0.95rem;
+  height: 0.95rem;
+  border-radius: 0.25rem;
+  border: 1px solid var(--color-stone-300, #d6d3d1);
+  display: inline-block;
+}
+.tiptap .sd-fm-checkbox[data-checked] {
+  background: #6366f1 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6L9 17l-5-5'/%3E%3C/svg%3E") center / 70% no-repeat;
+  border-color: #6366f1;
+}
+.tiptap .sd-fm-empty {
+  grid-column: 1 / -1;
+  color: var(--color-stone-400, #a8a29e);
+  font-style: italic;
+}
+/* Badge on a visible raw block whose fences are broken or whose YAML doesn't
+   parse to a mapping. */
+.tiptap pre.sd-frontmatter-invalid {
+  position: relative;
+}
+.tiptap pre.sd-frontmatter-invalid::after {
+  content: '⚠ invalid frontmatter';
+  position: absolute;
+  top: 0.35rem;
+  right: 0.5rem;
+  font-size: 0.7rem;
+  font-family: var(--font-sans, ui-sans-serif);
+  color: #b45309;
+  background: rgba(254, 243, 199, 0.9);
+  border-radius: 0.35rem;
+  padding: 0.05rem 0.4rem;
+  pointer-events: none;
+}
+.dark .tiptap .sd-fm-value {
+  color: #d6d3d1;
+}
+.dark .tiptap .sd-fm-value code {
+  background: #292524;
+}
+.dark .tiptap .sd-fm-pill {
+  background: rgba(129, 140, 248, 0.16);
+  color: #a5b4fc;
+}
+.dark .tiptap .sd-fm-checkbox {
+  border-color: #57534e;
+}
 /* A code block inside a pending suggestion drops the slab so the green/red
    review band (diff-pending rules further down) composites over the page
    background exactly like every other block type. */
@@ -885,6 +1535,138 @@ html.js .ssr-only {
 }
 .tiptap pre.sd-mermaid-invalid {
   position: relative;
+}
+
+/* Raw HTML live preview — the source paragraph hides behind a sandboxed
+   iframe when the selection is outside (HtmlPreview extension). */
+.tiptap .sd-html-source-hidden {
+  display: none;
+}
+.tiptap .sd-html-preview {
+  position: relative;
+  padding: 0.25rem 0;
+}
+.tiptap .sd-html-preview-frame {
+  display: block;
+  width: 100%;
+  height: 3rem;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 0.5rem;
+  /* Transparent so the content sits on the document background in both
+     themes (the srcdoc theme bridge sets a matching text color). */
+  background: transparent;
+}
+.dark .tiptap .sd-html-preview-frame {
+  border-color: rgba(255, 255, 255, 0.1);
+}
+/* ![[page.html]] — the sandboxed frame inside an embed card. */
+.tiptap .sd-embed-card--html .sd-html-preview-frame {
+  border: 0;
+  border-radius: 0 0 0.5rem 0.5rem;
+}
+.tiptap .sd-html-preview-edit {
+  position: absolute;
+  top: 0.6rem;
+  right: 0.5rem;
+  font-size: 0.7rem;
+  font-family: var(--font-sans, ui-sans-serif);
+  color: var(--color-stone-500, #78716c);
+  background: rgba(231, 229, 228, 0.9);
+  border-radius: 0.35rem;
+  padding: 0.05rem 0.4rem;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.tiptap .sd-html-preview:hover .sd-html-preview-edit {
+  opacity: 1;
+}
+
+/* Obsidian block IDs — trailing `^my-id` text painted as a dim badge
+   (BlockIdBadges extension). Always visible + editable in place. */
+.tiptap .sd-block-id {
+  color: var(--color-stone-400, #a8a29e);
+  background: rgba(168, 162, 158, 0.12);
+  border-radius: 0.3rem;
+  padding: 0 0.22rem;
+  font-size: 0.78em;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.dark .tiptap .sd-block-id {
+  color: var(--color-stone-500, #78716c);
+  background: rgba(120, 113, 108, 0.18);
+}
+
+/* ![[note#…]] transclusion — rendered card over the hidden source text when
+   the selection is outside (EmbedPreview extension). Clicking the card
+   reveals the source for editing; ↗ opens the source note. */
+.tiptap .sd-embed-card {
+  margin: 0.25rem 0;
+  border: 1px solid var(--color-stone-200, #e7e5e4);
+  border-radius: 0.5rem;
+  background: var(--color-stone-50, #fafaf9);
+  cursor: pointer;
+}
+.tiptap .sd-embed-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.3rem 0.75rem 0;
+  font-size: 0.72rem;
+  color: var(--color-stone-400, #a8a29e);
+}
+.tiptap .sd-embed-card__title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tiptap .sd-embed-card__open {
+  flex-shrink: 0;
+  border-radius: 0.3rem;
+  padding: 0 0.3rem;
+  color: var(--color-stone-400, #a8a29e);
+}
+.tiptap .sd-embed-card__open:hover {
+  background: var(--color-stone-200, #e7e5e4);
+  color: var(--color-stone-700, #44403c);
+}
+.tiptap .sd-embed-card__body {
+  padding: 0.25rem 0.75rem 0.5rem;
+  font-size: 0.925em;
+}
+.tiptap .sd-embed-card__body > *:first-child { margin-top: 0; }
+.tiptap .sd-embed-card__body > *:last-child { margin-bottom: 0; }
+.tiptap .sd-embed-image img {
+  max-width: 100%;
+  border-radius: 0.375rem;
+}
+/* Target/anchor doesn't resolve: keep the chip visible, flag it. */
+.tiptap .sd-embed-broken {
+  text-decoration: underline dotted #b45309;
+  text-underline-offset: 3px;
+}
+.dark .tiptap .sd-embed-card {
+  border-color: var(--color-stone-700, #44403c);
+  background: rgba(41, 37, 36, 0.5);
+}
+.dark .tiptap .sd-embed-card__open:hover {
+  background: var(--color-stone-700, #44403c);
+  color: var(--color-stone-200, #e7e5e4);
+}
+
+/* Anchor navigation — brief highlight on the block a [[note#…]] link landed on
+   (scrollEditorToAnchor). */
+.tiptap .sd-anchor-flash {
+  animation: sd-anchor-flash 1.6s ease-out;
+  border-radius: 0.25rem;
+}
+@keyframes sd-anchor-flash {
+  0% { background-color: rgba(253, 230, 138, 0.85); }
+  100% { background-color: transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tiptap .sd-anchor-flash { animation: none; }
 }
 
 .tiptap mark,
@@ -1353,9 +2135,17 @@ del[data-suggestion='deletion'] {
   border-radius: 2px;
   -webkit-box-decoration-break: clone;
   box-decoration-break: clone;
-  /* Struck text is the accepted projection's "absent" content: the browser skips
-   * it when selecting and excludes it from copy, so a selection across a deletion
-   * reads as the kept + suggested text only (truly optimistic). */
+}
+/* Struck text reads as the accepted projection's "absent" content when copied.
+ * INSIDE the live editor that lives at the PM level (deletionGuard's
+ * createSelectionBetween + the clipboardTextSerializer projection) — never via
+ * user-select:none, which makes Chrome refuse caret text-insertion at the run
+ * boundary, so typing right after deleting a word went dead. Static surfaces
+ * have no PM guard, so THEY keep the native skip. The live editor is
+ * `.tiptap[contenteditable]` (ProseMirror always stamps the attribute, true or
+ * false); chat/review diff chunks reuse the `.tiptap` class for typography
+ * only (DIFF_MARKDOWN_SURFACE_CLASS) and carry no contenteditable. */
+del[data-suggestion='deletion']:not(.tiptap[contenteditable] *) {
   -webkit-user-select: none;
   user-select: none;
 }
@@ -1382,14 +2172,15 @@ del[data-suggestion] .ProseMirror-widget:not(.Tiptap-mathematics-render) {
 
 /* Granular accept (✓) / reject (✕) review controls. Shared 17px square button;
  * the inline (per change-group) and gutter (per block) wrappers position them. */
-.suggestion-inline-review,
-.suggestion-gutter {
+.suggestion-gutter,
+.suggestion-inline-review {
   display: inline-flex;
+  align-items: center;
   gap: 2px;
   user-select: none;
 }
-.suggestion-inline-review button,
-.suggestion-gutter button {
+.suggestion-gutter button,
+.suggestion-inline-review button {
   width: 17px;
   height: 17px;
   padding: 0;
@@ -1405,15 +2196,43 @@ del[data-suggestion] .ProseMirror-widget:not(.Tiptap-mathematics-render) {
   opacity: 0.85;
   transition: opacity 80ms ease-out;
 }
-.suggestion-inline-review button:hover,
-.suggestion-gutter button:hover { opacity: 1; }
+.suggestion-gutter button:hover,
+.suggestion-inline-review button:hover { opacity: 1; }
 .suggestion-review-accept { color: var(--diff-add-text); border-color: var(--diff-add-border); }
 .suggestion-review-reject { color: var(--diff-del-text); border-color: var(--diff-del-border); }
 
-/* Inline group control: an OVERLAY anchored at the hovered run's end. Absolute
- * so it never shifts the line (the words after the run stay put), dropped just
- * below the baseline so it doesn't cover the text being read, and given a small
- * floating chip so the buttons stay legible over whatever it overlaps. */
+/* Right-gutter block control: pin one ✓/✕ pair to the right edge at each block's
+ * top, so they line up. position:relative makes the editor the containing block
+ * for the absolutely-positioned controls. Every ProseMirror markdown editor
+ * (contenteditable true OR false — Edit/View is a live toggle on one view)
+ * reserves the gutter PERMANENTLY: toggling padding-right re-wrapped the whole
+ * document — on the first suggestion mid-typing, and on every Edit↔View flip.
+ * Chat-rendered markdown carries no contenteditable attribute and is spared. */
+.tiptap[contenteditable]:not(.tiptap-code),
+.tiptap.has-suggestions {
+  position: relative;
+  /* Wide enough for author chip + ✕/✓ (~59px), so the chip never sits over text. */
+  padding-right: 4rem;
+}
+.suggestion-gutter {
+  position: absolute;
+  right: 0.25rem;
+  margin-top: -0.1rem;
+}
+/* `.sd-foldable { position: relative }` (fold chevron anchor) hijacks the
+ * gutter's containing block from `.tiptap`, dragging the controls out of the
+ * reserved right lane onto the block's own text. Compensate for the lane the
+ * block no longer spans (the .tiptap padding-right above). */
+.tiptap .sd-foldable > .suggestion-gutter {
+  right: calc(0.25rem - 4rem);
+}
+/* Inline group control: an OVERLAY anchored at the hovered run's end — the
+ * pre-#1104 per-run reviewer, restored. Absolute so it never shifts the line
+ * (the words after the run stay put), dropped just below the baseline so it
+ * doesn't cover the text being read, and given a small floating chip so the
+ * buttons stay legible over whatever it overlaps. No inset offsets — it keeps
+ * its static inline position, so a positioned ancestor (.sd-foldable) cannot
+ * drag it out of place the way it hijacks the gutter's lane above. */
 .suggestion-inline-review {
   position: absolute;
   z-index: 12;
@@ -1427,26 +2246,82 @@ del[data-suggestion] .ProseMirror-widget:not(.Tiptap-mathematics-render) {
   box-shadow: 0 1px 4px rgba(28, 25, 23, 0.2);
   pointer-events: auto;
 }
-
-/* Right-gutter block control: pin one ✓/✕ pair to the right edge at each block's
- * top, so they line up. position:relative makes the editor the containing block
- * for the absolutely-positioned controls. Two selectors:
- *  - the live editor reserves the gutter PERMANENTLY (not toggled with
- *    `.has-suggestions`): toggling padding-right re-wrapped the whole document
- *    the instant a suggestion appeared — a jarring shift mid-typing.
- *  - read-only editors (contenteditable=false) still render controls for
- *    existing suggestion marks, so reserve the gutter on demand there too,
- *    otherwise the controls anchor to the viewport instead of the block.
- * An editable editor matches both with identical values, so no reflow. */
-.tiptap[contenteditable='true']:not(.tiptap-code),
-.tiptap.has-suggestions {
-  position: relative;
-  padding-right: 2.75rem;
+/* One line at a time: a document where every line is suggested otherwise reads
+ * as a column of ✓/✕ chrome. Each editor marks the line under the pointer with
+ * `is-hovered`. Opacity, not display — the control keeps its box, so revealing
+ * it never reflows the line — and pointer-events stay off while hidden so an
+ * invisible button can't be clicked. Touch devices have no hover to give, so
+ * they keep the always-on controls.
+ *
+ * Scoped to the EDITABLE markdown editor: on a read-only review surface (the
+ * diff tab, /d/<id>) presenting the decisions IS the job, so nothing hides.
+ * The code editor's pill shares the rule — one contract, one place. */
+@media (hover: hover) {
+  .tiptap[contenteditable='true'] .suggestion-gutter,
+  .monaco-diff-pending-actions {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 90ms ease-out;
+  }
+  .tiptap[contenteditable='true'] .suggestion-gutter.is-hovered,
+  .tiptap[contenteditable='true'] .suggestion-gutter:focus-within,
+  .monaco-diff-pending-actions.is-hovered,
+  .monaco-diff-pending-actions:focus-within {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
-.suggestion-gutter {
-  position: absolute;
-  right: 0.25rem;
-  margin-top: -0.1rem;
+
+/* Who suggested this line. Sits LEFT of the ✓/✕ and jumps to the chat turn
+ * that wrote it, so a suggestion is never anonymous chrome. Dimmed at rest and
+ * borderless so it reads as passive attribution (a "go to the turn" marker),
+ * not a third action button beside ✓/✕. */
+.suggestion-gutter .suggestion-author {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  margin-right: 1px;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 8px;
+  font-weight: 600;
+  line-height: 1;
+  color: #fff;
+  background: var(--stone-400, #a8a29e);
+  opacity: 0.65;
+  transition: opacity 80ms ease-out;
+}
+.suggestion-gutter .suggestion-author:hover {
+  opacity: 1;
+}
+/* Author chips without a jump target render as spans (`is-static`) — an
+ * identity byline, not a control: default cursor, no hover invitation. */
+.suggestion-gutter .suggestion-author.is-static {
+  cursor: default;
+}
+.suggestion-gutter .suggestion-author.is-static:hover {
+  opacity: 0.65;
+}
+/* Face avatars (people) fill the round chip; brand marks (`is-mark`, Sunny's
+ * asterisk, the Claude asterisk, …) sit uncropped on a transparent chip — the
+ * same two treatments the chat list uses, so the gutter reads as the same
+ * people. */
+.suggestion-author img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.suggestion-author.is-mark {
+  background: transparent;
+  overflow: visible;
+}
+.suggestion-author img.is-mark {
+  object-fit: contain;
 }
 
 /* Image-upload placeholder — instant local preview + spinner shown while a
@@ -1531,7 +2406,7 @@ del[data-suggestion] .ProseMirror-widget:not(.Tiptap-mathematics-render) {
 .tiptap .diff-pending-addition:not(.diff-pending-last)::before {
   border-bottom-right-radius: 0;
 }
-/* Continuous rail — extend the ::after slab 0.6em into the 0.9em margin gap on
+/* Continuous rail — extend the ::after slab 0.6em past the block margin gap on
    each side so adjacent same-change rails overlap and the eye sees one line.
    Standalone blocks (first AND last) skip both extensions. */
 .tiptap .diff-pending-addition:not(.diff-pending-first)::after {
@@ -1540,14 +2415,19 @@ del[data-suggestion] .ProseMirror-widget:not(.Tiptap-mathematics-render) {
 .tiptap .diff-pending-addition:not(.diff-pending-last)::after {
   bottom: -0.6em;
 }
-/* Extend the tint + rail into list marker columns (markers stay outside). */
+/* Extend the tint + rail into list marker columns (markers stay outside).
+   The offset CANCELS the list gutter, so a list item's rail lands on the same
+   left edge as a paragraph's (-13px) and a diff spanning both reads as one
+   straight ribbon instead of a stepped one. Hence var(), not a hard-coded rem. */
 .tiptap li.diff-pending-addition::before,
 .tiptap li.diff-pending-addition::after {
-  left: calc(-1.5rem - 13px);
+  left: calc(-1 * var(--sd-list-gutter, 1.5rem) - 13px);
 }
+/* Checkbox items hang their box closer in than a disc, so their rail sits the
+   same 0.25rem further right — expressed off the gutter for the same reason. */
 .tiptap li:has(> p > .md-checkbox).diff-pending-addition::before,
 .tiptap li:has(> p > .md-checkbox).diff-pending-addition::after {
-  left: calc(-1.25em - 13px);
+  left: calc(-1 * var(--sd-list-gutter, 1.5rem) + 0.25rem - 13px);
 }
 /* Thin horizontal rules need a little vertical band to read as highlighted. */
 .tiptap hr.diff-pending-addition::before,
@@ -1632,11 +2512,11 @@ del[data-suggestion] .ProseMirror-widget:not(.Tiptap-mathematics-render) {
 }
 .tiptap li.diff-pending-deletion::before,
 .tiptap li.diff-pending-deletion::after {
-  left: calc(-1.5rem - 13px);
+  left: calc(-1 * var(--sd-list-gutter, 1.5rem) - 13px);
 }
 .tiptap li:has(> p > .md-checkbox).diff-pending-deletion::before,
 .tiptap li:has(> p > .md-checkbox).diff-pending-deletion::after {
-  left: calc(-1.25em - 13px);
+  left: calc(-1 * var(--sd-list-gutter, 1.5rem) + 0.25rem - 13px);
 }
 .tiptap hr.diff-pending-deletion::before,
 .tiptap hr.diff-pending-deletion::after {
@@ -1661,7 +2541,7 @@ del[data-suggestion] .ProseMirror-widget:not(.Tiptap-mathematics-render) {
   display: block;
 }
 /* When a deletion widget sits directly above its paired live blocks, drop the
-   default 0.9em sibling margin so the red and green rails meet seamlessly. */
+   default sibling margin so the red and green rails meet seamlessly. */
 .tiptap .ProseMirror-widget:has(.diff-pending-deletion-widget) + *,
 .tiptap .diff-pending-deletion-widget + * {
   margin-top: 0;
@@ -1721,36 +2601,49 @@ del[data-suggestion] .ProseMirror-widget:not(.Tiptap-mathematics-render) {
   opacity: 1;
   background-color: var(--diff-del-bg);
 }
+/* Round initials chip — "who suggested this", not their spelled-out name.
+ * The full label lives in the tooltip; the click opens the chat turn. Dimmed
+ * at rest so it reads as passive attribution, not a third action button. */
 .diff-pending-author {
   display: inline-flex;
   align-items: center;
-  padding: 0 4px;
-  font-size: 10px;
-  font-weight: 500;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  color: var(--color-stone-500, rgb(120, 113, 108));
-  background: transparent;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
   border: 0;
+  border-radius: 999px;
+  font-size: 8px;
+  font-weight: 600;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #fff;
+  background: var(--color-stone-400, rgb(168, 162, 158));
   cursor: default;
-  text-decoration: none;
   line-height: 1;
-  max-width: 120px;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
-}
-.diff-pending-author:hover {
-  color: var(--color-stone-800, rgb(41, 37, 36));
-  text-decoration-color: currentColor;
+  opacity: 0.65;
+  transition: opacity 0.12s;
 }
 button.diff-pending-author {
   cursor: pointer;
-  text-decoration: underline;
-  text-decoration-color: rgba(120, 113, 108, 0.3);
-  text-underline-offset: 2px;
 }
 button.diff-pending-author:hover {
-  text-decoration-color: currentColor;
+  opacity: 1;
+}
+.diff-pending-author img {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  object-fit: cover;
+}
+/* Brand marks (Claude asterisk, etc.) sit uncropped on a transparent chip —
+ * matching the chat list's ExternalAgentBadge treatment. */
+.diff-pending-author.is-mark {
+  background: transparent;
+}
+.diff-pending-author img.is-mark {
+  object-fit: contain;
+  border-radius: 0;
 }
 
 /* Base container — compact, right-aligned row. */
@@ -1926,12 +2819,6 @@ button.diff-pending-author:hover {
   [data-print-root] * {
     visibility: visible;
   }
-  /* Override the on-screen content-visibility optimization: every block must
-     render so the printout/PDF includes off-screen content. */
-  [data-print-root] .tiptap > * {
-    content-visibility: visible;
-    contain-intrinsic-size: auto none;
-  }
   [data-print-root] {
     position: absolute;
     left: 0;
@@ -1940,13 +2827,17 @@ button.diff-pending-author:hover {
     /* The printed margin is this element's own padding (driven by the toolbar's
        Narrow/Normal/Wide control). @page margin is 0 below so the browser prints
        no date/title/URL/page-number chrome in the page margins. */
-    padding: var(--print-margin, 0.75in);
+    /* !important: the screen side padding is an inline style (pane-relative cqw). */
+    padding: var(--print-margin, 0.75in) !important;
     /* Honor the editor's zoom as the printed text size. `zoom` (unlike the
        on-screen scale transform, which is reset here) reflows and paginates;
        dividing the width back out keeps the zoomed page exactly one sheet wide
        instead of overflowing it. */
     zoom: var(--print-zoom, 1);
     width: calc(100% / var(--print-zoom, 1)) !important;
+    /* The docs sheet caps itself at the pane width on screen; printing needs
+       the full width back so sub-100% zoom still fills the sheet. */
+    max-width: none !important;
     background: white !important;
     border: none !important;
     box-shadow: none !important;
@@ -2004,11 +2895,11 @@ button.diff-pending-author:hover {
 
 /* Shimmer for the transient "Compiling LaTeX" chat indicator — a soft
    highlight band sweeping left→right across the text, Claude-Code style. */
-@keyframes latex-compile-shimmer {
+@keyframes chat-shimmer {
   0% { background-position: 150% 0; }
   100% { background-position: -50% 0; }
 }
-.latex-compile-shimmer {
+.chat-shimmer {
   background-image: linear-gradient(
     90deg,
     var(--color-stone-400, #a8a29e) 0%,
@@ -2021,13 +2912,55 @@ button.diff-pending-author:hover {
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  animation: latex-compile-shimmer 1.5s linear infinite;
+  animation: chat-shimmer 1.5s linear infinite;
 }
 @media (prefers-reduced-motion: reduce) {
-  .latex-compile-shimmer {
+  .chat-shimmer {
     animation: none;
     color: var(--color-stone-500, #78716c);
   }
+}
+
+/* Fullscreen chat-table view — Streamdown portals it to <body>, OUTSIDE the
+   transcript's MARKDOWN_CHROME class overrides, so its default chrome (black
+   borders, bold text-sm headers) needs restyling here to match the in-chat
+   CSV-viewer table. border-collapse must be `separate` for the radius. */
+[data-streamdown='table-fullscreen'] [data-streamdown='table'] {
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 1px solid var(--color-stone-200, #e7e5e4);
+  border-radius: 12px;
+  font-size: 12px;
+}
+[data-streamdown='table-fullscreen'] [data-streamdown='table-header'] {
+  background: var(--color-stone-50, #fafaf9);
+}
+[data-streamdown='table-fullscreen'] [data-streamdown='table-header-cell'] {
+  padding: 8px 12px;
+  font-size: 10px;
+  line-height: 1rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-stone-400, #a8a29e);
+  border-bottom: 1px solid var(--color-stone-200, #e7e5e4);
+}
+[data-streamdown='table-fullscreen'] [data-streamdown='table-header-cell']:first-child {
+  border-top-left-radius: 11px;
+}
+[data-streamdown='table-fullscreen'] [data-streamdown='table-header-cell']:last-child {
+  border-top-right-radius: 11px;
+}
+[data-streamdown='table-fullscreen'] [data-streamdown='table-cell'] {
+  padding: 6px 12px;
+  font-size: 12px; /* td carries its own text-sm — inherit isn't enough */
+  color: var(--color-stone-700, #44403c);
+}
+[data-streamdown='table-fullscreen'] [data-streamdown='table-row'] {
+  border-color: var(--color-stone-100, #f5f5f4);
+}
+[data-streamdown='table-fullscreen'] button {
+  color: var(--color-stone-500, #78716c);
 }
 
 /* SyncTeX inverse / search jump: briefly flash the target editor line so the
@@ -2040,8 +2973,52 @@ button.diff-pending-author:hover {
   to { background-color: rgba(129, 140, 248, 0); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .stx-line-flash { animation: none; }
+  /* Static highlight instead of the fade — both users (Monaco decoration, PDF
+     forward-search bar) remove the element/class after ~1.5s themselves. */
+  .stx-line-flash { animation: none; background-color: rgba(129, 140, 248, 0.34); }
 }
+
+/* "Fix with Agent": two soft indigo ring pulses when a NEW compile error lands
+   (keyed off the parsed error signature in use-latex-autofix, so recompiles of
+   the same failure stay quiet). Indigo = the agent affordance color both Fix
+   seats already use for their busy state. */
+.latex-fix-attention {
+  animation: latex-fix-attention 1.1s ease-in-out 2;
+}
+@keyframes latex-fix-attention {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); transform: scale(1); }
+  35% { box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.3); transform: scale(1.04); }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Static ring for the pulse window instead of motion; the hook removes the
+     class after ~2.4s (same treatment as .stx-line-flash above). */
+  .latex-fix-attention { animation: none; box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25); }
+}
+
+/* Floating "enable auto-fix?" card: slides up over the editor bottom when a
+   requested fix resolves the compile. The keyframes carry translateX(-50%)
+   because animating transform would otherwise override the centering class. */
+.latex-autofix-card-in {
+  animation: latex-autofix-card-in 200ms ease-out;
+}
+@keyframes latex-autofix-card-in {
+  from { opacity: 0; transform: translate(-50%, 10px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .latex-autofix-card-in { animation: none; }
+}
+
+/* LaTeX compile problems: a slim gutter bar beside the failing line (red for
+   errors, amber and fainter for warnings); the squiggle + hover come from the
+   Monaco markers themselves. */
+.latex-compile-gutter {
+  width: 3px !important;
+  margin-left: 2px;
+  border-radius: 2px;
+}
+.latex-compile-gutter-error { background-color: rgb(220 38 38 / 0.85); }
+.latex-compile-gutter-warning { background-color: rgb(217 119 6 / 0.5); }
 
 /* Onboarding flow: gentle entrance for each step + revealed controls. */
 @keyframes onboarding-fade-in-up {
@@ -2104,7 +3081,9 @@ button.diff-pending-author:hover {
   .sd-onb-demo-pill { display: none; }
 }
 
-/* ── LaTeX landing fonts (Google Sans / Google Sans Code) ── */
+/* ── Google Sans / Google Sans Code. Self-hosted faces, currently unreferenced
+   (the old /latex landing was their only consumer); @font-face costs nothing
+   until something declares the family. ── */
 @font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 400; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4x5hg2a2c.woff2") format('woff2'); unicode-range: U+02C7, U+02D8-02D9, U+02DB, U+0307, U+1400-167F, U+18B0-18F5, U+25CC, U+11AB0-11ABF; }
 @font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 400; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4x2hg2a2c.woff2") format('woff2'); unicode-range: U+0300-0302, U+0304, U+030B-030C, U+0323-0324, U+0330-0331, U+13A0-13FF, U+AB70-ABBF; }
 @font-face { font-family: 'Google Sans Flex'; font-style: normal; font-weight: 400; font-stretch: 100%; font-display: swap; src: url("/fonts/t5s6IQcYNIWbFgDgAAzZ34auoVyXkJCOvp3SFWJbN5hF8Ju1x6sKCyp0l9sI40swNJwInycYAJzz0m7kJ4qFQOJBOjLvDSndo0SKMpKSTzwliVdHAy4xtRg2a2c.woff2") format('woff2'); unicode-range: U+0302-0303, U+0305, U+0307-0308, U+0310, U+0312, U+0315, U+031A, U+0326-0327, U+032C, U+032F-0330, U+0332-0333, U+0338, U+033A, U+0346, U+034D, U+0391-03A1, U+03A3-03A9, U+03B1-03C9, U+03D1, U+03D5-03D6, U+03F0-03F1, U+03F4-03F5, U+2016-2017, U+2034-2038, U+203C, U+2040, U+2043, U+2047, U+2050, U+2057, U+205F, U+2070-2071, U+2074-208E, U+2090-209C, U+20D0-20DC, U+20E1, U+20E5-20EF, U+2100-2112, U+2114-2115, U+2117-2121, U+2123-214F, U+2190, U+2192, U+2194-21AE, U+21B0-21E5, U+21F1-21F2, U+21F4-2211, U+2213-2214, U+2216-22FF, U+2308-230B, U+2310, U+2319, U+231C-2321, U+2336-237A, U+237C, U+2395, U+239B-23B7, U+23D0, U+23DC-23E1, U+2474-2475, U+25AF, U+25B3, U+25B7, U+25BD, U+25C1, U+25CA, U+25CC, U+25FB, U+266D-266F, U+27C0-27FF, U+2900-2AFF, U+2B0E-2B11, U+2B30-2B4C, U+2BFE, U+3030, U+FF5B, U+FF5D, U+1D400-1D7FF, U+1EE00-1EEFF; }
@@ -2148,91 +3127,16 @@ button.diff-pending-author:hover {
 @font-face { font-family: 'Google Sans Code'; font-style: normal; font-weight: 400; src: url("/fonts/pxihyogzv91QhV44Z_GQBHsGf5PuckJMZfIVTPZaiXEp_ht12EVEHsN1sCQNcmTltAki.woff2") format('woff2'); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
 @font-face { font-family: "Google Sans"; src: url("/fonts/4Ua_rENHsxJlGDuGo1OIlJfC6l_24rlCK1Yo_Iqcsih3SAyH6cAwhX9RFD48TE63OOYKtrw2IKlnrSjiEjo5.woff2"); font-display: swap; font-style: normal; font-weight: 500 }
 
-/* ── LaTeX landing (/latex) — design tokens + animations ported from the
-   marketing site (PR #448). Colors + `font-display` are additive (no collision
-   with the app theme); the landing's base font + mono are scoped to
-   `.latex-landing` so the rest of the app is untouched. ──────────────────── */
-@theme {
-  --color-paper: #fffdfb;
-  --color-section: #eceae3;
-  --color-cream: #f5efe5;
-  --color-ink: #151009;
-  --color-ink-2: #1a1000;
-  --color-ink-soft: #211c15;
-  --color-gray-warm: #635d54;
-  --color-gray-mid: #8c857a;
-  --color-tan: #b5afa5;
-  --color-sand: #e8d5c0;
-  --color-orange: #ff8112;
-  --color-orange-deep: #c24d00;
-  --color-amber: #ffc56a;
-  --color-peach: #ffedd0;
-
-  --font-display: "Google Sans", "Google Sans Flex", sans-serif;
-}
-
-/* Scope the landing's base typography + surface so it never leaks onto the app.
-   `--font-mono` is overridden only here (the app uses font-mono elsewhere). */
-.latex-landing {
-  background: var(--color-paper);
-  color: var(--color-ink);
-  font-family: "Google Sans Flex", "Google Sans", sans-serif;
-  --font-mono: "Google Sans Code", "Fragment Mono", monospace;
-  -webkit-font-smoothing: antialiased;
-}
-
-@keyframes blink {
-  0%, 45% { opacity: 1; }
-  50%, 95% { opacity: 0; }
-}
-@keyframes marquee {
-  from { transform: translateX(0); }
-  to { transform: translateX(-50%); }
-}
-@keyframes wiggle {
-  from { transform: rotate(-7deg); }
-  to { transform: rotate(7deg); }
-}
-@keyframes peek {
-  0%, 12% { transform: translateX(-115%) rotate(-30deg); }
-  22%, 70% { transform: translateX(0) rotate(0deg); }
-  80%, 100% { transform: translateX(-115%) rotate(-30deg); }
-}
-@keyframes latex-float {
+/* Gentle bob, used by the demo pages' Sundial marks. */
+@keyframes soft-float {
   0%, 100% { transform: translateY(0); }
   50% { transform: translateY(-7px); }
 }
-@utility animate-blink {
-  animation: blink 1s step-end infinite;
-}
-@utility animate-marquee {
-  animation: marquee 35s linear infinite;
-}
-@utility animate-wiggle {
-  animation: wiggle 1.6s ease-in-out infinite alternate;
-}
-@utility animate-peek {
-  animation: peek 9s ease-in-out infinite;
-}
 @utility animate-float {
-  animation: latex-float 4.5s ease-in-out infinite;
-}
-
-/* scroll-triggered entrances (driven by Reveal in latex-landing/client.tsx) */
-.latex-landing [data-reveal] {
-  opacity: 0;
-  transition: opacity 0.55s ease-out, transform 0.65s cubic-bezier(0.34, 1.56, 0.64, 1);
-  transition-delay: var(--reveal-delay, 0s);
-}
-.latex-landing [data-reveal="rise"] { transform: translateY(28px); }
-.latex-landing [data-reveal="pop"] { transform: scale(0); }
-.latex-landing [data-reveal].revealed {
-  opacity: 1;
-  transform: none;
+  animation: soft-float 4.5s ease-in-out infinite;
 }
 @media (prefers-reduced-motion: reduce) {
-  .latex-landing [data-reveal] { opacity: 1; transform: none; transition: none; }
-  .animate-wiggle, .animate-peek, .animate-marquee, .animate-float { animation: none; }
+  .animate-float { animation: none; }
 }
 
 /* ── Streamdown table chrome: opaque surfaces ───────────────────────────────

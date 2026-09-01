@@ -1,47 +1,20 @@
-// What shows up in the workspace model picker. Two layers, evaluated by
-// `isModelAllowed` against the live Vercel AI Gateway catalog
-// (`https://ai-gateway.vercel.sh/v1/models`):
-//
-//  1. AUTO-ACCEPT — for our core providers we surface *new* flagship language
-//     models automatically (released on/after AUTO_ACCEPT_BASELINE), so a fresh
-//     release appears with no code change. Old models and small/specialized
-//     variants (-mini, -fast, -code, image, …) stay hidden: there are too many
-//     and most are stale.
-//  2. ALLOWED_GATEWAY_MODELS — explicit opt-ins: older models we still want,
-//     variants we like, and anything from a provider outside the auto set.
-//
-// IGNORED_GATEWAY_MODELS blocks a specific id and wins over both.
+// What shows up in the workspace model picker, evaluated by `isModelAllowed`
+// against the live Vercel AI Gateway catalog
+// (`https://ai-gateway.vercel.sh/v1/models`): every language model the
+// gateway serves. There is no curation layer — a new release appears the day
+// the gateway lists it, and the picker handles discovery (featured row,
+// provider groups, search) instead of a hand-maintained list.
+// IGNORED_GATEWAY_MODELS blocks a specific id when one misbehaves.
 // Capability metadata (context window, tags, …) is fetched from the gateway.
 
-// Providers whose new flagship releases we trust enough to surface on sight.
-export const AUTO_ACCEPT_PROVIDERS: ReadonlySet<string> = new Set([
-  'anthropic',
-  'openai',
-  'google',
-  'moonshotai',
-  'zai',
-]);
-
-// Unix seconds. A model from an auto-accept provider released on/after this is
-// shown automatically. Never needs bumping — future releases are all newer.
-export const AUTO_ACCEPT_BASELINE = Date.parse('2026-05-01T00:00:00Z') / 1000;
-
-// Suffix tokens that mark a small/fast/specialized spin of a flagship. We don't
-// auto-surface these (opt one in via ALLOWED_GATEWAY_MODELS if you want it).
-const VARIANT_TOKENS: ReadonlySet<string> = new Set([
-  'mini', 'nano', 'fast', 'flashx', 'highspeed', 'turbo', 'air', 'instant',
-  'code', 'codex', 'image', 'chat', 'safeguard',
-]);
-
-function isVariantSlug(slug: string): boolean {
-  return slug.split('-').some((token) => VARIANT_TOKENS.has(token));
-}
-
+// Ids we accept without consulting the live catalog: the fast path for chat
+// create/PATCH (`normalizeSupportedModelRef`) and the featured-row anchors.
 export const ALLOWED_GATEWAY_MODELS = [
   // Anthropic
   'anthropic/claude-haiku-4.5',
   'anthropic/claude-opus-4.7',
   'anthropic/claude-opus-4.8',
+  'anthropic/claude-opus-5',
   'anthropic/claude-sonnet-4.6',
   'anthropic/claude-fable-5',
   // OpenAI
@@ -99,7 +72,7 @@ export type AllowedGatewayModelId = (typeof ALLOWED_GATEWAY_MODELS)[number];
 export const ALLOWED_GATEWAY_MODEL_SET: ReadonlySet<string> = new Set(ALLOWED_GATEWAY_MODELS);
 const IGNORED_GATEWAY_MODEL_SET: ReadonlySet<string> = new Set(IGNORED_GATEWAY_MODELS);
 
-export const DEFAULT_MODEL_REF: AllowedGatewayModelId = 'anthropic/claude-fable-5';
+export const DEFAULT_MODEL_REF: AllowedGatewayModelId = 'anthropic/claude-opus-5';
 
 export type GatewayModelMeta = {
   id: string;
@@ -111,11 +84,5 @@ export type GatewayModelMeta = {
 export function isModelAllowed(model: GatewayModelMeta): boolean {
   if (IGNORED_GATEWAY_MODEL_SET.has(model.id)) return false;
   if (ALLOWED_GATEWAY_MODEL_SET.has(model.id)) return true;
-  const [provider, slug = ''] = model.id.split('/');
-  return (
-    AUTO_ACCEPT_PROVIDERS.has(provider ?? '') &&
-    model.type === 'language' &&
-    (model.released ?? 0) >= AUTO_ACCEPT_BASELINE &&
-    !isVariantSlug(slug)
-  );
+  return model.type === 'language';
 }

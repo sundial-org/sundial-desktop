@@ -54,6 +54,7 @@ export function DocFileNameControl({
   onRenameValueChange,
   onCommitRename,
   onCancelRename,
+  large = false,
 }: {
   fileName: string;
   canRename: boolean;
@@ -64,8 +65,22 @@ export function DocFileNameControl({
   onRenameValueChange: (value: string) => void;
   onCommitRename: () => void;
   onCancelRename: () => void;
+  /** Google Docs-style header title: bigger, regular weight. The rename
+   *  input mirrors the same metrics so nothing moves when editing starts. */
+  large?: boolean;
 }) {
-  const labelClass = 'min-w-0 max-w-[220px] truncate text-[13px] font-medium text-stone-700';
+  // Markdown is the product's native file type, so its extension is chrome,
+  // not information — the header shows the bare name. Real extensions
+  // (.tex, .csv, …) stay: they say what the file IS. Only the literal .md
+  // hides — .mdx/.markdown keep theirs, because the rename flow only
+  // auto-preserves .md and an extensionless display would invite renames
+  // that silently convert the file (Codex P2 on #1027). A too-long name
+  // clips cleanly (overflow-hidden, no ellipsis); title attr = full name.
+  const label = fileName.endsWith('.md') ? fileName.slice(0, -3) : fileName;
+  const sizeClass = large
+    ? 'text-[17px] font-normal text-stone-800'
+    : 'text-[13px] font-medium text-stone-700';
+  const labelClass = `min-w-0 overflow-hidden whitespace-nowrap ${sizeClass}`;
 
   if (isRenaming) {
     return (
@@ -73,6 +88,9 @@ export function DocFileNameControl({
         ref={inputRef}
         data-testid="doc-file-name-input"
         aria-label="Rename file"
+        autoCapitalize="none"
+        autoCorrect="off"
+        spellCheck={false}
         value={renameValue}
         onChange={(event) => onRenameValueChange(event.target.value)}
         onKeyDown={(event) => {
@@ -87,7 +105,13 @@ export function DocFileNameControl({
         onBlur={onCommitRename}
         onClick={(event) => event.stopPropagation()}
         size={Math.max(renameValue.length + 1, 2)}
-        className="min-w-0 max-w-[220px] rounded px-1 py-0.5 text-left text-[13px] font-medium text-stone-700 bg-transparent outline-none"
+        // Default: pinned to the control line (h-5/leading-5, header polish);
+        // large (Docs title): free height, the input mirrors the label so
+        // nothing moves when a rename starts. py-0: the title hugs the menu
+        // bar below it (Belinda, round 3).
+        className={`min-w-0 rounded px-1 text-left ${sizeClass} ${
+          large ? 'py-0' : 'h-5 py-0 leading-5'
+        } bg-transparent outline-none`}
       />
     );
   }
@@ -95,7 +119,7 @@ export function DocFileNameControl({
   if (!canRename) {
     return (
       <span data-testid="doc-file-name" className={labelClass} title={fileName}>
-        {fileName}
+        {label}
       </span>
     );
   }
@@ -107,9 +131,11 @@ export function DocFileNameControl({
       aria-label={`Rename ${fileName}`}
       title={fileName}
       onClick={onBeginRename}
-      className={`${labelClass} rounded px-1 py-0.5 text-left hover:bg-stone-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-stone-300`}
+      className={`${labelClass} rounded px-1 text-left ${
+        large ? 'py-0' : 'h-5 py-0 leading-5'
+      } hover:bg-stone-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-stone-300`}
     >
-      {fileName}
+      {label}
     </button>
   );
 }

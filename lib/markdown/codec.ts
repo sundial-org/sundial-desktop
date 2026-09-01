@@ -1,7 +1,8 @@
 import { Extension, getSchema } from '@tiptap/core';
-import FontFamily from '@tiptap/extension-font-family';
 import Highlight from '@tiptap/extension-highlight';
 import Image from '@tiptap/extension-image';
+import Subscript from '@tiptap/extension-subscript';
+import Superscript from '@tiptap/extension-superscript';
 import { Table } from '@tiptap/extension-table';
 import TableCell from '@tiptap/extension-table-cell';
 import TableHeader from '@tiptap/extension-table-header';
@@ -14,7 +15,7 @@ import { yDocToProsemirrorJSON } from 'y-prosemirror';
 import * as Y from 'yjs';
 import { replaceFromMarkdown, serializeDoc } from '@/lib/crdt-js/markdown_yjs.mjs';
 import { imageWidthAttribute } from '@/lib/markdown/image-attrs.mjs';
-import { FontSize } from '@/lib/tiptap/font-size';
+import { Frontmatter } from '@/lib/tiptap/frontmatter';
 import { ObsidianBlockquote, ObsidianLink } from '@/lib/tiptap/obsidian';
 import { allowSuggestionBlockMarks, SuggestionDocument, SuggestionNodeAttributes, InsertionMark, DeletionMark, ModificationMark } from '@/lib/workspace/suggestion-marks';
 
@@ -34,6 +35,76 @@ export const HardBreakMarker = Extension.create({
   },
 });
 
+// Same deal for bullet lists: the codec records the source bullet style
+// (`*` / `+`; `-` is the unmarked default) on a `marker` attribute so a
+// starred Obsidian list round-trips byte-identical instead of being rewritten
+// to dashes. Registered here AND in the live editor for the same reason as
+// HardBreakMarker above.
+export const BulletMarker = Extension.create({
+  name: 'bulletMarker',
+  addGlobalAttributes() {
+    return [{ types: ['bulletList'], attributes: { marker: { default: null } } }];
+  },
+});
+
+// Source-fidelity attrs the crdt-js codec emits, declared for the same reason
+// as HardBreakMarker (an editor round trip must not drop them): `marker` on
+// horizontalRule (`***` / `___` variants), `indented` on codeBlock (4-space
+// blocks), and `align` on table cells (from `:---:` separators). `align` also
+// renders as text-align so column alignment is visible in the editor.
+// Each attr keeps an HTML bridge (`data-*` parse + render) because the plain-
+// markdown paste path re-parses `markdownToHtml` output through the ProseMirror
+// DOMParser — without it, pasted `***` / indented code / `:---:` tables would
+// silently degrade to the default forms on the next serialization.
+export const MarkdownSourceFidelity = Extension.create({
+  name: 'markdownSourceFidelity',
+  addGlobalAttributes() {
+    const dataAttr = (name: string, validate?: (raw: string) => boolean) => ({
+      default: null as string | null,
+      // Clipboard-controlled: pasted HTML can carry any `data-*` value, and
+      // these attrs serialize back into MARKDOWN SOURCE — an unvalidated
+      // marker would emit invisible arbitrary document content on save.
+      parseHTML: (el: HTMLElement) => {
+        const raw = el.getAttribute(`data-${name}`);
+        return raw && (!validate || validate(raw)) ? raw : null;
+      },
+      renderHTML: (attrs: Record<string, unknown>) =>
+        attrs[name] ? { [`data-${name}`]: attrs[name] } : {},
+    });
+    // The thematic-break spellings the markdown parser emits (parser.mjs
+    // MD_HR, sans indent — the marker serializes at column 0).
+    const HR_MARKER = /^(?:-(?:[ \t]*-){2,}|\*(?:[ \t]*\*){2,}|_(?:[ \t]*_){2,})$/;
+    return [
+      { types: ['horizontalRule'], attributes: { marker: dataAttr('marker', (raw) => HR_MARKER.test(raw)) } },
+      { types: ['codeBlock'], attributes: { indented: dataAttr('indented', (raw) => raw === 'true') } },
+      {
+        types: ['tableHeader', 'tableCell'],
+        attributes: {
+          align: {
+            default: null,
+            // Fall back to the inline text-align so aligned cells pasted from
+            // outside HTML (not our renderer) keep their alignment too. Both
+            // sources are clipboard-controlled, so only the three known tokens
+            // are accepted — anything else (e.g. a crafted `data-align` smuggling
+            // extra CSS declarations) is dropped, and renderHTML re-validates so
+            // a hostile value can never reach the style attribute.
+            parseHTML: (el: HTMLElement) => {
+              const value = el.getAttribute('data-align') ?? el.style?.textAlign;
+              return value === 'left' || value === 'center' || value === 'right' ? value : null;
+            },
+            renderHTML: (attrs: Record<string, unknown>) => {
+              const a = attrs.align;
+              return a === 'left' || a === 'center' || a === 'right'
+                ? { 'data-align': a, style: `text-align: ${a}` }
+                : {};
+            },
+          },
+        },
+      },
+    ];
+  },
+});
+
 export const markdownSchema = getSchema([
   // v3 StarterKit bundles `link` + `underline`. Disable `link` (ObsidianLink
   // provides it) and `blockquote` (ObsidianBlockquote provides it); StarterKit's
@@ -48,12 +119,19 @@ export const markdownSchema = getSchema([
   SuggestionDocument,
   SuggestionNodeAttributes,
   HardBreakMarker,
+  BulletMarker,
+  MarkdownSourceFidelity,
+  // Raw YAML frontmatter block — must match the editor's extension list so the
+  // codec-built Y.Doc stays y-prosemirror-readable (see codec cross-equivalence).
+  Frontmatter,
   allowSuggestionBlockMarks(ObsidianBlockquote),
   Highlight,
+  // Inline-HTML subset marks (`<sub>`/`<sup>`; `<u>` comes from StarterKit).
+  // Must match the live editor's markdownFormattingExtensions.
+  Subscript,
+  Superscript,
   TextStyle,
-  FontFamily,
-  FontSize,
-  TextAlign.configure({ types: ['heading', 'paragraph', 'image'] }),
+  TextAlign.configure({ types: ['image'], alignments: ['left', 'center', 'right'] }),
   // Override Tiptap's default `isAllowedUri`: its regex (`[^a-z+.-:]`) treats
   // `.-:` as a range and ends up excluding `/`, so workspace-relative paths
   // like `tutorial/paper.tex` get their href stripped during parse/render.

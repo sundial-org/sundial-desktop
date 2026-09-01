@@ -11,14 +11,13 @@
 // maps to `--sandbox read-only` — enforced by Codex's own sandbox.
 
 import { execFileSync, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 
 import { modelMessagesToClaudePrompt } from '../../agent-ts/src/harness/history.ts';
-import { rowsUnseenByEngine, rowsToModelMessages, systemPrompt } from './runner.mjs';
+import { appendThinkingRow, rowsUnseenByEngine, rowsToModelMessages, systemPrompt, turnEditsMetadata, writeTurnEditsMetadata } from './runner.mjs';
 
 /** Where `codex` lives: env override, installer paths, nvm globals, PATH. */
 export function detectCodexEngine() {
@@ -60,17 +59,24 @@ function promptText(messages) {
   return typeof prompt === 'string' ? prompt : '';
 }
 
-const LOGIN_ERROR = /not logged in|login|unauthorized|401|auth/i;
+// Same trap as claude-runner's: bare `auth`/`login`/`401` matched "author", a
+// URL path, "4013 bytes" — any of which swapped the real failure for "you're
+// not signed in". Only phrases that can't mean anything else.
+const LOGIN_ERROR = /not logged in|codex login|unauthorized|invalid api key|authentication (?:error|failed)|failed to authenticate/i;
 
 /** One turn on the user's Codex. Streams UI chunks + persists rows on the
  *  same contract as the other engines. `holdAttribution(until)` keeps the
  *  project's watcher attributing disk changes to this run. */
 export async function runCodexTurn({
-  project, chatId, model, editMode, stream, abort, store, log, isReplaced, holdAttribution, external = null,
+  project, chatId, model, editMode, stream, abort, store, log, isReplaced, holdAttribution, settleWatcher, assistantMessageId, external = null,
+  // Rows the caller pinned as this turn's context (guest comment deliveries
+  // held back — Codex runs with native filesystem access, so a guest prompt
+  // must never reach it, not even as history). null = the whole chat.
+  historyRows = null,
 }) {
   const engine = detectCodexEngine();
   if (!engine.available) {
-    throw new Error('Codex isn\'t installed on this machine — install it (`npm i -g @openai/codex`) and run `codex login`, then try again.');
+    throw new Error('Codex isn\'t installed on this machine. Install it (`npm i -g @openai/codex`) and run `codex login`, then try again.');
   }
 
   // Adopted external session: `codex exec resume <id>` continues the CLI's
@@ -87,7 +93,7 @@ export async function runCodexTurn({
     if (await codexSessionFileExists(external.sessionId)) resume = external.sessionId;
   }
   const cwd = resume ? external.cwd : project.root;
-  const rows = store.listChatMessages(project.id, chatId);
+  const rows = historyRows ?? store.listChatMessages(project.id, chatId);
   const messages = rowsToModelMessages(resume ? rowsUnseenByEngine(rows) : rows);
   // Same identity + ground rules as the other engines; Codex reads the
   // conversation as one prompt (its own system prompt stays in charge).
@@ -96,7 +102,7 @@ export async function runCodexTurn({
   // for it; the prompt must advertise the absolute folders instead.
   const prompt = resume
     ? promptText(messages)
-    : `${systemPrompt(project, extraRoots, { nativeFs: true })}\n\n${promptText(messages)}`;
+    : `${systemPrompt(project, extraRoots, { nativeFs: true, folderScope: store.getChat(chatId)?.folder_scope || null })}\n\n${promptText(messages)}`;
 
   const env = { ...process.env };
   // Subscription auth only — a stray OpenAI/Codex API key or access token
@@ -125,20 +131,28 @@ export async function runCodexTurn({
     // The resume subcommand rejects exec-only flags (--sandbox, -C): the
     // sandbox rides the -c config form there and the cwd rides the spawn cwd.
     ...(resume ? ['-c', `sandbox_mode="${sandboxMode}"`] : ['--sandbox', sandboxMode]),
-    // Extra roots (multi-root mounts) are part of the workspace — writable too.
-    ...(editMode !== 'view' && extraRoots.length
-      ? ['-c', `sandbox_workspace_write.writable_roots=[${extraRoots.map((entry) => JSON.stringify(entry.root)).join(',')}]`]
-      : []),
+    // Extra roots (multi-root mounts) are part of the workspace — writable
+    // too. Resumed runs spawn at the session's recorded cwd (possibly a
+    // subfolder), so the project root itself must ride writable_roots or
+    // sibling/parent workspace files become read-only.
+    ...(() => {
+      if (editMode === 'view') return [];
+      const roots = [...(resume ? [{ root: project.root }] : []), ...extraRoots];
+      return roots.length
+        ? ['-c', `sandbox_workspace_write.writable_roots=[${roots.map((entry) => JSON.stringify(entry.root)).join(',')}]`]
+        : [];
+    })(),
     ...(resume ? [] : ['-C', project.root]),
     ...(model?.startsWith('openai/') ? ['-m', model.slice('openai/'.length)] : []),
     '-',
   ];
 
-  const assistantMessageId = randomUUID();
   stream.write({ type: 'start', messageId: assistantMessageId });
 
   let seq = 0;
   let pendingText = ''; // latest agent_message, not yet persisted
+  let sawText = false; // survives a flush — pendingText alone can't answer "did it reply?"
+  let persistedReasoning = false; // a thinking row exists, so the turn needs its anchor
   let ranTools = false;
   let turnErrored = null;
   let stderrTail = '';
@@ -175,15 +189,31 @@ export async function runCodexTurn({
 
   // An announcement persists as its own row BEFORE the tool rows it precedes
   // (same stream-order rule as the other engines).
+  // `streaming: true` marks it IN-FLIGHT (same marker the cloud-step loop and
+  // the brain use): only the final anchor row is unmarked, and that asymmetry
+  // is what tells reload / gone-recovery the turn actually ended. Without it
+  // an announcement reads as a finished reply and recovery stops following a
+  // run that's still going.
+  // Buffered readline events keep arriving after a soft replace SIGTERMs the
+  // CLI, and every per-event write below would land AFTER the replacing turn's
+  // user row. persistTool writes complete pairs, so the unmatched-pair pruning
+  // cannot clean that up — it has to not happen. Same corruption class the
+  // cloud-step loop guards against.
   const flushPendingText = () => {
+    if (isReplaced?.()) return;
     if (pendingText.trim()) {
-      store.appendChatMessage(project.id, chatId, { role: 'assistant', content: pendingText, metadata: {} });
+      store.appendChatMessage(project.id, chatId, {
+        role: 'assistant',
+        content: pendingText,
+        metadata: { streaming: true },
+      });
     }
     pendingText = '';
   };
 
   const persistTool = (toolCallId, name, input, output, isError) => {
     ranTools = true;
+    if (isReplaced?.()) return;
     flushPendingText();
     store.appendChatMessage(project.id, chatId, {
       role: 'system',
@@ -220,8 +250,23 @@ export async function runCodexTurn({
           flushPendingText();
           emitText(item.text);
           pendingText = item.text;
+          // `.trim()`: an EMPTY agent_message must not count as a reply, or a
+          // CLI that said nothing skips the actionable "run codex once in a
+          // terminal" failure and persists a blank anchor marked completed —
+          // a silent empty bubble, the exact outcome that gate exists to stop.
+          if (item.text.trim()) sawText = true;
         } else if (item.type === 'reasoning' && typeof item.text === 'string' && item.text.trim()) {
           const id = `r${seq++}`;
+          // Persisted as well as streamed, in stream order — otherwise any
+          // reconnect + history reconcile wiped the reasoning and the
+          // transcript showed a bare "Thinking…".
+          // Flushing clears pendingText, which is ALSO how the turn decides it
+          // produced a reply — `sawText` remembers that independently, or a
+          // reasoning item after the last message would make the turn look
+          // like a CLI that returned nothing (failure) and leave the flushed
+          // row wearing the in-flight marker with no anchor behind it.
+          flushPendingText();
+          if (!isReplaced?.() && appendThinkingRow(store, project.id, chatId, item.text)) persistedReasoning = true;
           stream.write({ type: 'reasoning-start', id });
           stream.write({ type: 'reasoning-delta', id, delta: item.text });
           stream.write({ type: 'reasoning-end', id });
@@ -319,38 +364,72 @@ export async function runCodexTurn({
     clearInterval(holdRefresh);
   }
   hold?.(Date.now() + 3_000); // grace for the watcher's debounce
+  // …and actually WAIT for that debounce to drain. The hold only keeps the
+  // attribution window open; without settling, the count below can run before
+  // the watcher has inserted this turn's rows, persist `{}` as the assistant
+  // metadata, and the chat diff chip never renders for a turn that did edit.
+  await settleWatcher?.();
 
   if (isReplaced()) return;
   if (resume && continuedThreadId && continuedThreadId !== resume) {
     store.updateChat(chatId, { external_resume_id: continuedThreadId });
   }
 
+  // Codex edits the disk natively, so the turn's rows arrive through the
+  // watcher — read the count once, here, after its debounce grace above.
+  const editsMeta = turnEditsMetadata(store, project.id, assistantMessageId);
   if (abort.signal.aborted) {
-    // User stop — persist whatever the turn produced so far.
-    if (pendingText.trim() || ranTools) {
-      store.appendChatMessage(project.id, chatId, { id: assistantMessageId, role: 'assistant', content: pendingText, metadata: {} });
+    // User stop — persist whatever the turn produced so far. A thinking row
+    // counts: without its anchor it flushes under a synthetic id, reads as
+    // outcome 'none', and the client retries for minutes.
+    if (pendingText.trim() || ranTools || persistedReasoning) {
+      store.appendChatMessage(project.id, chatId, {
+        id: assistantMessageId,
+        role: 'assistant',
+        content: pendingText,
+        metadata: pendingText.trim() || ranTools ? editsMeta : { ...editsMeta, run_status: 'aborted' },
+      });
     }
+    writeTurnEditsMetadata(stream, editsMeta);
     stream.write({ type: 'finish', finishReason: 'stop' });
     return;
   }
 
-  const failure = turnErrored || (exitCode !== 0 ? stderrTail.trim() || `codex exited with code ${exitCode}` : null);
-  if (failure && !pendingText.trim() && !ranTools) {
+  // A CLI that never got going (not onboarded, unusable model) can exit 0
+  // having printed nothing — finishing clean there is a silent non-reply.
+  // `sawText`, not pendingText: a reasoning item after the last message
+  // FLUSHES pendingText, and judging by it alone would call a turn that
+  // replied perfectly well a CLI that returned nothing.
+  const replied = sawText || pendingText.trim() || ranTools;
+  const failure =
+    turnErrored ||
+    (exitCode !== 0 ? stderrTail.trim() || `codex exited with code ${exitCode}` : null) ||
+    (!replied
+      ? stderrTail.trim() || 'it returned nothing — run `codex` once in a terminal to finish setup and sign in, then try again'
+      : null);
+  if (failure && !replied) {
     // Nothing streamed — fail the turn outright, with an actionable message.
     throw new Error(
       LOGIN_ERROR.test(failure)
-        ? 'Codex isn\'t signed in on this computer — run `codex login` in a terminal, then try again.'
+        ? 'Codex isn\'t signed in on this computer. Run `codex login` in a terminal, then try again.'
         : `Codex failed: ${failure.slice(0, 300)}`,
     );
   }
-  if (pendingText.trim() || ranTools || failure) {
+  if (replied || failure) {
+    // Contentless anchor (reasoning-only, or a reply already flushed by a
+    // trailing reasoning item) needs a terminal marker, or latestTurnOutcome
+    // reads the turn as still running.
+    const terminal = pendingText.trim() || ranTools || failure ? {} : { run_status: 'completed' };
     store.appendChatMessage(project.id, chatId, {
       id: assistantMessageId,
       role: 'assistant',
       content: pendingText,
-      metadata: failure ? { run_status: 'error', run_error: `Codex stopped before finishing (${failure.slice(0, 200)}).` } : {},
+      metadata: failure
+        ? { ...editsMeta, run_status: 'error', run_error: `Codex stopped before finishing (${failure.slice(0, 200)}).` }
+        : { ...editsMeta, ...terminal },
     });
   }
+  writeTurnEditsMetadata(stream, editsMeta);
   if (failure) {
     stream.write({ type: 'error', errorText: `Codex stopped before finishing (${failure.slice(0, 200)}).` });
     return;

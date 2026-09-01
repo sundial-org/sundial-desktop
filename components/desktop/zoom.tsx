@@ -19,11 +19,24 @@ function storedZoom(): number {
 
 async function applyZoom(factor: number) {
   window.localStorage.setItem(ZOOM_STORAGE_KEY, String(factor));
+  // The macOS traffic lights are positioned natively in window points and
+  // don't scale with page zoom — expose the factor so the CSS clearance pads
+  // (`pl-[calc(72px/var(--sd-zoom,1))]`) stay constant in physical points.
+  document.documentElement.style.setProperty('--sd-zoom', String(factor));
   const { getCurrentWebview } = await import('@tauri-apps/api/webview');
   await getCurrentWebview().setZoom(factor);
 }
 
 export function DesktopZoomHandler() {
+  // macOS WKWebView rubber-bands the ROOT frame on trackpad scroll even when
+  // nothing overflows — inner scrollers chain to the document and the whole
+  // fixed-layout shell visibly bounces. Root-level overscroll-behavior stops
+  // the chaining. Desktop-only: browser pages should keep their native feel.
+  useEffect(() => {
+    if (!isDesktopApp()) return;
+    document.documentElement.style.overscrollBehavior = 'none';
+    document.body.style.overscrollBehavior = 'none';
+  }, []);
   useEffect(() => {
     if (!isDesktopApp() || !('__TAURI_INTERNALS__' in window)) return;
     if (storedZoom() !== 1) void applyZoom(storedZoom());

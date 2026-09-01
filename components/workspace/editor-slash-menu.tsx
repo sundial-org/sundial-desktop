@@ -9,6 +9,7 @@ import {
   CheckSquareIcon,
   CodeBlockIcon,
   ImageSquareIcon,
+  ImagesSquareIcon,
   InfoIcon,
   ListBulletsIcon,
   ListNumbersIcon,
@@ -47,6 +48,7 @@ const ICONS: Record<string, Icon> = {
   math: MathOperationsIcon,
   table: TableIcon,
   image: ImageSquareIcon,
+  'image-gen': ImagesSquareIcon,
   sparkle: SparkleIcon,
   divider: MinusIcon,
 };
@@ -68,12 +70,15 @@ export function EditorSlashMenu({
   editor,
   pickImage,
   askSunny,
+  generateImage,
 }: {
   editor: Editor;
   /** Present only when the surface can upload images (onImageDrop wired). */
   pickImage?: () => void;
   /** Present only when the surface can route "/ai …" to the agent. */
   askSunny?: SlashItemContext['askSunny'];
+  /** Present only when the surface can AI-generate images at the caret. */
+  generateImage?: SlashItemContext['generateImage'];
 }) {
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [index, setIndex] = useState(0);
@@ -89,6 +94,8 @@ export function EditorSlashMenu({
   pickImageRef.current = pickImage;
   const askSunnyRef = useRef(askSunny);
   askSunnyRef.current = askSunny;
+  const generateImageRef = useRef(generateImage);
+  generateImageRef.current = generateImage;
 
   useEffect(() => {
     if (!editor || editor.isDestroyed) return;
@@ -124,9 +131,16 @@ export function EditorSlashMenu({
         filterSlashItems(SLASH_ITEMS, query, {
           hasImageUpload: !!pickImageRef.current,
           hasAskSunny: !!askSunnyRef.current,
+          hasGenerateImage: !!generateImageRef.current,
         }),
       command: ({ editor: e, range, props: item }) =>
-        item.run({ editor: e, range, pickImage: pickImageRef.current, askSunny: askSunnyRef.current }),
+        item.run({
+          editor: e,
+          range,
+          pickImage: pickImageRef.current,
+          askSunny: askSunnyRef.current,
+          generateImage: generateImageRef.current,
+        }),
       allow: ({ state, range }) => editor.isEditable && allowSlashMenu(state, range.from),
       // The plugin activates POSITIONALLY — merely clicking the caret to just
       // after pre-existing text like `ls /code` would open the menu and steal

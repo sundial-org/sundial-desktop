@@ -1,3 +1,5 @@
+import { appendPathShareTokenToUrl } from '@/lib/workspace/path-share-token-client';
+
 /** True for `http(s):`, protocol-relative, or root-absolute `/…` URLs. */
 export function isAbsoluteImageSrc(src: string): boolean {
   return /^([a-z][a-z0-9+.-]*:|\/\/|\/)/i.test(src);
@@ -29,9 +31,15 @@ export function resolveWorkspaceImageSrc(src: string, workspaceId?: string | nul
   if (localImageSource && localImageSource.projectId === workspaceId) {
     return localImageSource.toUrl(trimmed);
   }
-  return `/api/workspace/files/preview?projectId=${encodeURIComponent(
-    workspaceId,
-  )}&path=${encodeURIComponent(trimmed)}`;
+  // `appendPathShareTokenToUrl` is a no-op except for path-share guests, whose
+  // only credential is the sticky ?pshare= token (img requests carry no
+  // headers). `unresolveWorkspaceImageSrc` strips the whole query on paste, so
+  // the token never bakes into a stored doc.
+  return appendPathShareTokenToUrl(
+    `/api/workspace/files/preview?projectId=${encodeURIComponent(
+      workspaceId,
+    )}&path=${encodeURIComponent(trimmed)}`,
+  );
 }
 
 /**

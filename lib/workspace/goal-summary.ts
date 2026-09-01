@@ -66,8 +66,16 @@ export async function nameChatFromFirstMessage(
 ): Promise<void> {
   const naming = await generateChatNaming(firstMessage);
   const title = naming?.title ?? deriveChatTitle(firstMessage);
-  await supabase.from('chats').update({ title }).eq('id', chatId).is('title', null);
-  if (naming?.goalSummary) {
+  const { data: won } = await supabase
+    .from('chats')
+    .update({ title })
+    .eq('id', chatId)
+    .is('title', null)
+    .select('id');
+  // The summary rides the SAME race outcome as the title: a naming call that
+  // lost the CAS (user rename, or a duplicate call) must not overwrite the
+  // winner's goal_summary with a later turn's.
+  if (naming?.goalSummary && won?.length) {
     // Separate write: chats.goal_summary may not be migrated yet, and its
     // missing-column error must not take the title update down with it.
     await supabase.from('chats').update({ goal_summary: naming.goalSummary }).eq('id', chatId);

@@ -2,30 +2,37 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { CheckCircleIcon, CircleIcon } from '@phosphor-icons/react';
-import { sidecar, type SidecarConfig } from '@/lib/local/sidecar';
+import type { SidecarConfig } from '@/lib/local/sidecar';
+import type { ChecklistSteps } from '@/lib/user/checklist-steps';
 
 /**
- * First-run "Get set up" checklist for the desktop app, pinned bottom-left in
- * a local project. Device-local (localStorage) and signal-driven: no plumbing
- * into the workspace monolith — it watches the sidecar for the things it
- * teaches. "Create your first file" completes when the project's file count
- * rises above the baseline captured on first sight (so a starter pack's
- * seeded files never auto-complete it); "Ask Sunny" when any local chat has a
- * message. Dismissed or completed, it never comes back on this device.
+ * The "Get set up" checklist — now a Settings tab (it used to dock in the
+ * sidebar above the footer; founders deprecated that in favor of the
+ * "Open with …" row, so the checklist survives as an on-demand surface).
+ *
+ * Completion is signal-driven, never self-reported: the steps poll
+ * GET /api/user/checklist, which derives them from rows the product already
+ * writes (see lib/user/checklist.ts). Signals merge into localStorage
+ * monotonically (false→true only), so a done step stays done offline and
+ * signed out. All-done renders as a completed list, not a blank tab.
  */
 
 const STORAGE_KEY = 'sundial:get-set-up:v1';
-const POLL_MS = 8000;
+// The endpoint fans out into several DB exists-checks — poll gently.
+const POLL_MS = 60_000;
 
-type ChecklistState = {
-  dismissed: boolean;
-  file: boolean;
-  askedAi: boolean;
-  /** Per-project file-count baselines, captured on first sight. */
-  baselines: Record<string, number>;
+const STEP_KEYS = ['project', 'agentEdit', 'commented', 'commentReply', 'shared'] as const;
+
+type StepKey = (typeof STEP_KEYS)[number];
+type ChecklistState = Record<StepKey, boolean>;
+
+const EMPTY: ChecklistState = {
+  project: false,
+  agentEdit: false,
+  commented: false,
+  commentReply: false,
+  shared: false,
 };
-
-const EMPTY: ChecklistState = { dismissed: false, file: false, askedAi: false, baselines: {} };
 
 function load(): ChecklistState {
   try {
@@ -33,10 +40,8 @@ function load(): ChecklistState {
     if (!raw) return EMPTY;
     const parsed = JSON.parse(raw) as Partial<ChecklistState>;
     return {
-      dismissed: Boolean(parsed.dismissed),
-      file: Boolean(parsed.file),
-      askedAi: Boolean(parsed.askedAi),
-      baselines: parsed.baselines && typeof parsed.baselines === 'object' ? parsed.baselines : {},
+      ...EMPTY,
+      ...Object.fromEntries(STEP_KEYS.map((key) => [key, Boolean(parsed[key])])),
     };
   } catch {
     return EMPTY;
@@ -45,68 +50,76 @@ function load(): ChecklistState {
 
 function save(state: ChecklistState) {
   try {
+    // Spread over the stored raw value so legacy keys (minimized/dismissed)
+    // don't resurrect; only the step bits matter now.
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   } catch {
     /* private mode — the card degrades to per-session */
   }
 }
 
-function Step({ done, label, hint }: { done: boolean; label: string; hint?: string }) {
+function allDone(state: ChecklistState, inProject: boolean) {
+  return STEP_KEYS.every((key) => state[key] || (key === 'project' && inProject));
+}
+
+function Step({ done, label, detail }: { done: boolean; label: string; detail: string }) {
   return (
-    <li className="flex items-center gap-2 text-sm">
+    <li className="flex items-start gap-2.5">
       {done ? (
-        <CheckCircleIcon className="h-4.5 w-4.5 shrink-0 text-emerald-600" weight="fill" aria-hidden />
+        <CheckCircleIcon className="mt-px h-4.5 w-4.5 shrink-0 text-emerald-600" weight="fill" aria-hidden />
       ) : (
-        <CircleIcon className="h-4.5 w-4.5 shrink-0 text-stone-300" aria-hidden />
+        <CircleIcon className="mt-px h-4.5 w-4.5 shrink-0 text-stone-300" aria-hidden />
       )}
-      <span className={done ? 'text-stone-400 line-through decoration-stone-300' : 'text-stone-700'}>{label}</span>
-      {hint && !done && (
-        <kbd className="ml-auto rounded border border-stone-200 bg-stone-50 px-1.5 py-0.5 font-sans text-[10px] text-stone-500">
-          {hint}
-        </kbd>
-      )}
+      <span className="min-w-0">
+        <span
+          className={`block text-sm ${done ? 'text-stone-400 line-through decoration-stone-300' : 'text-stone-700'}`}
+        >
+          {label}
+        </span>
+        {done ? null : <span className="block text-xs text-stone-400">{detail}</span>}
+      </span>
     </li>
   );
 }
 
-export function GetSetUpCard({ config, projectId }: { config: SidecarConfig; projectId: string }) {
+export function GetSetUpCard({
+  config,
+  projectId,
+}: {
+  config?: SidecarConfig | null;
+  projectId?: string | null;
+}) {
   const [state, setState] = useState<ChecklistState | null>(null);
-  useEffect(() => setState(load()), []);
-
-  const active = state !== null && !state.dismissed && !(state.file && state.askedAi);
-
-  // Watch the sidecar for completion signals while any step is open.
   useEffect(() => {
-    if (!state || state.dismissed || (state.file && state.askedAi)) return;
+    setState(load());
+  }, []);
+
+  // Rendering inside a project IS the first step — don't wait for the cloud
+  // round-trip to confirm what the surface already proves.
+  const inProject = Boolean(config && projectId);
+  const done = state !== null && allDone(state, inProject);
+
+  // Poll the checklist while any step is open, merging monotonically — a
+  // poll can only complete steps. Signed out (or with stale parked desktop
+  // credentials) the fetch 401s and is ignored.
+  useEffect(() => {
+    if (!state || allDone(state, inProject)) return;
     let cancelled = false;
     const tick = async () => {
       try {
-        const next = { ...state, baselines: { ...state.baselines } };
-        let changed = false;
-        if (!next.file) {
-          const { files } = await sidecar.listFiles(config, projectId);
-          const count = files.filter((file) => file.type !== 'folder').length;
-          if (!(projectId in next.baselines)) {
-            next.baselines[projectId] = count;
-            changed = true;
-          } else if (count > next.baselines[projectId]) {
-            next.file = true;
-            changed = true;
-          }
-        }
-        if (!next.askedAi) {
-          const { chats } = await sidecar.listChats(config, projectId);
-          if (chats.some((chat) => chat.last_message_at !== null)) {
-            next.askedAi = true;
-            changed = true;
-          }
-        }
-        if (changed && !cancelled) {
+        const res = await fetch('/api/user/checklist');
+        if (!res.ok || cancelled) return;
+        const { steps } = (await res.json()) as { steps: ChecklistSteps };
+        setState((current) => {
+          if (!current) return current;
+          const next = { ...current };
+          for (const key of STEP_KEYS) if (steps[key]) next[key] = true;
+          if (STEP_KEYS.every((key) => next[key] === current[key])) return current;
           save(next);
-          setState(next);
-        }
+          return next;
+        });
       } catch {
-        /* sidecar hiccup — try again next tick */
+        /* offline — try again next tick */
       }
     };
     void tick();
@@ -115,43 +128,53 @@ export function GetSetUpCard({ config, projectId }: { config: SidecarConfig; pro
       cancelled = true;
       clearInterval(timer);
     };
-  }, [state, config, projectId]);
+  }, [state, inProject]);
 
   const doneCount = useMemo(
-    () => (state ? 1 + Number(state.file) + Number(state.askedAi) : 1),
-    [state],
+    () =>
+      state ? STEP_KEYS.filter((key) => state[key] || (key === 'project' && inProject)).length : 0,
+    [state, inProject],
   );
 
-  if (!active || !state) return null;
+  if (!state) return null;
 
   return (
     <aside
-      className="fixed bottom-4 left-4 z-40 w-64 rounded-xl border border-stone-200 bg-white p-4 shadow-lg"
+      className="w-full rounded-xl border border-stone-200 bg-white p-3"
       data-testid="get-set-up-card"
     >
-      <div className="mb-3 flex items-baseline justify-between">
+      <div className="flex items-baseline justify-between">
         <span className="text-sm font-semibold text-stone-800">Get set up</span>
-        <span className="font-mono text-xs text-stone-400">{doneCount}/3</span>
+        <span className="font-mono text-xs text-stone-400">
+          {doneCount}/{STEP_KEYS.length}
+        </span>
+      </div>
+      <div className="mb-3 mt-2 h-1 overflow-hidden rounded-full bg-stone-100" aria-hidden>
+        <div
+          className="h-full rounded-full bg-emerald-500 transition-[width]"
+          style={{ width: `${(doneCount / STEP_KEYS.length) * 100}%` }}
+        />
       </div>
       <ul className="flex flex-col gap-2.5">
-        <Step done label="Create your first project" />
-        <Step done={state.file} label="Create your first file" hint="⌘N" />
-        <Step done={state.askedAi} label="Ask Sunny" hint="⌘J" />
+        <Step
+          done={state.project || inProject}
+          label="Create a project"
+          detail="Start a workspace for your docs"
+        />
+        <Step done={state.agentEdit} label="Agent edits a file" detail="Ask Sunny to change something" />
+        <Step done={state.commented} label="Make a comment" detail="Highlight text and comment" />
+        <Step
+          done={state.commentReply}
+          label="Agent responds to a comment"
+          detail="Sunny replies in the thread"
+        />
+        <Step done={state.shared} label="Share a workspace or file" detail="Invite someone or copy a link" />
       </ul>
-      <div className="mt-3 flex justify-end">
-        <button
-          type="button"
-          className="text-xs text-stone-400 hover:text-stone-600"
-          onClick={() => {
-            const next = { ...state, dismissed: true };
-            save(next);
-            setState(next);
-          }}
-          data-testid="get-set-up-dismiss"
-        >
-          Dismiss
-        </button>
-      </div>
+      {done ? (
+        <p className="mt-3 text-xs text-emerald-700" data-testid="get-set-up-done">
+          All set: you&apos;ve tried everything.
+        </p>
+      ) : null}
     </aside>
   );
 }

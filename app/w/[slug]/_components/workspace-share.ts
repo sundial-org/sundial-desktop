@@ -1,19 +1,29 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { LINK_INVITE_EMAIL } from '@/lib/workspace/invites';
 import { buildWorkspacePath } from '@/lib/workspace/paths';
 import type { WorkspaceKind } from '@/lib/workspace/kinds';
 import { track } from '@/lib/analytics/track';
-import { isDesktopApp } from '@/lib/desktop';
+import { isSidecarServedOrigin } from '@/lib/local/sidecar';
+import { withPathShareToken } from '@/lib/workspace/path-share-token-client';
 import { SITE_URL } from '@/lib/seo';
 
-/** Origin for links handed to collaborators. In the packaged desktop shell
- *  window.location.origin is the loopback proxy — useless off this machine —
- *  so shareable links must use the public site origin instead. */
-export const shareOrigin = () => (isDesktopApp() ? SITE_URL : window.location.origin);
+/** Origin for links handed to collaborators: the origin the page is ACTUALLY
+ *  served from, so a link always points at the deployment (or dev port) the
+ *  user is on. The one exception is the packaged desktop shell's loopback
+ *  proxy — that origin means nothing off this machine, so it falls back to
+ *  the public site. Keying on "is this page sidecar-served" rather than "is
+ *  this the desktop app" is what keeps a desktop build pointed at a dev
+ *  server from minting links for some other worktree's port. */
+export const shareOrigin = () => (isSidecarServedOrigin() ? SITE_URL : window.location.origin);
 
-type WorkspaceRouteId = string | { id: string; public_id: string | null };
+import type { WorkspaceRouteInput } from '@/lib/workspace/public-ids';
+
+// The page's own route id, `local` flag included — these hooks forward it
+// straight to buildWorkspacePath, which is what keeps a local project's
+// links and redirects off the cloud `/w/` route.
+type WorkspaceRouteId = WorkspaceRouteInput;
 type RouterLike = {
   push(href: string): void;
 };
@@ -54,15 +64,154 @@ export type ShareMember = {
   imageUrl: string | null;
 };
 
+/** The workspace-root grant: "anyone with the link" as a `path_shares` row.
+ *  Tokened rows carry the capability in the ?pshare= URL (`id`/`url` are
+ *  owner-only in the payload); TOKENLESS rows (converted legacy-public) mean
+ *  the bare /w/<id> URL grants `role`, so `url` is served to every reader. */
+export type ShareLinkShare = { id?: string; role: 'view' | 'suggest' | 'edit'; url?: string };
+
 export type ShareInfo = {
-  visibility: 'private' | 'public';
-  publicAccess: 'view' | 'suggest' | 'edit' | 'none';
+  /** Root grant, or null — the single link-sharing lane. */
+  linkShare?: ShareLinkShare | null;
   isOwner: boolean;
   canInvite: boolean;
   organization: ShareOrganization | null;
+  /** The workspace belongs to an org with someone else in it: every one of
+   *  them already has access (editor for owners/admins, viewer for members)
+   *  without appearing in `members`. */
+  orgAudience?: boolean;
+  /** A signed-in chat participant beyond the owner: getProjectAccess grants
+   *  them workspace-wide read with no project_members row. */
+  chatAudience?: boolean;
   members: ShareMember[];
   invites: ShareInvite[];
 };
+
+export const isLinkSharedInfo = (info: ShareInfo | null): boolean => Boolean(info?.linkShare);
+
+/** Named people who can get in regardless of any link: members beyond the
+ *  owner, invites someone can still redeem (/invite/<token> rejects expired
+ *  ones, and an accepted EMAIL invite is already counted as a member —
+ *  reusable copy-link invites keep granting after their first acceptance),
+ *  an org audience, or a chat participant. */
+export const workspacePeopleAudience = (info: ShareInfo | null): boolean => {
+  if (!info) return false;
+  const liveInvites = (info.invites ?? []).filter(
+    (invite) =>
+      Date.parse(invite.expires_at ?? '') >= Date.now() &&
+      (invite.accepted_at === null || !invite.email || invite.email === LINK_INVITE_EMAIL),
+  );
+  return (
+    (info.members?.length ?? 0) > 1 ||
+    liveInvites.length > 0 ||
+    Boolean(info.orgAudience) ||
+    Boolean(info.chatAudience)
+  );
+};
+
+/** ANY audience at all — a live link lane or named people. */
+export const shareInfoHasAudience = (info: ShareInfo | null): boolean =>
+  isLinkSharedInfo(info) || workspacePeopleAudience(info);
+
+/** The raw /api/workspace/share payload, normalized. */
+export function parseShareInfoPayload(payload: {
+  linkShare?: ShareLinkShare | null;
+  isOwner?: boolean;
+  canInvite?: boolean;
+  organization?: ShareOrganization | null;
+  orgAudience?: boolean;
+  chatAudience?: boolean;
+  members?: ShareMember[];
+  invites?: ShareInvite[];
+}): ShareInfo {
+  return {
+    linkShare: payload.linkShare ?? null,
+    isOwner: payload.isOwner ?? false,
+    canInvite: payload.canInvite ?? payload.isOwner ?? false,
+    organization: payload.organization ?? null,
+    orgAudience: payload.orgAudience ?? false,
+    chatAudience: payload.chatAudience ?? false,
+    members: payload.members ?? [],
+    invites: payload.invites ?? [],
+  };
+}
+
+/** An invite expires on a wall clock, not on a render: without this a tab
+ *  left open past `expires_at` keeps reporting an audience /invite/<token>
+ *  now refuses. One timer armed at the NEAREST future expiry per snapshot —
+ *  not a poll (setTimeout truncates past ~24.8 days, so far-off expiries
+ *  re-arm daily). Returns a tick to depend on wherever the audience is
+ *  derived. */
+function useInviteExpiryTick(invites: readonly ShareInvite[] | undefined): number {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const now = Date.now();
+    const next = Math.min(
+      ...(invites ?? [])
+        .map((invite) => Date.parse(invite.expires_at ?? ''))
+        .filter((at) => Number.isFinite(at) && at > now),
+    );
+    if (!Number.isFinite(next)) return;
+    const timer = setTimeout(() => setTick((value) => value + 1), Math.min(next - now + 1, 86_400_000));
+    return () => clearTimeout(timer);
+  }, [invites, tick]);
+  return tick;
+}
+
+/** Whether `projectId`'s workspace grants ANYONE access (link lane or named
+ *  people), read from /api/workspace/share. `audience` is null until an
+ *  authoritative read lands — a 403/5xx/network failure must not flip badges
+ *  built on it. `lane` says WHICH lane grants it ('link' wins when both are
+ *  on, matching cloud icon semantics; null while unauthoritative or when
+ *  there is no audience) so local scopes can show the globe, not always the
+ *  people icon. Read-only companion to useWorkspaceShare for surfaces (the
+ *  local header's backing workspace) that only need the predicate. */
+export function useWorkspaceAudienceProbe(projectId: string | null) {
+  // The parsed payload, not just the boolean: the predicate re-evaluates as
+  // the last invite's expires_at passes, which needs the expiries in scope.
+  const [info, setInfo] = useState<ShareInfo | null>(null);
+  const seqRef = useRef(0);
+  const refresh = useCallback(async () => {
+    if (!projectId) return;
+    const seq = ++seqRef.current;
+    try {
+      const res = await fetch(`/api/workspace/share?projectId=${encodeURIComponent(projectId)}`);
+      if (seq !== seqRef.current) return;
+      if (!res.ok) {
+        setInfo(null);
+        return;
+      }
+      const payload = (await res.json()) as Parameters<typeof parseShareInfoPayload>[0];
+      if (seq !== seqRef.current) return;
+      setInfo(parseShareInfoPayload(payload));
+    } catch {
+      if (seq === seqRef.current) setInfo(null);
+    }
+  }, [projectId]);
+  useEffect(() => {
+    // Workspace switch: the previous workspace's audience must not answer
+    // for this one while the new read is in flight.
+    seqRef.current += 1;
+    setInfo(null);
+    if (projectId) void refresh();
+  }, [projectId, refresh]);
+  const expiryTick = useInviteExpiryTick(info?.invites);
+  const { audience, lane } = useMemo<{ audience: boolean | null; lane: 'link' | 'members' | null }>(() => {
+    void expiryTick; // re-evaluated when an invite's expiry passes
+    if (!info) return { audience: null, lane: null };
+    return {
+      audience: shareInfoHasAudience(info),
+      lane: isLinkSharedInfo(info) ? 'link' : workspacePeopleAudience(info) ? 'members' : null,
+    };
+  }, [info, expiryTick]);
+  return { audience, lane, refresh };
+}
+
+/** A URL this CALLER can hand out. A tokened root share read by a non-owner
+ *  has none — the bare URL grants nothing, so copying it would silently hand
+ *  out a dead link. */
+export const hasCopyableShareLink = (info: ShareInfo | null): boolean =>
+  Boolean(info?.linkShare?.url);
 
 export function useWorkspaceShare({
   projectId,
@@ -72,6 +221,8 @@ export function useWorkspaceShare({
   user,
   router,
   openSignIn,
+  mintScopeGeneration,
+  eagerLoad = true,
 }: {
   projectId: string;
   projectKind: WorkspaceKind | null;
@@ -80,6 +231,13 @@ export function useWorkspaceShare({
   user: WorkspaceUser;
   router: RouterLike;
   openSignIn: (options?: { redirectUrl?: string }) => void;
+  /** Local project shares (PR #1033): the sidecar scope generation to stamp
+   *  on invite mints — the route gates them against the root revocation
+   *  watermark so a stop's revoke wins even if this tab dies mid-flight. */
+  mintScopeGeneration?: () => number | null;
+  /** Defer the status/badge read until the document-first shell has painted.
+   * Opening the modal still loads immediately regardless of this flag. */
+  eagerLoad?: boolean;
 }) {
   const [showShareModal, setShowShareModal] = useState(false);
   const [shareInfo, setShareInfo] = useState<ShareInfo | null>(null);
@@ -107,39 +265,40 @@ export function useWorkspaceShare({
     [shareInfo?.invites],
   );
 
-  const shareStatus = useMemo(() => {
-    if (!shareInfo) return 'private';
-    if (shareInfo.visibility === 'public' && shareInfo.publicAccess !== 'none') return 'public';
-    if ((shareInfo.members?.length ?? 0) > 1 || (shareInfo.invites?.length ?? 0) > 0) return 'shared';
-    return 'private';
-  }, [shareInfo]);
+  const expiryTick = useInviteExpiryTick(shareInfo?.invites);
 
+  // Independent of `shareStatus`, which collapses to 'public' when a link is
+  // ALSO on — this predicate must not vanish then.
+  const workspaceAudience = useMemo<boolean>(() => {
+    void expiryTick; // re-evaluated when an invite's expiry passes
+    return workspacePeopleAudience(shareInfo);
+  }, [shareInfo, expiryTick]);
+  const shareStatus: 'private' | 'shared' | 'public' = isLinkSharedInfo(shareInfo)
+    ? 'public'
+    : workspaceAudience
+      ? 'shared'
+      : 'private';
+
+  // Only the LATEST load may write state. A fetch started before a mutation
+  // can land after the refetch that follows it and roll the modal back to the
+  // pre-mutation state (this is how a fresh link share bounced to Restricted).
+  const loadSeqRef = useRef(0);
   const loadShareInfo = useCallback(async () => {
     if (!projectId || projectKind === null) return;
+    const seq = ++loadSeqRef.current;
     setShareError('');
     try {
-      const res = await fetch(`/api/workspace/share?projectId=${projectId}`);
+      // Token-forwarding: a root ?pshare= guest's ONLY credential is the
+      // link token — without it this read 403s and the share UI errors out.
+      const res = await withPathShareToken(fetch)(`/api/workspace/share?projectId=${projectId}`);
+      if (seq !== loadSeqRef.current) return;
       if (!res.ok) {
         setShareError('Unable to load sharing settings.');
         return;
       }
-      const payload = (await res.json()) as {
-        project: { visibility: 'private' | 'public'; publicAccess?: 'view' | 'suggest' | 'edit' | 'none' };
-        isOwner: boolean;
-        canInvite?: boolean;
-        organization?: ShareOrganization | null;
-        members: ShareMember[];
-        invites: ShareInvite[];
-      };
-      setShareInfo({
-        visibility: payload.project.visibility,
-        publicAccess: payload.project.publicAccess ?? 'edit',
-        isOwner: payload.isOwner,
-        canInvite: payload.canInvite ?? payload.isOwner,
-        organization: payload.organization ?? null,
-        members: payload.members ?? [],
-        invites: payload.invites ?? [],
-      });
+      const payload = (await res.json()) as Parameters<typeof parseShareInfoPayload>[0];
+      if (seq !== loadSeqRef.current) return;
+      setShareInfo(parseShareInfoPayload(payload));
     } finally {
       // no-op
     }
@@ -150,10 +309,15 @@ export function useWorkspaceShare({
     void loadShareInfo();
   }, [showShareModal, loadShareInfo]);
 
+  // A client-side workspace switch keeps this hook mounted: the previous
+  // workspace's sharing must not read as this one's (and an in-flight load
+  // for it must not land) while the new read is out.
   useEffect(() => {
-    if (!projectId) return;
+    loadSeqRef.current += 1;
+    setShareInfo(null);
+    if (!projectId || !eagerLoad) return;
     void loadShareInfo();
-  }, [projectId, loadShareInfo]);
+  }, [eagerLoad, projectId, loadShareInfo]);
 
   useEffect(() => {
     if (!shareDropdown) return;
@@ -185,19 +349,18 @@ export function useWorkspaceShare({
 
   const handleCreateLinkInvite = useCallback(async () => {
     if (!projectId) return;
-    // When the workspace is link-shared, the doc URL itself is the share
-    // link — no invite/login round-trip. lib/workspace/access.ts grants anon
-    // access only when visibility='public' AND public_access != 'none'. The
-    // /invite/<token> flow is only for restricted workspaces where the
-    // visitor needs to be added to project_members on accept.
-    const isEffectivelyPublic =
-      shareInfo?.visibility === 'public' && shareInfo.publicAccess !== 'none';
-    if (isEffectivelyPublic) {
+    // When the caller holds a copyable link — the root grant's ?pshare= URL
+    // (owner-only) or a tokenless share's bare doc URL — copy it directly. A
+    // non-owner on a TOKENED root share has no capability URL, so they fall
+    // through to the /invite/<token> mint below like on a restricted
+    // workspace (a bare URL would copy "successfully" and grant nothing).
+    const copyableUrl = shareInfo?.linkShare?.url;
+    if (copyableUrl) {
       setShareBusyAction('link');
       setShareError('');
       setCopyNotice('');
       try {
-        await handleCopyInvite(`${shareOrigin()}${buildWorkspacePath(workspaceRouteId)}`);
+        await handleCopyInvite(copyableUrl);
       } catch {
         setShareBusyAction(null);
       }
@@ -219,6 +382,7 @@ export function useWorkspaceShare({
         await handleCopyInvite(`${shareOrigin()}/invite/${existingInvite.token}`);
         return;
       }
+      const generation = mintScopeGeneration?.() ?? null;
       const res = await fetch('/api/workspace/share', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -226,6 +390,7 @@ export function useWorkspaceShare({
           projectId,
           role: linkRole,
           ...(currentChatId ? { chatId: currentChatId } : {}),
+          ...(generation != null ? { scopeGeneration: generation } : {}),
         }),
       });
       if (!res.ok) {
@@ -239,7 +404,7 @@ export function useWorkspaceShare({
     } catch {
       setShareBusyAction(null);
     }
-  }, [canInviteShare, currentChatId, handleCopyInvite, linkRole, loadShareInfo, projectId, shareInfo?.invites, shareInfo?.publicAccess, shareInfo?.visibility, workspaceRouteId]);
+  }, [canInviteShare, currentChatId, handleCopyInvite, linkRole, loadShareInfo, mintScopeGeneration, projectId, shareInfo]);
 
   const handleCreateEmailInvite = useCallback(async () => {
     if (!projectId || !canInviteShare) return;
@@ -252,6 +417,7 @@ export function useWorkspaceShare({
     setShareError('');
     setCopyNotice('');
     try {
+      const generation = mintScopeGeneration?.() ?? null;
       const res = await fetch('/api/workspace/share', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -260,6 +426,7 @@ export function useWorkspaceShare({
           role: inviteRole,
           email: normalizedEmail,
           ...(currentChatId ? { chatId: currentChatId } : {}),
+          ...(generation != null ? { scopeGeneration: generation } : {}),
         }),
       });
       if (!res.ok) {
@@ -284,47 +451,72 @@ export function useWorkspaceShare({
     } finally {
       setShareBusyAction(null);
     }
-  }, [canInviteShare, currentChatId, inviteEmail, inviteRole, loadShareInfo, projectId]);
+  }, [canInviteShare, currentChatId, inviteEmail, inviteRole, loadShareInfo, mintScopeGeneration, projectId]);
 
   const handleVisibilityChange = useCallback(
     async (visibility: 'private' | 'public') => {
       if (!projectId || !shareInfo?.isOwner) return;
+      if (visibility === 'public' && isLinkSharedInfo(shareInfo)) return; // already on
       setShareBusyAction(visibility === 'private' ? 'visibility-private' : 'visibility-public');
       setShareError('');
       try {
-        // Turning link sharing ON always starts at Viewer: a restricted
-        // workspace may hold a latent public_access='edit' (the old DB
-        // default) the owner never chose, and 'none' would leave the link
-        // useless. Re-selecting "Anyone with the link" while already shared
-        // keeps the chosen role.
-        const wasLinkShared = shareInfo.visibility === 'public' && shareInfo.publicAccess !== 'none';
-        const grantView = visibility === 'public' && !wasLinkShared;
-        const res = await fetch('/api/workspace/share', {
-          method: 'PATCH',
+        if (visibility === 'public') {
+          // Link sharing ON mints the workspace-ROOT grant: its own token +
+          // role (Viewer to start), so the bare /w/<id> URL grants nothing
+          // and per-path links stay independent. Local project shares stamp
+          // the scope generation so the watermark gate can refuse a mint
+          // that lost to a stop (PR #1033).
+          const generation = mintScopeGeneration?.() ?? null;
+          const res = await fetch('/api/workspace/path-shares', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              projectId,
+              scope: 'workspace',
+              linkRole: 'view',
+              ...(generation != null ? { scopeGeneration: generation } : {}),
+            }),
+          });
+          const payload = (await res.json().catch(() => null)) as {
+            share?: { id: string; linkRole: 'view' | 'suggest' | 'edit' | null; linkUrl: string | null };
+          } | null;
+          if (!res.ok || !payload?.share?.linkUrl) {
+            setShareError('Unable to update visibility.');
+            return;
+          }
+          const linkShare = {
+            id: payload.share.id,
+            role: payload.share.linkRole ?? ('view' as const),
+            url: payload.share.linkUrl,
+          };
+          setShareInfo((prev) => (prev ? { ...prev, linkShare } : prev));
+          return;
+        }
+        // Restricted = revoke the root grant (tokened or tokenless; revoking
+        // a tokened one also rotates its secret).
+        // Local shares ≤-scope the delete to this modal's generation (no
+        // watermark raise — not a stop): a stale modal can never delete a
+        // re-added scope's newer link, while re-enabling here keeps working.
+        const generation = mintScopeGeneration?.() ?? null;
+        const revoke = await fetch('/api/workspace/path-shares', {
+          method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ projectId, visibility, ...(grantView ? { publicAccess: 'view' } : {}) }),
+          body: JSON.stringify({
+            projectId,
+            scope: 'workspace',
+            ...(generation != null ? { maxGeneration: generation } : {}),
+          }),
         });
-        if (!res.ok) {
+        if (!revoke.ok) {
           setShareError('Unable to update visibility.');
           return;
         }
-        const payload = (await res.json()) as {
-          project: { visibility: 'private' | 'public'; publicAccess: 'view' | 'suggest' | 'edit' | 'none' };
-        };
-        setShareInfo((prev) =>
-          prev
-            ? {
-                ...prev,
-                visibility: payload.project.visibility,
-                publicAccess: payload.project.publicAccess,
-              }
-            : prev,
-        );
+        setShareInfo((prev) => (prev ? { ...prev, linkShare: null } : prev));
       } finally {
         setShareBusyAction(null);
       }
     },
-    [projectId, shareInfo?.isOwner, shareInfo?.publicAccess, shareInfo?.visibility],
+    [mintScopeGeneration, projectId, shareInfo],
   );
 
   const handlePublicAccessChange = useCallback(
@@ -333,23 +525,54 @@ export function useWorkspaceShare({
       setShareBusyAction(`public-access-${publicAccess}`);
       setShareError('');
       try {
-        const res = await fetch('/api/workspace/share', {
+        // The role lives on the grant row (token — or its absence — stable).
+        // `id` is manager-only in the payload; owners always have it.
+        const linkShare = shareInfo.linkShare;
+        if (!linkShare?.id || publicAccess === 'none') return;
+        // Local project shares stamp the scope generation here too: the row
+        // id is REUSED across a stop + re-add, so without it a stale window
+        // could widen the re-added link's role (Codex P1 round 27). The
+        // route predicates the update on it and 409s the stale side.
+        const generation = mintScopeGeneration?.() ?? null;
+        const res = await fetch('/api/workspace/path-shares', {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ projectId, publicAccess }),
+          body: JSON.stringify({
+            projectId,
+            shareId: linkShare.id,
+            linkRole: publicAccess,
+            ...(generation != null ? { scopeGeneration: generation } : {}),
+          }),
         });
         if (!res.ok) {
-          setShareError('Unable to update public access.');
+          setShareError(
+            res.status === 409
+              ? 'Sharing changed in another window. Reload and try again.'
+              : 'Unable to update public access.',
+          );
           return;
         }
-        const payload = (await res.json()) as { project: { publicAccess: 'view' | 'suggest' | 'edit' | 'none' } };
-        setShareInfo((prev) => (prev ? { ...prev, publicAccess: payload.project.publicAccess } : prev));
+        setShareInfo((prev) => (prev ? { ...prev, linkShare: { ...linkShare, role: publicAccess } } : prev));
       } finally {
         setShareBusyAction(null);
       }
     },
-    [projectId, shareInfo?.isOwner],
+    [mintScopeGeneration, projectId, shareInfo],
   );
+
+  /** Local project shares: the workspace ACL IS the scope's audience, and its
+   *  members/invites are addressed by id — ids a stop + re-add hands straight
+   *  back to a stale window. Stamping this modal's generation lets the route
+   *  refuse those mutations once a stop's watermark covers it, instead of
+   *  letting them land on the re-added share's people (Codex P2 round 28). */
+  const aclBody = useCallback(
+    (fields: Record<string, unknown>) => {
+      const generation = mintScopeGeneration?.() ?? null;
+      return JSON.stringify(generation != null ? { ...fields, scopeGeneration: generation } : fields);
+    },
+    [mintScopeGeneration],
+  );
+  const staleAcl = 'Sharing changed in another window. Reload and try again.';
 
   const handleUpdateMemberRole = useCallback(
     async (memberId: string, role: 'editor' | 'commenter' | 'viewer') => {
@@ -360,10 +583,10 @@ export function useWorkspaceShare({
         const res = await fetch('/api/workspace/share', {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ projectId, memberId, role }),
+          body: aclBody({ projectId, memberId, role }),
         });
         if (!res.ok) {
-          setShareError('Unable to update permissions.');
+          setShareError(res.status === 409 ? staleAcl : 'Unable to update permissions.');
           return;
         }
         await loadShareInfo();
@@ -371,7 +594,7 @@ export function useWorkspaceShare({
         setShareBusyAction(null);
       }
     },
-    [loadShareInfo, projectId, shareInfo?.isOwner],
+    [aclBody, loadShareInfo, projectId, shareInfo?.isOwner],
   );
 
   const handleRemoveMember = useCallback(
@@ -383,10 +606,10 @@ export function useWorkspaceShare({
         const res = await fetch('/api/workspace/share', {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ projectId, memberId }),
+          body: aclBody({ projectId, memberId }),
         });
         if (!res.ok) {
-          setShareError('Unable to revoke access.');
+          setShareError(res.status === 409 ? staleAcl : 'Unable to revoke access.');
           return;
         }
         await loadShareInfo();
@@ -394,7 +617,7 @@ export function useWorkspaceShare({
         setShareBusyAction(null);
       }
     },
-    [loadShareInfo, projectId, shareInfo?.isOwner],
+    [aclBody, loadShareInfo, projectId, shareInfo?.isOwner],
   );
 
   const handleResendShareInvite = useCallback(
@@ -407,9 +630,15 @@ export function useWorkspaceShare({
         const res = await fetch('/api/workspace/share', {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ projectId, inviteId }),
+          // A resend repeats the SAME link (the one already in the recipient's
+          // inbox keeps working) and pushes the expiry back another 7 days.
+          body: aclBody({ projectId, inviteId }),
         });
-        const payload = (await res.json().catch(() => null)) as { error?: string; emailSent?: boolean } | null;
+        const payload = (await res.json().catch(() => null)) as {
+          error?: string;
+          emailSent?: boolean;
+          inviteUrl?: string;
+        } | null;
         if (!res.ok) {
           setShareError(payload?.error ?? 'Unable to resend invite.');
           return;
@@ -417,15 +646,23 @@ export function useWorkspaceShare({
         if (payload?.emailSent) {
           setCopyNotice(`Invite resent to ${email}`);
           window.setTimeout(() => setCopyNotice(''), 3000);
+        } else if (payload?.inviteUrl) {
+          // THIS invite's link, which the route rides back for exactly this
+          // case. The generic Copy link control mints a different one (its own
+          // role, no email restriction), so it is not a substitute.
+          await handleCopyInvite(payload.inviteUrl);
+          setShareError(
+            `The invite for ${email} is still valid, but the email could not be sent. Its join link is on your clipboard.`,
+          );
         } else {
-          setShareError('Invite refreshed, but the email could not be sent.');
+          setShareError('The invite is still valid, but the email could not be sent.');
         }
         await loadShareInfo();
       } finally {
         setShareBusyAction(null);
       }
     },
-    [canInviteShare, loadShareInfo, projectId],
+    [aclBody, canInviteShare, handleCopyInvite, loadShareInfo, projectId],
   );
 
   const handleRevokeShareInvite = useCallback(
@@ -438,7 +675,7 @@ export function useWorkspaceShare({
         const res = await fetch('/api/workspace/share', {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ projectId, inviteId }),
+          body: aclBody({ projectId, inviteId }),
         });
         const payload = (await res.json().catch(() => null)) as { error?: string } | null;
         if (!res.ok) {
@@ -450,7 +687,7 @@ export function useWorkspaceShare({
         setShareBusyAction(null);
       }
     },
-    [canInviteShare, loadShareInfo, projectId],
+    [aclBody, canInviteShare, loadShareInfo, projectId],
   );
 
   const handleOpenTeamPermissions = useCallback(() => {
@@ -478,6 +715,7 @@ export function useWorkspaceShare({
     canShowShareControls,
     pendingEmailInvites,
     shareStatus,
+    workspaceAudience,
     loadShareInfo,
     handleOpenShare,
     handleCopyInvite,

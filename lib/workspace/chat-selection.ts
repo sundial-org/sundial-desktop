@@ -54,7 +54,12 @@ export function findPreferredWorkspaceChatIndex(
     }
   }
 
-  const pinnedChats = activeChats.filter(isPinnedChat);
+  // Un-imported external agent sessions (read-only Claude Code / Codex
+  // transcripts, id `external:<agent>:<sessionId>`) never win auto-selection —
+  // only an explicit click or a stored last-chat id opens them.
+  const realChats = activeChats.filter((chat) => !chat.id.startsWith('external:'));
+
+  const pinnedChats = realChats.filter(isPinnedChat);
   // Match the pinned section in the workspace sidebar: most recently active
   // pinned chats appear first, with later chat rows winning ties.
   const preferredPinnedChat = pickFirstSidebarChat(pinnedChats);
@@ -62,5 +67,5 @@ export function findPreferredWorkspaceChatIndex(
     return preferredPinnedChat.index;
   }
 
-  return pickFirstSidebarChat(activeChats)?.index ?? -1;
+  return pickFirstSidebarChat(realChats)?.index ?? -1;
 }

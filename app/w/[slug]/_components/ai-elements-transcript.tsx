@@ -21,6 +21,7 @@ import {
   MessageResponse,
 } from '@/components/ai-elements/message';
 import { useSmoothStreamedText } from '@/components/ai-elements/use-smooth-text';
+import { SpinnerSlot } from '@/components/ai-elements/sunny-spinner';
 import { ToolInput, ToolOutput } from '@/components/ai-elements/tool';
 import {
   Collapsible,
@@ -31,11 +32,21 @@ import {
   Reasoning,
   ReasoningContent,
   ReasoningTrigger,
+  useReasoning,
 } from '@/components/ai-elements/reasoning';
 import { TurnEditsCard } from '@/components/workspace/turn-edits-card';
+import { isChunkLoadError, reloadPage } from '@/lib/workspace/chunk-load-error';
 import { CopyLinkButton } from '@/components/workspace/copy-link-button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { ChatCircleIcon, GitDiffIcon, ReceiptIcon } from '@phosphor-icons/react';
+import { IconTooltip } from '@/components/collab-bubbles';
 import { WikiLinkInline } from '@/components/workspace/wiki-link-inline';
 import { textHasWikiLinks } from '@/lib/workspace/wiki-file-links';
+import { formatBytes } from '@/lib/workspace/uploads';
 import { isShortIdRef, isUuid } from '@/lib/workspace/public-ids';
 import { setFreezeContext } from '@/lib/perf/freeze-monitor';
 import {
@@ -46,15 +57,13 @@ import {
 } from '@/lib/agent/coalesce-assistant-runs';
 import {
   ArrowUpRightIcon,
-  CheckCircleIcon,
   ChevronDownIcon,
-  CircleIcon,
-  ClockIcon,
   GlobeIcon,
   SparklesIcon,
-  XCircleIcon,
 } from 'lucide-react';
 import { splitInlineAskContext } from '@/lib/workspace/inline-ask-context';
+import { resolveCommentEvent, type CommentEvent } from '@/lib/workspace/comment-event';
+import { skillToolUse, skillsUsedIn } from '@/lib/skills/tool-call';
 import {
   Component,
   memo,
@@ -98,17 +107,19 @@ type AIElementsTranscriptProps = {
   /** True while the active reply is still streaming in (useChat status). Drives
    *  live reasoning shimmer + keeps tool runs expanded while they execute. */
   isStreaming?: boolean;
-  onOpenDiffFile?: (assistantMessageId: string) => void;
-  /** True when a live run in THIS chat just finished (session-local falling
-   *  edge derived in page.tsx). Stamps a quiet "Done" line under the final
-   *  assistant turn — the positive counterpart of the abnormal run_status
-   *  markers, so a finished reply is distinguishable from a stalled one
-   *  (user-interview feedback). */
-  latestTurnJustCompleted?: boolean;
+  /** Open one turn's whole edit set as its own surface (the end-of-turn diff
+   *  icon). Absent on mobile, which has no pane tabs. */
+  onOpenTurnDiff?: (assistantMessageId: string) => void;
   /** Workspace file paths for resolving `[[wiki]]` labels in user messages. */
   knownFilePaths?: string[];
   workspaceId?: string | null;
   onOpenWikiFile?: (path: string) => void;
+  /** Edit-card header click — open JUST the file (no chat side-panel dock);
+   *  falls back to onOpenWikiFile when absent. */
+  onOpenEditedFile?: (path: string) => void;
+  /** Local-mode override: builds the href for a user attachment (sidecar file
+   *  URL). When absent, cloud rules apply (signed url / preview proxy). */
+  attachmentHref?: (attachment: MessageAttachment) => string | null;
 };
 
 type MessageResponseComponents = NonNullable<
@@ -270,65 +281,65 @@ function isVisibleTextPart(part: unknown): boolean {
   return isTextPart(part) && part.text.trim().length > 0;
 }
 
-/** The assistant's visible prose for the turn — what the "copy message" icon copies. */
+/** The assistant's visible prose for the turn — what the "copy message" icon
+ *  copies. CONTIGUOUS text parts are one document (citation splits) and join
+ *  with no separator; runs separated by tools/reasoning join as paragraphs. */
 function messagePlainText(parts: unknown[]): string {
-  return parts
-    .filter(isTextPart)
-    .map((p) => p.text)
-    .join('\n\n')
-    .trim();
+  const runs: string[] = [];
+  let current = '';
+  for (const p of parts) {
+    if (isTextPart(p)) {
+      current += p.text;
+    } else if (current) {
+      runs.push(current);
+      current = '';
+    }
+  }
+  if (current) runs.push(current);
+  return runs.join('\n\n').trim();
 }
 
 function isVisibleReasoningPart(part: unknown): boolean {
   return isReasoningPart(part) && (part.text ?? part.reasoning ?? '').trim().length > 0;
 }
 
+/** Compile status as the same grey h-6 meta line as tool groups — spinner +
+ *  shimmer while compiling, settled grey text after. No red/green status
+ *  colors (chat design rules); the full errorTail stays reachable as a
+ *  tooltip on the failed line. */
 function CompileStatus({ data }: { data: CompileStatusData }) {
   const phase = data.phase ?? 'compiling';
-  const texPath = data.texPath ?? null;
-  const attempt = typeof data.attempt === 'number' ? data.attempt : null;
-  if (phase === 'compiling') {
-    return (
-      <div className="flex justify-start py-0.5">
-        <span className="latex-compile-shimmer text-[13px] font-medium">
-          Compiling{texPath ? ` ${texPath}` : ' LaTeX'}…
-        </span>
-      </div>
-    );
-  }
-  if (phase === 'failed') {
-    const errorTail = data.errorTail ?? null;
-    // First `! …` line is the most useful preview — tectonic puts the actual
-    // `! LaTeX Error: …` near the top of the tail.
-    const firstErrorLine = errorTail
-      ? errorTail
-          .split('\n')
-          .map((l) => l.trim())
-          .find((l) => l.startsWith('!')) ?? null
-      : null;
-    return (
-      <div className="flex justify-start py-0.5" title={errorTail ?? undefined}>
-        <span className="text-[12px] font-medium text-red-600">
-          Compile failed
-          {texPath ? ` for ${texPath}` : ''}
-          {attempt && attempt > 1 ? ` (attempt ${attempt})` : ''}
-          {firstErrorLine ? ` — ${firstErrorLine.replace(/^!\s*/, '')}` : ''}
-        </span>
-      </div>
-    );
-  }
-  if (phase === 'succeeded') {
-    return (
-      <div className="flex justify-start py-0.5">
-        <span className="text-[12px] font-medium text-emerald-600">
-          Compiled{texPath ? ` ${texPath}` : ' LaTeX'}
-          {attempt && attempt > 1 ? ` (attempt ${attempt})` : ''}
-        </span>
-      </div>
-    );
-  }
-  // 'no-tex' → render nothing
-  return null;
+  if (phase === 'no-tex') return null;
+  const target = data.texPath ?? 'LaTeX';
+  const attempt =
+    typeof data.attempt === 'number' && data.attempt > 1 ? ` (attempt ${data.attempt})` : '';
+  const active = phase === 'compiling';
+  const failed = phase === 'failed';
+  // First `! …` line is the most useful preview — tectonic puts the actual
+  // `! LaTeX Error: …` near the top of the tail.
+  const firstErrorLine = failed
+    ? data.errorTail
+        ?.split('\n')
+        .map((l) => l.trim())
+        .find((l) => l.startsWith('!'))
+        ?.replace(/^!\s*/, '') ?? null
+    : null;
+  const label = active
+    ? `Compiling ${target}…`
+    : failed
+      ? `Compile failed for ${target}${attempt}${firstErrorLine ? ` - ${firstErrorLine}` : ''}`
+      : `Compiled ${target}${attempt}`;
+  return (
+    <div
+      className={`my-0.5 flex h-6 items-center text-[14px] ${active ? 'text-stone-500' : 'text-stone-400'}`}
+      title={failed ? data.errorTail ?? undefined : undefined}
+    >
+      <SpinnerSlot show={active} />
+      <span className={active ? 'chat-shimmer min-w-0 truncate' : 'min-w-0 truncate'}>
+        {label}
+      </span>
+    </div>
+  );
 }
 
 /* ─── Message-level helpers (ported from the legacy renderer) ── */
@@ -367,25 +378,6 @@ function messageEditedFileCount(message: UIMessage): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
-/** Terminal status the brain stamps on a turn that didn't complete normally
- *  (`metadata.run_status` from agent-ts finalize). Surfaced as a marker line so
- *  a dead turn never renders as a silent empty bubble (issue #432). */
-function messageRunStatusLabel(message: UIMessage): string | null {
-  const meta = messageMeta(message);
-  const status = meta.run_status;
-  const error = typeof meta.run_error === 'string' ? meta.run_error : null;
-  if (status === 'aborted') {
-    return error === 'replaced' ? 'Interrupted by a newer message' : 'Interrupted';
-  }
-  if (status === 'error') {
-    return error ? `Turn failed: ${error}` : 'Turn failed';
-  }
-  if (status === 'incomplete') {
-    return 'Turn ended before all tools finished';
-  }
-  return null;
-}
-
 function partKey(message: UIMessage, partIndex: number): string {
   return `${message.id}-${partIndex}`;
 }
@@ -408,19 +400,55 @@ function toolDisplayName(part: ToolUIPart): string {
   return type.replace(/^tool-/, '');
 }
 
-function toolStatusIcon(state: ToolUIPart['state']): ReactNode {
-  switch (state) {
-    case 'output-available':
-    case 'approval-responded':
-      return <CheckCircleIcon className="size-3 shrink-0 text-emerald-600" />;
-    case 'output-error':
-    case 'output-denied':
-      return <XCircleIcon className="size-3 shrink-0 text-red-500" />;
-    case 'input-streaming':
-      return <CircleIcon className="size-3 shrink-0 text-stone-300" />;
-    default:
-      return <ClockIcon className="size-3 shrink-0 animate-pulse text-stone-500" />;
-  }
+/** Same-size grey dot for every state so row labels left-align; failure is a
+ *  darker dot + a "failed" text suffix, never a red icon. Running pulses in
+ *  brand orange. */
+function toolStatusDot(state: ToolUIPart['state']): ReactNode {
+  const failed = state === 'output-error' || state === 'output-denied';
+  const settled = state === 'output-available' || state === 'approval-responded' || failed;
+  const cls = !settled
+    ? 'animate-pulse bg-[#FF7800]'
+    : failed
+      ? 'bg-stone-500'
+      : 'bg-stone-300';
+  return (
+    <span className="flex w-3 shrink-0 justify-center">
+      <span className={`size-1.5 rounded-full ${cls}`} />
+    </span>
+  );
+}
+
+/** Human verb labels: present-continuous while the tool runs, past once done.
+ *  "Read {file_path: a.md}" → "Reading a.md" / "Read a.md". */
+const TOOL_VERBS: Record<string, [running: string, done: string]> = {
+  Read: ['Reading', 'Read'],
+  Write: ['Writing', 'Wrote'],
+  Edit: ['Editing', 'Edited'],
+  MultiEdit: ['Editing', 'Edited'],
+  NotebookEdit: ['Editing', 'Edited'],
+  Bash: ['Running', 'Ran'],
+  Glob: ['Searching files', 'Searched files'],
+  Grep: ['Searching files', 'Searched files'],
+  web_search: ['Searching the web', 'Searched the web'],
+  web_fetch: ['Reading the web', 'Read the web'],
+};
+
+function humanToolLabel(part: ToolUIPart, running: boolean): string {
+  const name = toolDisplayName(part);
+  const verbs = TOOL_VERBS[name];
+  const verb = verbs ? verbs[running ? 0 : 1] : name;
+  const input = (part.input ?? null) as Record<string, unknown> | null;
+  const subject = clipText(summarizeToolInput(name, input), 60);
+  // Name-carrying verbs ("Searched the web") already read complete.
+  if (!subject || name === 'web_search') return verb;
+  return `${verb} ${subject}`;
+}
+
+/** agent-ts file tools report failures as ordinary `"Error: ..."` strings
+ *  under `output-available` — for skill attribution that is a FAILED read (a
+ *  real SKILL.md's content starts with frontmatter, never `Error: `). */
+function toolOutputIsError(output: unknown): boolean {
+  return typeof output === 'string' && output.startsWith('Error: ');
 }
 
 function toolIsActive(state: ToolUIPart['state']): boolean {
@@ -479,15 +507,22 @@ function webSearchSources(part: ToolUIPart): WebSource[] | null {
     .map((r) => ({ url: (r as WebSource).url, title: (r as WebSource).title, pageAge: (r as WebSource).pageAge }));
 }
 
-/** One row inside a ToolGroup: status glyph + name + clipped input summary,
- *  expandable to the full input/output payload. */
+/** One row inside an expanded ToolGroup: grey status dot + human label,
+ *  expandable to the (clamped) input/output payload. Link-like, no button
+ *  chrome. */
 function ToolRow({ part }: { part: ToolUIPart }) {
-  const name = toolDisplayName(part);
-  const input = (part.input ?? null) as Record<string, unknown> | null;
+  const failed = part.state === 'output-error' || part.state === 'output-denied';
   const sources = webSearchSources(part);
-  const summary = sources
-    ? `${sources.length} source${sources.length === 1 ? '' : 's'}`
-    : clipText(summarizeToolInput(name, input), 72);
+  // A skill read reads as its own action, not a file read — a reviewer asking
+  // "which skill did it apply?" shouldn't have to decode `Read skills/…`.
+  const skill = skillToolUse(toolDisplayName(part), part.input);
+  const label = sources
+    ? `Searched the web · ${sources.length} source${sources.length === 1 ? '' : 's'}`
+    : skill
+      ? skill.kind === 'entry'
+        ? `Read the ${skill.id} skill`
+        : `Read ${skill.id} › ${skill.path.slice(`skills/${skill.id}/`.length)}`
+      : humanToolLabel(part, toolIsActive(part.state));
   const hasDetail =
     part.input != null ||
     part.state === 'output-available' ||
@@ -495,27 +530,30 @@ function ToolRow({ part }: { part: ToolUIPart }) {
 
   const rowBody = (
     <div className="flex min-w-0 flex-1 items-center gap-2">
-      {toolStatusIcon(part.state)}
-      <span className="shrink-0 font-medium text-stone-700">
-        {sources ? 'Searched the web' : name}
-      </span>
-      {summary ? (
-        <span className="min-w-0 truncate font-mono text-[12px] text-stone-400">
-          {summary}
+      {/* Only a SUCCESSFUL read earns the skill glyph — otherwise the sparkle
+          would sit where the failure dot belongs and a failed skill read would
+          look like it worked. */}
+      {skill && part.state === 'output-available' && !toolOutputIsError(part.output) ? (
+        <span className="flex w-3 shrink-0 justify-center">
+          <SparklesIcon className="size-3 text-amber-500" />
         </span>
-      ) : null}
+      ) : (
+        toolStatusDot(part.state)
+      )}
+      <span className="min-w-0 truncate text-stone-500">{label}</span>
+      {failed ? <span className="shrink-0 text-[11px] text-stone-400">failed</span> : null}
     </div>
   );
 
   if (!hasDetail) {
-    return <div className="flex items-center px-1.5 py-1 text-[13px]">{rowBody}</div>;
+    return <div className="flex h-6 items-center text-[14px]">{rowBody}</div>;
   }
 
   return (
     <Collapsible className="group/row">
-      <CollapsibleTrigger className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-[13px] transition-colors hover:bg-stone-100/70">
+      <CollapsibleTrigger className="flex h-6 w-fit max-w-full items-center gap-1 text-left text-[14px] transition-colors hover:text-stone-700">
         {rowBody}
-        <ChevronDownIcon className="size-3 shrink-0 text-stone-300 transition-transform group-data-[state=open]/row:rotate-180" />
+        <ChevronDownIcon className="size-3 shrink-0 text-stone-300 opacity-0 transition-all group-hover/row:opacity-100 group-data-[state=open]/row:rotate-180 group-data-[state=open]/row:opacity-100" />
       </CollapsibleTrigger>
       <CollapsibleContent className="overflow-hidden text-popover-foreground">
         {sources ? (
@@ -536,51 +574,108 @@ function ToolRow({ part }: { part: ToolUIPart }) {
   );
 }
 
-/** Compact run of contiguous tool calls: a single "Ran N tools" summary that
- *  stays expanded while the tools execute, then collapses when finished. */
-export function ToolGroup({ parts }: { parts: ToolUIPart[] }) {
-  const total = parts.length;
-  const active = parts.some((p) => toolIsActive(p.state));
-  const errorCount = parts.filter(
-    (p) => p.state === 'output-error' || p.state === 'output-denied',
-  ).length;
+/** Reasoning part folded into a tool group (see renderMessageParts). */
+type GroupReasoning = { type: 'reasoning'; text?: string; reasoning?: string; state?: string };
 
-  const [open, setOpen] = useState(active);
-  const prevActive = useRef(active);
-  useEffect(() => {
-    if (active && !prevActive.current) setOpen(true);
-    else if (!active && prevActive.current) setOpen(false);
-    prevActive.current = active;
-  }, [active]);
+function groupReasoningText(item: GroupReasoning): string {
+  return (item.text ?? item.reasoning ?? '').trim();
+}
 
-  const noun = total === 1 ? 'tool' : 'tools';
-  const label = active ? `Running ${total} ${noun}…` : `Ran ${total} ${noun}`;
-
+/** A thought inside an expanded tool group: same link-like row as tools,
+ *  expandable to the (clamped) chain of thought. */
+function ThoughtRow({ text }: { text: string }) {
   return (
-    <Collapsible
-      open={open}
-      onOpenChange={setOpen}
-      className="not-prose group my-1 w-fit max-w-full rounded-lg border border-stone-200 bg-stone-50/60 text-[13px]"
-    >
-      <CollapsibleTrigger className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-stone-600 transition-colors hover:bg-stone-100/60">
-        {active ? (
-          <ClockIcon className="size-3 shrink-0 animate-pulse text-stone-500" />
-        ) : errorCount > 0 ? (
-          <XCircleIcon className="size-3 shrink-0 text-red-500" />
-        ) : (
-          <CheckCircleIcon className="size-3 shrink-0 text-emerald-600" />
-        )}
-        <span className={active ? 'latex-compile-shimmer font-medium' : 'font-medium'}>
-          {label}
-          {errorCount > 0 ? ` · ${errorCount} failed` : ''}
+    <Collapsible className="group/row">
+      <CollapsibleTrigger className="flex h-6 w-fit max-w-full items-center gap-1 text-left text-[14px] transition-colors hover:text-stone-700">
+        <span className="flex w-3 shrink-0 justify-center">
+          <span className="size-1.5 rounded-full bg-stone-300" />
         </span>
-        <ChevronDownIcon className="size-3.5 shrink-0 text-stone-400 transition-transform group-data-[state=open]:rotate-180" />
+        <span className="text-stone-500">Thought</span>
+        <ChevronDownIcon className="size-3 shrink-0 text-stone-300 opacity-0 transition-all group-hover/row:opacity-100 group-data-[state=open]/row:rotate-180 group-data-[state=open]/row:opacity-100" />
       </CollapsibleTrigger>
       <CollapsibleContent className="overflow-hidden">
-        <div className="flex flex-col gap-0.5 border-t border-stone-200/70 px-1.5 py-1">
-          {parts.map((part, i) => (
-            <ToolRow key={part.toolCallId ?? i} part={part} />
-          ))}
+        <div className="my-1 max-h-40 overflow-auto text-[12px] leading-5 text-stone-400">{text}</div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+/** A contiguous run of tool calls AND interleaved thinking as ONE fixed-height
+ *  line, live or settled. While work runs the line IS the working indicator —
+ *  Sunny spinner + a label narrating the current activity ("Reading
+ *  paper.tex…", "Thinking…"); settled, the spinner slides away and the label
+ *  becomes "Ran N tools". Nothing auto-expands or auto-collapses (that
+ *  collapse was a mid-turn layout jump), and the collapsed line carries no
+ *  status icons or failure counts — failures are visible in the expanded rows. */
+export function ToolGroup({
+  parts,
+  lastReasoningStreaming = false,
+}: {
+  parts: (ToolUIPart | GroupReasoning)[];
+  lastReasoningStreaming?: boolean;
+}) {
+  const tools = parts.filter((p): p is ToolUIPart => isToolPart(p));
+  const total = tools.length;
+  const activeTools = tools.filter((p) => toolIsActive(p.state));
+  const active = activeTools.length > 0 || lastReasoningStreaming;
+  const label = lastReasoningStreaming
+    ? 'Thinking…'
+    : activeTools.length > 0
+      ? `${humanToolLabel(activeTools[activeTools.length - 1]!, true)}…`
+      : `Ran ${total} ${total === 1 ? 'tool' : 'tools'}`;
+
+  // Skills are surfaced on the collapsed line: "which of my skills did it
+  // apply?" shouldn't require expanding the run of tool calls to find out.
+  // Successful reads only — a failed read means the agent never saw the skill,
+  // and a chip claiming otherwise is worse than no chip.
+  const skills = skillsUsedIn(
+    tools
+      .filter((p) => p.state === 'output-available' && !toolOutputIsError(p.output))
+      .map((p) => ({ toolName: toolDisplayName(p), input: p.input })),
+  );
+
+  return (
+    <Collapsible className="not-prose group my-0.5 text-[14px]">
+      <CollapsibleTrigger
+        data-testid="tool-group-line"
+        className={`flex h-6 w-fit max-w-full items-center text-left transition-colors ${active ? 'text-stone-500 hover:text-stone-600' : 'text-stone-400 hover:text-stone-600'}`}
+      >
+        <SpinnerSlot show={active} />
+        <span className={active ? 'chat-shimmer min-w-0 truncate' : 'min-w-0 truncate'}>
+          {label}
+        </span>
+        {skills.map((skill) => (
+          <span
+            key={skill.id}
+            // "Read", not "used": this is derived from the agent opening the
+            // file, which is not proof it followed it. Don't claim more — and a
+            // turn that only opened a supporting file never read the skill
+            // itself, so it doesn't get to say it did.
+            // "N of its files" stays plural at any N ("1 of its files").
+            title={
+              skill.readEntry
+                ? `Read the ${skill.id} skill${
+                    skill.referenceCount > 0 ? ` and ${skill.referenceCount} of its files` : ''
+                  }`
+                : `Read ${skill.referenceCount} of the ${skill.id} skill's files`
+            }
+            className="ml-1.5 flex min-w-0 shrink items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-700"
+          >
+            <SparklesIcon className="size-2.5 shrink-0" />
+            <span className="truncate">{skill.id}</span>
+          </span>
+        ))}
+        <ChevronDownIcon className="ml-1 size-3 shrink-0 opacity-0 transition-all group-hover:opacity-100 group-data-[state=open]:rotate-180 group-data-[state=open]:opacity-100" />
+      </CollapsibleTrigger>
+      <CollapsibleContent className="overflow-hidden">
+        <div className="ml-1.5 flex flex-col border-l border-stone-200 pl-3">
+          {parts.map((item, i) =>
+            isToolPart(item) ? (
+              <ToolRow key={item.toolCallId ?? i} part={item} />
+            ) : groupReasoningText(item) ? (
+              <ThoughtRow key={i} text={groupReasoningText(item)} />
+            ) : null,
+          )}
         </div>
       </CollapsibleContent>
     </Collapsible>
@@ -601,6 +696,8 @@ function AssistantTextPart({
   streaming: boolean;
   components?: MessageResponseComponents;
 }): ReactNode {
+  // Em-dash → dash typography happens in MessageResponse's remark plugin
+  // (parsed text nodes only — code/math/links structurally protected).
   const shown = useSmoothStreamedText(text, streaming);
   return (
     <MessageResponse components={components} isAnimating={streaming}>
@@ -609,16 +706,28 @@ function AssistantTextPart({
   );
 }
 
-/* Plain, always-visible label. The default uses a `text-transparent`
-   bg-clip shimmer that can render invisibly (empty-looking title) in
-   this nested context. Module-scope so its identity never churns a
-   memoized trigger. */
-const transcriptThinkingMessage = (streaming: boolean, dur?: number) =>
-  streaming ? (
-    <span className="animate-pulse">Thinking…</span>
-  ) : (
-    <span>{dur ? `Thought for ${dur} second${dur === 1 ? '' : 's'}` : 'Reasoning'}</span>
+/** Custom trigger body: the new link-like thinking line (no box, no brain
+ *  icon) — shimmer while live, "Thought for Ns" settled, chevron on hover.
+ *  Reads streaming/duration from the Reasoning context so the component's
+ *  settle-once machinery stays intact. */
+function TranscriptReasoningLabel() {
+  const { isStreaming, isOpen, duration } = useReasoning();
+  if (isStreaming) {
+    return (
+      <span className="flex h-6 items-center text-[14px] text-stone-400">
+        <span className="chat-shimmer">Thinking…</span>
+      </span>
+    );
+  }
+  return (
+    <span className="flex h-6 items-center gap-1 text-[14px] text-stone-400 transition-colors hover:text-stone-600">
+      <span>{duration ? `Thought for ${duration}s` : 'Thought'}</span>
+      <ChevronDownIcon
+        className={`size-3 shrink-0 opacity-0 transition-all group-hover/think:opacity-100 ${isOpen ? 'rotate-180 opacity-100' : ''}`}
+      />
+    </span>
   );
+}
 
 /** Memoized — primitive props, so settled thoughts skip re-rendering on every
  *  throttled stream flush of their (coalesced) message. */
@@ -631,9 +740,13 @@ const TranscriptReasoning = memo(function TranscriptReasoning({
 }) {
   return (
     // Collapsed by default — the user opens it to read the chain of thought.
-    <Reasoning defaultOpen={false} isStreaming={isStreaming}>
-      <ReasoningTrigger getThinkingMessage={transcriptThinkingMessage} />
-      <ReasoningContent>{text}</ReasoningContent>
+    <Reasoning defaultOpen={false} isStreaming={isStreaming} className="my-0.5 mb-0">
+      <ReasoningTrigger className="group/think h-6 w-fit gap-0">
+        <TranscriptReasoningLabel />
+      </ReasoningTrigger>
+      <ReasoningContent className="ml-1.5 mt-0 max-h-40 overflow-auto border-l border-stone-200 pl-3 text-[12px] leading-5 text-stone-400">
+        {text}
+      </ReasoningContent>
     </Reasoning>
   );
 });
@@ -724,13 +837,11 @@ function renderPart(
 
   if (isReasoningPart(part)) {
     const text = part.text ?? part.reasoning ?? '';
-    // Hide an empty reasoning part EXCEPT while it's actively streaming — some
-    // models (e.g. OpenAI gpt-5) reason silently for a while and only emit the
-    // summary text near the end, so without this the box vanishes and the user
-    // sees an empty bubble, then a "Thought for Ns" box pops in. Keeping it
-    // mounted lets the "Thinking…" shimmer show continuously. Persisted/reloaded
-    // empty reasoning (not streaming) still collapses away.
-    if (!text && !options.reasoningIsStreaming) return null;
+    // Empty reasoning renders nothing — even mid-stream. Models that reason
+    // silently (e.g. OpenAI gpt-5) are covered by the Sunny working line
+    // ("Thinking…") until summary text arrives; mounting the reasoning shimmer
+    // too showed TWO Thinking lines at once (2026-07-31 feedback).
+    if (!text) return null;
     return (
       <TranscriptReasoning
         key={key}
@@ -769,14 +880,68 @@ function renderMessageParts(
       i += 1;
       continue;
     }
-    if (isToolPart(part)) {
-      const group: ToolUIPart[] = [];
+    if (isToolPart(part) || isReasoningPart(part)) {
+      // Measure the contiguous meta-run: tools, reasoning, and step markers.
+      // A run containing at least one tool consolidates into ONE line —
+      // alternating "Thought for 2s" / "Ran 2 tools" stacks read too sparse
+      // (2026-07-31 feedback). Reasoning-only runs keep the Reasoning box.
       let j = i;
-      while (j < parts.length && (isToolPart(parts[j]) || isStepBoundaryPart(parts[j]))) {
-        if (isToolPart(parts[j])) group.push(parts[j] as ToolUIPart);
+      const items: (ToolUIPart | GroupReasoning)[] = [];
+      let toolCount = 0;
+      while (
+        j < parts.length &&
+        (isToolPart(parts[j]) || isStepBoundaryPart(parts[j]) || isReasoningPart(parts[j]))
+      ) {
+        const p = parts[j];
+        if (isToolPart(p)) {
+          items.push(p);
+          toolCount += 1;
+        } else if (isReasoningPart(p)) {
+          items.push(p as GroupReasoning);
+        }
         j += 1;
       }
-      nodes.push(<ToolGroup key={partKey(message, i)} parts={group} />);
+      if (toolCount > 0) {
+        const lastItem = items[items.length - 1];
+        const lastReasoningStreaming =
+          options.isStreamingMessage &&
+          j === parts.length &&
+          !!lastItem &&
+          isReasoningPart(lastItem) &&
+          (lastItem as { state?: string }).state !== 'done';
+        nodes.push(
+          <ToolGroup
+            key={partKey(message, i)}
+            parts={items}
+            lastReasoningStreaming={lastReasoningStreaming}
+          />,
+        );
+        i = j;
+        continue;
+      }
+    }
+    // Contiguous assistant text parts are ONE document. The brain persists a
+    // reply as many text parts when the model's text stream is chopped up
+    // (e.g. web-citation boundaries), and rendering each as its own markdown
+    // block broke sentences and lists mid-way — lone "." lines, empty bullets
+    // (2026-08-01, turn ef4fff20). Join them and parse once.
+    if (message.role === 'assistant' && isTextPart(part)) {
+      let j = i;
+      let joined = '';
+      while (j < parts.length && isTextPart(parts[j])) {
+        joined += (parts[j] as { text: string }).text;
+        j += 1;
+      }
+      if (joined) {
+        nodes.push(
+          <AssistantTextPart
+            key={partKey(message, i)}
+            text={joined}
+            streaming={options.isStreamingMessage && j === parts.length}
+            components={options.workspaceFileLinkComponents}
+          />,
+        );
+      }
       i = j;
       continue;
     }
@@ -807,6 +972,134 @@ function renderMessageParts(
   return nodes;
 }
 
+/** Relative turn age ("Now", "5m ago", "2h ago"…), self-ticking so "Now"
+ *  becomes "1m ago" without a parent re-render. A missing/unparsable
+ *  created_at (the still-streaming reply isn't persisted yet) reads "Now". */
+function relativeTimeLabel(createdAt: unknown, now: number): string {
+  const t = typeof createdAt === 'string' ? Date.parse(createdAt) : NaN;
+  if (Number.isNaN(t)) return 'Now';
+  const s = Math.max(0, Math.floor((now - t) / 1000));
+  if (s < 60) return 'Now';
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `${d}d ago`;
+  const w = Math.floor(d / 7);
+  if (d < 30) return `${w}w ago`;
+  const mo = Math.floor(d / 30);
+  if (d < 365) return `${mo}mo ago`;
+  return `${Math.floor(d / 365)}y ago`;
+}
+
+function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
+
+function formatTurnDuration(ms: number): string {
+  const s = Math.max(1, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+/** Three-dots turn details: model, token usage, wall-clock duration — read
+ *  from message metadata (messages.model / input_tokens / output_tokens via
+ *  the GET route; duration_ms stamped by the brain at finalize). Renders
+ *  nothing when the turn predates the plumbing. */
+function TurnMetaMenu({ meta }: { meta: Record<string, unknown> }) {
+  const model = typeof meta.model === 'string' ? meta.model.split('/').pop() ?? meta.model : null;
+  const input = typeof meta.input_tokens === 'number' ? meta.input_tokens : null;
+  const output = typeof meta.output_tokens === 'number' ? meta.output_tokens : null;
+  const duration = typeof meta.duration_ms === 'number' ? meta.duration_ms : null;
+  // Whether the CURRENT open came from a pointer — closing a pointer-opened
+  // menu must not refocus the trigger (focus-within would pin the
+  // hover-revealed footer row), but a keyboard-opened menu must keep Radix's
+  // focus restore or Escape strands focus on <body> (Codex round 15).
+  const pointerOpenedRef = useRef(false);
+  if (!model && input === null && output === null && duration === null) return null;
+  const rows: [string, string][] = [];
+  if (model) rows.push(['Model', model]);
+  if (input !== null || output !== null) {
+    rows.push([
+      'Tokens',
+      [
+        input !== null ? `${formatTokenCount(input)} in` : null,
+        output !== null ? `${formatTokenCount(output)} out` : null,
+      ]
+        .filter(Boolean)
+        .join(' · '),
+    ]);
+  }
+  if (duration !== null) rows.push(['Duration', formatTurnDuration(duration)]);
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          aria-label="Turn details"
+          data-testid="turn-meta-trigger"
+          onPointerDown={() => {
+            pointerOpenedRef.current = true;
+          }}
+          onKeyDown={() => {
+            pointerOpenedRef.current = false;
+          }}
+          className="flex h-6 w-6 items-center justify-center rounded text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-700 active:bg-stone-100"
+        >
+          {/* weight matches CopyLinkButton's default 'bold' — the three footer
+              icons must read as one family (2026-08-01 feedback). */}
+          <ReceiptIcon weight="bold" className="h-3.5 w-3.5" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="start"
+        data-testid="turn-meta-menu"
+        className="min-w-[180px] rounded-lg border-stone-200 bg-white p-1.5 shadow-sm"
+        // Pointer-opened: don't refocus the trigger on close (focus-within
+        // would keep the hover-revealed footer row pinned after the menu is
+        // gone). Keyboard-opened: keep Radix's focus restore, or Escape
+        // would strand focus on <body>.
+        onCloseAutoFocus={(e) => {
+          if (pointerOpenedRef.current) e.preventDefault();
+        }}
+      >
+        {rows.map(([label, value]) => (
+          <div key={label} className="flex items-center justify-between gap-6 px-1.5 py-0.5 text-[12px]">
+            <span className="text-stone-400">{label}</span>
+            <span className="text-stone-600">{value}</span>
+          </div>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+function TurnTimestamp({ createdAt }: { createdAt: unknown }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+  const t = typeof createdAt === 'string' ? Date.parse(createdAt) : NaN;
+  return (
+    // The parent footer row is hover-revealed as a whole; hovering the stamp
+    // itself shows the exact date/time as the app's black tooltip.
+    <span
+      className="relative ml-1 cursor-default text-[11px] text-stone-400"
+      data-testid="turn-timestamp"
+    >
+      {relativeTimeLabel(createdAt, now)}
+      {Number.isNaN(t) ? null : <IconTooltip label={new Date(t).toLocaleString()} />}
+    </span>
+  );
+}
+
 /** Any renderable assistant content — used to retire the generic typing dots
  *  the moment live reasoning/tool/compile/text parts start streaming in. */
 function hasRenderableAssistantParts(message: UIMessage): boolean {
@@ -822,14 +1115,47 @@ function hasRenderableAssistantParts(message: UIMessage): boolean {
 
 /* ─── Attachments (user-side) ────────────────────────────────── */
 
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+/** Same-origin preview-proxy URL (302 → fresh signed URL) for a composer
+ *  upload, i.e. a real workspace file. Not built for text uploads (the proxy
+ *  only serves blobs) or chat-attachment-bucket rows (`storagePath` set — the
+ *  proxy can't serve that bucket). */
+function workspaceProxyHref(attachment: MessageAttachment, workspaceId?: string | null): string | null {
+  if (workspaceId && attachment.id && attachment.type !== 'text' && !attachment.storagePath) {
+    return `/api/workspace/files/preview?projectId=${encodeURIComponent(workspaceId)}&fileId=${encodeURIComponent(attachment.id)}`;
+  }
+  return null;
 }
 
-function AttachmentChip({ attachment }: { attachment: MessageAttachment }) {
+function AttachmentChip({
+  attachment,
+  ctx,
+}: {
+  attachment: MessageAttachment;
+  ctx: RowCtx;
+}) {
   const name = attachment.name ?? attachment.path.split('/').pop() ?? 'attachment';
+  // Inline previews auto-fetch, so they're limited to URLs WE construct (the
+  // same-origin proxy, or local mode's sidecar builder). A signed_url out of
+  // message metadata is client-supplied — any collaborator could plant a
+  // tracking pixel — so it stays a click-only chip link.
+  const constructed = ctx.attachmentHref
+    ? ctx.attachmentHref(attachment)
+    : workspaceProxyHref(attachment, ctx.workspaceId);
+  const href = constructed ?? attachment.signedUrl ?? null;
+  if (constructed && attachment.mime?.startsWith('image/')) {
+    return (
+      <a href={constructed} target="_blank" rel="noreferrer" data-testid="attachment-image">
+        {/* eslint-disable-next-line @next/next/no-img-element -- signed/proxied
+            src, unknown dimensions; next/image can't optimize these. */}
+        <img
+          src={constructed}
+          alt={name}
+          loading="lazy"
+          className="max-h-40 max-w-60 rounded-md border border-stone-200 object-cover"
+        />
+      </a>
+    );
+  }
   const body = (
     <span className="inline-flex items-center gap-1.5 rounded-md bg-stone-700 px-2 py-1 text-[12px] text-stone-100">
       <svg className="h-3 w-3 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -844,9 +1170,9 @@ function AttachmentChip({ attachment }: { attachment: MessageAttachment }) {
       {attachment.size ? <span className="text-stone-300">{formatBytes(attachment.size)}</span> : null}
     </span>
   );
-  if (attachment.signedUrl) {
+  if (href) {
     return (
-      <a href={attachment.signedUrl} target="_blank" rel="noreferrer">
+      <a href={href} target="_blank" rel="noreferrer">
         {body}
       </a>
     );
@@ -863,9 +1189,12 @@ type RowCtx = {
   knownFilePaths: string[];
   linkComponents: ReturnType<typeof workspaceFileLinkComponents>;
   onOpenWikiFile?: (path: string) => void;
-  onOpenDiffFile?: (assistantMessageId: string) => void;
+  onOpenEditedFile?: (path: string) => void;
+  onOpenTurnDiff?: (assistantMessageId: string) => void;
   turnLinkBase?: string;
   onTurnLinkShareGate?: () => void;
+  workspaceId?: string | null;
+  attachmentHref?: (attachment: MessageAttachment) => string | null;
 };
 
 type MessageRowProps = {
@@ -876,8 +1205,57 @@ type MessageRowProps = {
   isStreamingMessage: boolean;
   isLatestTurnWithEdits: boolean;
   isHighlighted: boolean;
-  isJustCompletedTurn: boolean;
+  /** metadata.created_at, hoisted to a prop so the memo comparator sees it —
+   *  the reconcile that stamps it often changes nothing else in the row. */
+  createdAt: unknown;
+  /** model|tokens|duration fingerprint — same reason: a metadata-only
+   *  reconcile must re-render the row or the turn-details menu stays stale. */
+  turnMetaKey: string;
 };
+
+/** "8:00 AM"-style stamp for the scheduled-run label; null without a date. */
+function scheduledRunTime(createdAt: unknown): string | null {
+  const t = typeof createdAt === 'string' ? Date.parse(createdAt) : NaN;
+  return Number.isNaN(t)
+    ? null
+    : new Date(t).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+}
+
+/** A doc comment that woke the agent — a quiet event card, not "the user said
+ *  this in chat". The delivered text also carries a model-only instruction;
+ *  resolveCommentEvent strips it. */
+function CommentEventCard({ event }: { event: CommentEvent }) {
+  return (
+    <div
+      data-testid="comment-event-card"
+      className="w-full rounded-lg border border-stone-200 bg-white px-2.5 py-2"
+    >
+      <div className="flex items-center gap-1.5 text-xs text-stone-400">
+        <ChatCircleIcon className="size-3.5 shrink-0" />
+        <span className="truncate">
+          <span className="text-stone-500">{event.authorName}</span>{' '}
+          {event.isNewThread ? 'commented on' : 'replied on'}{' '}
+          {event.filePath.split('/').pop() || event.filePath}
+        </span>
+      </div>
+      {event.quote ? (
+        <p className="mt-1.5 border-l-2 border-stone-200 pl-2 text-[12px] italic text-stone-400">
+          {clipText(event.quote, 80)}
+        </p>
+      ) : null}
+      {event.body ? (
+        <p className="mt-1.5 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+          {event.body}
+        </p>
+      ) : null}
+      {event.blocked ? (
+        <p data-testid="comment-event-blocked" className="mt-1.5 text-[12px] text-amber-600">
+          The agent couldn&apos;t run (usage limit reached), so this comment wasn&apos;t answered.
+        </p>
+      ) : null}
+    </div>
+  );
+}
 
 function MessageRowImpl({
   message,
@@ -885,24 +1263,99 @@ function MessageRowImpl({
   isStreamingMessage,
   isLatestTurnWithEdits,
   isHighlighted,
-  isJustCompletedTurn,
+  createdAt,
 }: MessageRowProps) {
+  // Scheduled runs (dispatcher-tagged metadata.source): the prompt keeps its
+  // bubble but carries a small "scheduled run · <time>" label; a skipped run
+  // collapses to a quiet one-line note with the reason — never a red banner.
+  const meta = messageMeta(message);
+  const isScheduledRun = message.role === 'user' && meta.source === 'scheduled_task';
+  if (isScheduledRun && meta.skipped === true) {
+    const reason = typeof meta.skip_reason === 'string' && meta.skip_reason.trim() ? meta.skip_reason.trim() : null;
+    return (
+      <div
+        data-message-id={message.id}
+        data-testid="scheduled-run-skipped"
+        className="py-1 text-right text-[12px] text-stone-400"
+      >
+        scheduled run skipped{reason ? ` · ${reason}` : ''}
+      </div>
+    );
+  }
+  const parts = Array.isArray(message.parts) ? message.parts : [];
+  if (message.role === 'user' && meta.source === 'comment') {
+    const event = resolveCommentEvent(meta, messagePlainText(parts));
+    if (event) {
+      return (
+        <div data-message-id={message.id} className="py-1">
+          <CommentEventCard event={event} />
+        </div>
+      );
+    }
+  }
   const attachments = message.role === 'user' ? messageAttachments(message) : [];
   const hasEdits = message.role === 'assistant' && messageHasTurnEdits(message);
   const editCount = hasEdits ? messageEditedFileCount(message) : null;
-  const parts = Array.isArray(message.parts) ? message.parts : [];
   const showTurnLink =
     message.role === 'assistant' &&
     Boolean(ctx.turnLinkBase) &&
     assistantHasTurnLinkTarget(message, parts);
   const turnMessageText = showTurnLink ? messagePlainText(parts) : '';
-  const runStatusLabel =
-    message.role === 'assistant' && !isStreamingMessage
-      ? messageRunStatusLabel(message)
+  // The end of a run shows NOTHING — no "Done", no failure label. The working
+  // line below disappearing IS the completion signal (2026-07-30 feedback).
+  // While streaming, exactly one line animates: the active tool line narrates
+  // tool work; otherwise this working line covers thinking/writing.
+  const lastPart = parts[parts.length - 1] as
+    | { type?: string; state?: string; text?: string; reasoning?: string }
+    | undefined;
+  // An active tool line or a streaming reasoning surface narrates its own
+  // progress — the working line only covers the gaps so exactly one line ever
+  // animates. A trailing reasoning part narrates when it will actually render
+  // something: it has text (standalone shimmer), or it's folded into a tool
+  // group (whose line shows "Thinking…" even for silent reasoning). A silent
+  // standalone thought renders nothing — the working line must cover it.
+  const lastReasoningInToolRun = (() => {
+    if (lastPart?.type !== 'reasoning') return false;
+    for (let k = parts.length - 2; k >= 0; k -= 1) {
+      const p = parts[k] as { type?: string };
+      if (isStepBoundaryPart(p) || p?.type === 'reasoning') continue;
+      return (
+        typeof p?.type === 'string' &&
+        (p.type.startsWith('tool-') || p.type === 'dynamic-tool')
+      );
+    }
+    return false;
+  })();
+  const lastPartNarrates =
+    !!lastPart &&
+    typeof lastPart.type === 'string' &&
+    ((lastPart.type === 'reasoning' &&
+      (((lastPart.text ?? lastPart.reasoning ?? '').trim().length > 0) || lastReasoningInToolRun)) ||
+      ((lastPart.type.startsWith('tool-') || lastPart.type === 'dynamic-tool') &&
+        toolIsActive((lastPart as ToolUIPart).state)) ||
+      // A live LaTeX compile shows its own "Compiling…" shimmer line.
+      (isCompileStatusPart(lastPart) &&
+        (lastPart.data?.phase ?? 'compiling') === 'compiling'));
+  // Gated on renderable content: before the first renderable part the
+  // transcript-level pre-token line covers the run — without this gate both
+  // rendered and the start of a turn showed two "Thinking…" lines.
+  const workingLabel =
+    message.role === 'assistant' &&
+    isStreamingMessage &&
+    !lastPartNarrates &&
+    hasRenderableAssistantParts(message)
+      ? lastPart?.type === 'text'
+        ? 'Writing…'
+        : 'Thinking…'
       : null;
 
   return (
     <Message from={message.role} key={message.id} data-message-id={message.id}>
+      {isScheduledRun ? (
+        <span data-testid="scheduled-run-label" className="-mb-1 mr-1.5 self-end text-[11px] text-stone-400">
+          scheduled run{scheduledRunTime(createdAt) ? ` · ${scheduledRunTime(createdAt)}` : ''}
+        </span>
+      ) : null}
       <MessageContent>
         {renderMessageParts(message, parts, {
           knownFilePaths: ctx.knownFilePaths,
@@ -910,39 +1363,58 @@ function MessageRowImpl({
           onOpenWikiFile: ctx.onOpenWikiFile,
           isStreamingMessage,
         })}
-        {runStatusLabel ? (
-          <div
-            className="mt-1 flex items-center gap-1.5 text-[12px] text-stone-400"
-            data-testid="turn-status"
-          >
-            <XCircleIcon className="size-3 shrink-0" />
-            <span>{runStatusLabel}</span>
-          </div>
-        ) : isJustCompletedTurn && !isStreamingMessage && hasRenderableAssistantParts(message) ? (
-          <div
-            className="animate-fade-in mt-1 flex items-center gap-1.5 text-[12px] text-stone-400"
-            data-testid="turn-done"
-          >
-            <CheckCircleIcon className="size-3 shrink-0 text-emerald-600" />
-            <span>Done</span>
+        {workingLabel ? (
+          <div className="flex h-6 items-center text-[14px] text-stone-500" data-testid="turn-working">
+            <SpinnerSlot show />
+            <span className="chat-shimmer">{workingLabel}</span>
           </div>
         ) : null}
         {attachments.length > 0 ? (
           <div className="mt-1 flex flex-wrap gap-1.5">
             {attachments.map((a) => (
-              <AttachmentChip key={a.id} attachment={a} />
+              <AttachmentChip key={a.id} attachment={a} ctx={ctx} />
             ))}
           </div>
         ) : null}
+        {hasEdits ? (
+          // Per-file edit cards own their interactions (header/double-click →
+          // open the file, hover ✓/✗, caret) — no whole-area click hijack.
+          <div data-diff-id={message.id} className="mt-2">
+            <TurnEditsCard
+              assistantMessageId={message.id}
+              initialCount={editCount}
+              variant="inline"
+              isLatestTurn={isLatestTurnWithEdits}
+              defaultExpanded={isHighlighted}
+              onOpenFile={ctx.onOpenEditedFile ?? ctx.onOpenWikiFile}
+            />
+          </div>
+        ) : null}
         {showTurnLink && ctx.turnLinkBase ? (
-          // End-of-turn affordances: a link icon (copies the turn link) and
-          // a copy icon (copies the message). Icon-only — the label shows as
-          // the app's black tooltip on hover, with a checkmark on copy
-          // (2026-06-05 feedback: no permanent "Copy link to this turn" text).
+          // End-of-turn affordances: link, copy, turn-details menu, relative
+          // timestamp. On hover-capable devices the WHOLE row hides until the
+          // turn is hovered (2026-08-01 feedback) — opacity keeps the space,
+          // so no layout jump; focus-within keeps it reachable by keyboard,
+          // and an OPEN details menu pins the row visible even when the
+          // cursor strays (the portaled menu holds focus outside the row, so
+          // focus-within alone can't; Radix stamps data-state=open on the
+          // trigger). Touch devices (hover:none) always see the row.
           <div
-            className="mt-1 flex items-center gap-0.5 opacity-60 transition-opacity hover:opacity-100 focus-within:opacity-100"
+            className="mt-1 flex items-center gap-0.5 transition-opacity [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:hover)]:focus-within:opacity-100 [@media(hover:hover)]:has-[[data-state=open]]:opacity-100"
             data-testid="turn-link"
           >
+            {hasEdits && ctx.onOpenTurnDiff ? (
+              <button
+                type="button"
+                onClick={() => ctx.onOpenTurnDiff?.(message.id)}
+                aria-label="Open this turn's edits"
+                data-testid="turn-open-diff"
+                className="relative group/tip inline-flex h-6 w-6 items-center justify-center rounded text-stone-400 hover:bg-stone-100 hover:text-stone-600"
+              >
+                <GitDiffIcon className="h-3.5 w-3.5" weight="bold" aria-hidden />
+                <IconTooltip label="Open this turn's edits" />
+              </button>
+            ) : null}
             <CopyLinkButton
               url={`${ctx.turnLinkBase}${ctx.turnLinkBase.includes('?') ? '&' : '?'}turnId=${message.id}`}
               label="Copy link to this turn"
@@ -959,40 +1431,29 @@ function MessageRowImpl({
                 iconClassName="h-3.5 w-3.5"
               />
             ) : null}
-          </div>
-        ) : null}
-        {hasEdits ? (
-          <div
-            data-diff-id={message.id}
-            className={
-              ctx.onOpenDiffFile
-                ? 'mt-2 cursor-pointer rounded-2xl transition-shadow hover:shadow-[0_1px_4px_rgba(28,25,23,0.08)]'
-                : 'mt-2'
-            }
-            onClick={
-              ctx.onOpenDiffFile
-                ? (event) => {
-                    const target = event.target as HTMLElement | null;
-                    const interactive = target?.closest('button, a, kbd, [role="button"]');
-                    if (interactive && interactive !== event.currentTarget) return;
-                    ctx.onOpenDiffFile?.(message.id);
-                  }
-                : undefined
-            }
-            role={ctx.onOpenDiffFile ? 'button' : undefined}
-            tabIndex={ctx.onOpenDiffFile ? 0 : undefined}
-            title={ctx.onOpenDiffFile ? 'Open file in side panel' : undefined}
-          >
-            <TurnEditsCard
-              assistantMessageId={message.id}
-              initialCount={editCount}
-              variant="inline"
-              isLatestTurn={isLatestTurnWithEdits}
-              defaultExpanded={isHighlighted}
-            />
+            <TurnMetaMenu meta={messageMeta(message)} />
+            <TurnTimestamp createdAt={createdAt} />
           </div>
         ) : null}
       </MessageContent>
+      {/* User-message footer — copy + timestamp under the bubble, hover-
+          revealed like the assistant's (2026-08-01 feedback). Outside
+          MessageContent: for user rows that IS the dark bubble. */}
+      {message.role === 'user' ? (
+        <div
+          className="-mt-1 mr-1.5 flex items-center gap-0.5 self-end transition-opacity [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:focus-within:opacity-100 [@media(hover:hover)]:group-hover:opacity-100"
+          data-testid="user-message-footer"
+        >
+          <CopyLinkButton
+            url={messagePlainText(parts)}
+            icon="copy"
+            label="Copy message"
+            tooltip="Copy message"
+            iconClassName="h-3.5 w-3.5"
+          />
+          <TurnTimestamp createdAt={createdAt} />
+        </div>
+      ) : null}
     </Message>
   );
 }
@@ -1008,7 +1469,8 @@ const MessageRow = memo(
     a.isStreamingMessage === b.isStreamingMessage &&
     a.isLatestTurnWithEdits === b.isLatestTurnWithEdits &&
     a.isHighlighted === b.isHighlighted &&
-    a.isJustCompletedTurn === b.isJustCompletedTurn &&
+    a.createdAt === b.createdAt &&
+    a.turnMetaKey === b.turnMetaKey &&
     a.ctx === b.ctx,
 );
 
@@ -1022,9 +1484,9 @@ const ROW_RETRY_MS = 1000;
 
 class MessageRowBoundary extends Component<
   { messageId: string; signature: string; children: ReactNode },
-  { failed: boolean }
+  { failed: boolean; stale: boolean }
 > {
-  state = { failed: false };
+  state = { failed: false, stale: false };
   private failedSignature: string | null = null;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -1034,7 +1496,16 @@ class MessageRowBoundary extends Component<
 
   componentDidCatch(error: Error) {
     console.error('[transcript] message render failed', error);
-    this.failedSignature = this.props.signature;
+    // A chunk missing after a redeploy never heals by retry: only a reload does.
+    if (isChunkLoadError(error)) {
+      // componentDidUpdate may already have armed a retry for this commit.
+      if (this.retryTimer) clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+      this.failedSignature = null;
+      this.setState({ stale: true });
+    } else {
+      this.failedSignature = this.props.signature;
+    }
   }
 
   componentDidUpdate() {
@@ -1063,7 +1534,20 @@ class MessageRowBoundary extends Component<
           data-message-id={this.props.messageId}
           data-testid="message-render-error"
         >
-          This message couldn’t be displayed.
+          {this.state.stale ? (
+            <>
+              This message needs a page refresh to display.{' '}
+              <button
+                type="button"
+                className="underline hover:text-stone-600"
+                onClick={reloadPage}
+              >
+                Refresh
+              </button>
+            </>
+          ) : (
+            'This message couldn’t be displayed.'
+          )}
         </div>
       );
     }
@@ -1082,11 +1566,12 @@ export function AIElementsTranscript({
   highlightedDiffId,
   scrollToBottomRef,
   isStreaming = false,
-  onOpenDiffFile,
-  latestTurnJustCompleted = false,
+  onOpenTurnDiff,
   knownFilePaths = [],
   workspaceId,
   onOpenWikiFile,
+  onOpenEditedFile,
+  attachmentHref,
 }: AIElementsTranscriptProps) {
   // Stable wrappers for the open callbacks. The parent recreates these whenever
   // its file map changes (handleOpenEditedFileInline depends on workspaceFiles,
@@ -1096,13 +1581,16 @@ export function AIElementsTranscript({
   // stays current without churning identity.
   const openWikiFileRef = useRef(onOpenWikiFile);
   openWikiFileRef.current = onOpenWikiFile;
-  const openDiffFileRef = useRef(onOpenDiffFile);
-  openDiffFileRef.current = onOpenDiffFile;
+  const openEditedFileRef = useRef(onOpenEditedFile);
+  openEditedFileRef.current = onOpenEditedFile;
+  const openTurnDiffRef = useRef(onOpenTurnDiff);
+  openTurnDiffRef.current = onOpenTurnDiff;
   const turnLinkShareGateRef = useRef(onTurnLinkShareGate);
   turnLinkShareGateRef.current = onTurnLinkShareGate;
   const stableOpenWikiFile = useCallback((path: string) => openWikiFileRef.current?.(path), []);
-  const stableOpenDiffFile = useCallback(
-    (assistantMessageId: string) => openDiffFileRef.current?.(assistantMessageId),
+  const stableOpenEditedFile = useCallback((path: string) => openEditedFileRef.current?.(path), []);
+  const stableOpenTurnDiff = useCallback(
+    (assistantMessageId: string) => openTurnDiffRef.current?.(assistantMessageId),
     [],
   );
   const stableTurnLinkShareGate = useCallback(() => turnLinkShareGateRef.current?.(), []);
@@ -1112,7 +1600,8 @@ export function AIElementsTranscript({
   // navigating. Mirrors the pre-memo behavior where the raw (possibly
   // undefined) callbacks were passed straight through.
   const hasOpenWikiFile = Boolean(onOpenWikiFile);
-  const hasOpenDiffFile = Boolean(onOpenDiffFile);
+  const hasOpenEditedFile = Boolean(onOpenEditedFile);
+  const hasOpenTurnDiff = Boolean(onOpenTurnDiff);
   const hasTurnLinkShareGate = Boolean(onTurnLinkShareGate);
   const wikiOpener = hasOpenWikiFile ? stableOpenWikiFile : undefined;
 
@@ -1129,11 +1618,14 @@ export function AIElementsTranscript({
       knownFilePaths,
       linkComponents: markdownFileLinkComponents,
       onOpenWikiFile: wikiOpener,
-      onOpenDiffFile: hasOpenDiffFile ? stableOpenDiffFile : undefined,
+      onOpenEditedFile: hasOpenEditedFile ? stableOpenEditedFile : undefined,
+      onOpenTurnDiff: hasOpenTurnDiff ? stableOpenTurnDiff : undefined,
       turnLinkBase,
       onTurnLinkShareGate: hasTurnLinkShareGate ? stableTurnLinkShareGate : undefined,
+      workspaceId,
+      attachmentHref,
     }),
-    [knownFilePaths, markdownFileLinkComponents, wikiOpener, stableOpenDiffFile, hasOpenDiffFile, turnLinkBase, hasTurnLinkShareGate, stableTurnLinkShareGate],
+    [knownFilePaths, markdownFileLinkComponents, wikiOpener, hasOpenEditedFile, stableOpenEditedFile, stableOpenTurnDiff, hasOpenTurnDiff, turnLinkBase, hasTurnLinkShareGate, stableTurnLinkShareGate, workspaceId, attachmentHref],
   );
 
   // renderMessages: merge a turn's split-across-messages tool steps into one
@@ -1205,6 +1697,7 @@ export function AIElementsTranscript({
 
         {renderMessages.map((message) => {
           const signature = messageRenderSignature(message);
+          const meta = messageMeta(message);
           return (
             <MessageRowBoundary key={message.id} messageId={message.id} signature={signature}>
               <MessageRow
@@ -1216,23 +1709,24 @@ export function AIElementsTranscript({
                 }
                 isLatestTurnWithEdits={message.id === latestAssistantWithEditsId}
                 isHighlighted={Boolean(highlightedDiffId) && message.id === highlightedDiffId}
-                isJustCompletedTurn={
-                  latestTurnJustCompleted &&
-                  latestAssistantId !== null &&
-                  message.id === latestAssistantId
-                }
+                createdAt={meta.created_at}
+                turnMetaKey={`${meta.model ?? ''}|${meta.input_tokens ?? ''}|${meta.output_tokens ?? ''}|${meta.duration_ms ?? ''}`}
               />
             </MessageRowBoundary>
           );
         })}
 
-        {showWorkingIndicator && !latestAssistantHasParts ? (
-          <div className="py-1">
-            <div className="inline-flex items-center gap-1 rounded-2xl rounded-bl-sm bg-stone-100 px-3 py-2">
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-stone-400 [animation-delay:0ms]" />
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-stone-400 [animation-delay:150ms]" />
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-stone-400 [animation-delay:300ms]" />
-            </div>
+        {(showWorkingIndicator || isStreaming) && !latestAssistantHasParts ? (
+          // Pre-first-token: same Sunny working line the streaming turn shows,
+          // so the whole run has one continuous "alive" signal (no dots).
+          // `isStreaming` (live useChat status, set synchronously on send) is
+          // OR'd in because the REST-derived `showWorkingIndicator` is stale in
+          // the send window on an existing chat: its latest-assistant row is
+          // the PREVIOUS turn's reply, whose content suppressed the line until
+          // the new run's row landed (2026-08-05 feedback).
+          <div className="flex h-6 items-center text-[14px] text-stone-500" data-testid="turn-working">
+            <SpinnerSlot show />
+            <span className="chat-shimmer">Thinking…</span>
           </div>
         ) : null}
 

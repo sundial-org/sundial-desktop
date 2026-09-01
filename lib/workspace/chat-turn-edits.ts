@@ -2,6 +2,10 @@ export type ChatTurnEditSummary = {
   assistantMessageId: string;
   /** Chat that owns the assistant message — used to jump to the right thread. */
   chatId: string | null;
+  /** Transcript message id to scroll to, when it differs from the review id.
+   *  Cloud turns ARE their message id and omit it; local review units are
+   *  synthetic `applied-<rowId>` sessions and carry the real one here. */
+  jumpMessageId?: string | null;
   createdAt: string | null;
   /** Raw `doc_edits.author_id` (e.g. `sunny:354` or a user id). */
   authorId: string | null;

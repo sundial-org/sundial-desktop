@@ -7,7 +7,7 @@ import { applyContentTextIfChanged, readDocumentText } from '../lib/crdt-js/docu
 import fsp from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 
-import { fileKind, isIgnoredPath, mimeFor, resolveInRoot } from './paths.mjs';
+import { fileKind, isEnvSecretPath, isIgnoredPath, mimeFor, resolveInRoot, scopeCoversPath, windowsUnwritableReason } from './paths.mjs';
 import { inExtraRoot } from './roots.mjs';
 import { syncShareLedger } from './ledger-sync.mjs';
 import { Readable } from 'node:stream';
@@ -15,6 +15,12 @@ import { deleteFile, readTextFile, walkProject, writeBlobStreamAtomic, writeText
 import { BRIDGE_ORIGIN } from './doc-host.mjs';
 const MAX_BRIDGED_FILES = 500;
 const CLOUD_POLL_MS = Number(process.env.SUNDIAL_BRIDGE_POLL_MS || 10_000);
+// Every comment-mirror request is deadline-bounded: comment reads run on the
+// sidecar's /comments REQUEST path, so a wedged backing workspace must
+// degrade to local-only threads, never hang the panel.
+const CLOUD_COMMENTS_TIMEOUT_MS = Number(process.env.SUNDIAL_CLOUD_COMMENTS_TIMEOUT_MS || 4_000);
+// How long a share stops asking a cloud that answered 404 (no mirror route).
+const COMMENTS_PARK_MS = Number(process.env.SUNDIAL_CLOUD_COMMENTS_PARK_MS || 5 * 60_000);
 // Blobs sync whole-file (sha-diffed, no CRDT) — bound the transfer size.
 // Local writes themselves are uncapped; this bounds only what crosses the
 // bridge (an oversized file logs a skip and simply stays local-only).
@@ -276,11 +282,12 @@ class FileBridge {
   }
 }
 
-/** One share = one cloud workspace synced with one scope (project root, a
- *  subfolder, or a single file) of a local project. Granular permissions fall
- *  out of this shape: only paths inside the scope are ever bridged, and who
- *  can see them is the cloud workspace's own member/invite ACL. */
-class ShareEngine {
+/** One share = one cloud workspace. Legacy model: one scope (project root,
+ *  subfolder, single file, or chat) per workspace, cloud paths translated to
+ *  be scope-relative. Grants model (scope_kind 'union'): one HIDDEN backing
+ *  workspace per local project syncs the union of its share_scopes at their
+ *  real relative paths; audiences live in cloud path_shares grants. */
+export class ShareEngine {
   constructor({ manager, share, project, resumeHorizon }) {
     this.manager = manager;
     this.share = share;
@@ -295,6 +302,13 @@ class ShareEngine {
     this.docHost = manager.docHost;
     this.store = manager.store;
     this.log = manager.log;
+    // Grants-model share (scope_kind 'union'): ONE engine per backing
+    // workspace syncs the union of its scopes at their real relative paths
+    // (identity mapping — no scope-root translation), and each scope's
+    // audience is a cloud path_shares grant. Legacy shares keep the
+    // one-workspace-per-scope model untouched.
+    this.isUnion = share.scope_kind === 'union';
+    this.scopes = this.isUnion ? this.store.listShareScopes(share.id) : [];
     this.bridges = new Map(); // localRel -> FileBridge
     this.socket = null;
     this.pollTimer = null;
@@ -310,6 +324,9 @@ class ShareEngine {
     // Each poll retries them; the share revives when the queue drains.
     this.pendingCloudOps = [];
     this.opsParked = false;
+    // Deadline until which comment mirroring is parked (0 = never parked); set
+    // when the cloud answers 404, i.e. has no mirror route. See #parkComments.
+    this.commentsParkedUntil = 0;
     // start() runs in the background after the server binds, so editor-open /
     // watcher events can race its offline-delete reconciliation. Until that
     // finishes, previously-synced files must NOT open bridges (a bridge would
@@ -332,9 +349,102 @@ class ShareEngine {
     // the 10s poll doesn't re-download the same huge blob forever. A new
     // cloud version (different sha) clears naturally by failing the compare.
     this.skippedBlobDownloads = new Map();
+    // Scope-root moves whose cloud half hasn't landed (durable across
+    // restarts): re-queue them, parking the engine until they drain — the
+    // start()/poll guards then defer everything that would act on a cloud
+    // listing these ops haven't caught up with.
+    if (this.isUnion) {
+      for (const move of this.store.listPendingScopeMoves(share.id)) {
+        this.queueCloudOp(`move ${move.from} -> ${move.to}`, this.scopeMoveOp(move));
+      }
+    }
+  }
+
+  /** The cloud half of a scope-root rename, idempotent: subtree move (404 =
+   *  already moved), grant move (no matching rows = already moved), then the
+   *  durable marker clears. Throwing keeps the share parked for retry.
+   *
+   *  Deliberately NOT under the project lock: this runs from pollCloud(), and
+   *  start() ends in a poll — so a locked section that restarts an engine
+   *  (add/stop) would deadlock on its own lock. The ordering against a stop
+   *  is bought with the watermark instead: a stop revokes through the highest
+   *  generation any PENDING relocation allocated (removeShareScopeLocked), so
+   *  a stamp landing before it is deleted with it, and one landing after it
+   *  finds no row left to stamp. */
+  scopeMoveOp(move) {
+    return async () => {
+      const res = await this.cloudFetch('/api/workspace/local-agent/file', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          workspaceId: this.share.workspace_id,
+          sourcePath: move.from,
+          targetPath: move.to,
+          editMode: 'edit',
+        }),
+      });
+      if (!res.ok && res.status !== 404) throw new Error(`cloud move failed ${res.status}`);
+      // EVERY relocation this move recorded, including hops the scope has
+      // since moved past: the generation is what carries the row over any
+      // revocation watermark at the intermediate path, and a chained rename
+      // whose middle hop transited unstamped would be swept there and never
+      // reach its final path. Which scopes actually adopt it is decided
+      // below, not here.
+      const relocations = move.relocations ?? [];
+      const grants = await this.cloudFetch('/api/workspace/local-agent/path-shares', {
+        method: 'POST',
+        body: JSON.stringify({
+          workspaceId: this.share.workspace_id,
+          fromPath: move.from,
+          toPath: move.to,
+          generations: Object.fromEntries(relocations.map((entry) => [entry.path, entry.generation])),
+        }),
+      });
+      // No 404 tolerance here: "already moved" is a 200 with moved:0 — a 404
+      // means the cloud lacks the route (deploy skew), and clearing the
+      // durable move would break outstanding ?pshare= links with no retry.
+      if (!grants.ok) throw new Error(`grant move failed ${grants.status}`);
+      // Bump the local scopes only once the cloud row carries the same
+      // generation. Bumping at rename time instead would hand a mint the new
+      // generation while the row still sat at the old one — the mint RAISES
+      // the row, and a raise over a recorded generation resets link + members
+      // server-side, wiping the very audience the rename preserves.
+      // ONLY the paths the route reports as stamped: a row that lost a target
+      // conflict, or already carried a higher generation, kept a generation
+      // the scope must not claim to have (same audience-wipe hazard, one step
+      // later). A non-array reply is an older cloud that ignored `generations`
+      // entirely — bumping there would strand scope above row. The store's own
+      // path guard drops the rest: a scope that moved on (chained rename) or
+      // was stopped no longer sits at the path this hop stamped.
+      // A body we cannot READ is not "an older cloud": the move may well have
+      // committed, and clearing the durable marker here would strand the scope
+      // below the generation the row now carries, out of reach of a later
+      // stop's watermark. Throw so the move stays queued — the route
+      // re-reports an already-stamped row by value, so the retry converges.
+      const outcome = await grants.json().catch(() => {
+        throw new Error('grant move reply unreadable');
+      });
+      if (Array.isArray(outcome?.stamped)) {
+        const landed = new Set(outcome.stamped);
+        let bumped = false;
+        for (const entry of relocations) {
+          if (landed.has(entry.path)) {
+            this.store.bumpShareScopeGeneration(entry.scopeId, entry.path, entry.generation);
+            bumped = true;
+          }
+        }
+        // The scopes the UI is holding just changed generation — tell it, or a
+        // modal opened while this move was parked keeps revoking with the
+        // pre-rename value.
+        if (bumped) this.manager.emitSharesChanged(this.project.id);
+      }
+      this.store.removePendingScopeMove(this.share.id, move);
+    };
   }
 
   scopeContains(rel) {
+    // Chat shares carry conversation history only — no file is ever in scope.
+    if (this.share.scope_kind === 'chat') return false;
+    if (this.isUnion) return this.scopes.some((scope) => scopeCoversPath(scope, rel));
     const scope = this.share.scope_path;
     if (!scope) return true;
     if (this.share.scope_kind === 'file') return rel === scope;
@@ -342,6 +452,7 @@ class ShareEngine {
   }
 
   localToCloud(rel) {
+    if (this.isUnion) return rel; // identity — cloud paths ARE local paths
     const scope = this.share.scope_path;
     if (!scope) return rel;
     if (this.share.scope_kind === 'file') return rel.split('/').pop();
@@ -349,6 +460,7 @@ class ShareEngine {
   }
 
   cloudToLocal(cloudPath) {
+    if (this.isUnion) return cloudPath;
     const scope = this.share.scope_path;
     if (!scope) return cloudPath;
     if (this.share.scope_kind === 'file') return scope;
@@ -367,7 +479,59 @@ class ShareEngine {
     return this.socket;
   }
 
+  /** Tear the shared socket down without taking the sidecar with it. Closing a
+   *  ws that is still CONNECTING throws ("WebSocket was closed before the
+   *  connection was established"), and the sidecar's uncaughtException handler
+   *  is a process.exit — so a stop that lands mid-handshake (stop sharing right
+   *  after starting one, or a slow/flaky Hocuspocus dial) would kill the local
+   *  backend outright. The socket is being discarded either way. */
+  destroySocket() {
+    if (!this.socket) return;
+    const socket = this.socket;
+    this.socket = null;
+    // ws emits that error on a nextTick AFTER Hocuspocus's cleanupWebSocket has
+    // removed its own listeners — the try/catch below can't see it, so keep a
+    // listener of our own on the raw socket or it lands as uncaughtException.
+    socket.webSocket?.on?.('error', () => {});
+    try {
+      socket.destroy();
+    } catch (error) {
+      this.log(`socket destroy failed (ignored) error=${error?.message}`);
+    }
+  }
+
+  /** Chat legacy shares — and union shares whose scopes are all chats — sync
+   *  through the ledger only: no file walk, no CRDT bridges, no collab socket. */
+  get ledgerOnly() {
+    if (this.share.scope_kind === 'chat') return true;
+    return this.isUnion && !this.scopes.some((scope) => scope.scope_kind !== 'chat');
+  }
+
+  /** Any chat scope makes the ledger trust-critical: a shared chat has no
+   *  CRDT/file fallback, so its upload failures must surface even while file
+   *  sync keeps running beside it (mixed unions). */
+  get ledgerCritical() {
+    if (this.ledgerOnly) return true;
+    return this.isUnion && this.scopes.some((scope) => scope.scope_kind === 'chat');
+  }
+
   async start() {
+    if (this.ledgerOnly) {
+      // Chat share: the ledger mirror (chat snapshot + its messages) IS the
+      // whole sync — no file walk, no CRDT bridges, no cloud file polling,
+      // and no collab socket (so no collab_url requirement either).
+      if (!this.share.api_origin || !this.share.token) {
+        this.status = 'error';
+        this.error = 'share is missing api_origin or token';
+        return;
+      }
+      this.resuming = false;
+      this.status = 'active';
+      await this.syncLedger();
+      if (this.stopped) return;
+      this.pollTimer = setInterval(() => void this.syncLedger(), CLOUD_POLL_MS);
+      return;
+    }
     if (!this.share.collab_url || !this.share.token) {
       this.status = 'error';
       this.error = 'share is missing collab_url or token';
@@ -387,11 +551,17 @@ class ShareEngine {
     // it first would push the stale local state back and resurrect it. If the
     // listing is unavailable (transient outage), DEFER previously-synced
     // files to the first successful poll instead of bridging blind; files
-    // never synced before are always safe to bridge.
-    const cloudPaths = await this.fetchCloudPaths().catch((error) => {
-      this.noteError('cloud-list', error);
-      return null;
-    });
+    // never synced before are always safe to bridge. An engine born PARKED
+    // (queued cloud ops — e.g. a scope-root rename whose cloud move hasn't
+    // landed) defers the same way: the listing predates the queued ops, so
+    // re-keyed bridge rows would misread as cloud deletes and reap the
+    // just-renamed local files.
+    const cloudPaths = this.opsParked
+      ? null
+      : await this.fetchCloudPaths().catch((error) => {
+          this.noteError('cloud-list', error);
+          return null;
+        });
     // stop() can land while the listing was in flight — a stopped engine
     // must not run the destructive reconciliation below during shutdown.
     if (this.stopped) return;
@@ -503,7 +673,7 @@ class ShareEngine {
       }
       if (this.share.scope_kind === 'file') {
         this.status = 'error';
-        this.error = `cloud file "${this.localToCloud(file.path)}" was removed or renamed — sharing stopped, local file kept`;
+        this.error = `cloud file "${this.localToCloud(file.path)}" was removed or renamed. Sharing stopped, local file kept.`;
         this.manager.emitSharesChanged(this.project.id);
         continue;
       }
@@ -672,10 +842,7 @@ class ShareEngine {
     if (!bridge) return;
     this.bridges.delete(localRel);
     await bridge.stop().catch(() => {});
-    if (this.bridges.size === 0 && this.socket) {
-      this.socket.destroy();
-      this.socket = null;
-    }
+    if (this.bridges.size === 0) this.destroySocket();
   }
 
   async cloudFetch(pathname, init = {}) {
@@ -684,7 +851,10 @@ class ShareEngine {
       signal: init.signal ?? this.stopAbort.signal,
       headers: {
         Authorization: `Bearer ${this.share.token}`,
-        'Content-Type': 'application/json',
+        // Only when we actually send JSON: a bodyless POST (the TUS create)
+        // that claims `application/json` is rejected 400 by Supabase Storage
+        // ("Body cannot be empty when content-type is set to application/json").
+        ...(init.body === undefined ? {} : { 'Content-Type': 'application/json' }),
         ...(init.headers || {}),
       },
     });
@@ -720,6 +890,238 @@ class ShareEngine {
       fetchedAt: Date.now(),
     };
     return this.lastCloudListing;
+  }
+
+  // ---- Doc comments (cloud backing store) ---------------------------------
+  // Link guests comment on the BACKING workspace through the normal cloud
+  // route; the local store never sees those rows. For share-covered paths the
+  // sidecar therefore reads/writes cloud threads through the mirror route —
+  // one store per conversation — and the poll below turns cloud-side changes
+  // into the same `comments-changed` SSE the local store emits.
+
+  supportsComments() {
+    if (this.share.scope_kind === 'chat') return false;
+    if (Date.now() < this.commentsParkedUntil) return false;
+    return !this.isUnion || this.scopes.some((scope) => scope.scope_kind !== 'chat');
+  }
+
+  /** A cloud origin OLDER than the mirror route (an app server or deployment
+   *  that predates it) answers 404 to the listing. Park mirroring for a
+   *  cool-off instead of failing every poll forever: comments fall back to the
+   *  local store — exactly how this share behaved before the mirror existed —
+   *  and a cloud that gains the route recovers on the next probe with no
+   *  sidecar restart. Logged once, on the first park, so a permanently old
+   *  cloud costs one line rather than one per poll. */
+  #parkComments() {
+    if (!this.commentsParkedUntil) {
+      this.log(
+        `share ${this.share.id} comments: cloud has no comment mirror — comments stay local`,
+      );
+    }
+    this.commentsParkedUntil = Date.now() + COMMENTS_PARK_MS;
+  }
+
+  /** Timeout + share-stop, whichever fires first. READS ONLY — aborting a
+   *  non-idempotent write that the server already persisted would roll back
+   *  the UI and invite a duplicating retry; mutations ride the share-stop
+   *  signal like every other bridge write. */
+  #commentsReadSignal() {
+    return AbortSignal.any([AbortSignal.timeout(CLOUD_COMMENTS_TIMEOUT_MS), this.stopAbort.signal]);
+  }
+
+  /** Wire threads → LOCAL shape (local projectId + local rel paths,
+   *  scope-filtered).
+   *
+   *  `rel` is the local file a PATH-SCOPED read asked for. The server answered
+   *  for that file (matching by path OR file_id), so every thread it returned
+   *  belongs there — including one still carrying its pre-rename path. Label
+   *  those with the file the caller asked about: the UI's edit/delete/open
+   *  actions key off `thread.filePath`, so a stale path aims them at a file
+   *  that no longer exists. Mutation echoes pass no `rel` on purpose — there
+   *  the mirror decides the authoritative path (it ignores a re-anchor onto a
+   *  DIFFERENT file), and the caller must not overrule it. */
+  #localizeCloudThreads(raw, rel = null) {
+    return (Array.isArray(raw) ? raw : [])
+      .map((thread) => ({
+        ...thread,
+        projectId: this.project.id,
+        filePath: rel ?? this.cloudToLocal(String(thread.filePath || '')),
+      }))
+      .filter((thread) => this.scopeContains(thread.filePath));
+  }
+
+  /** Cloud threads translated to the LOCAL wire shape. `rel === null` lists
+   *  the whole backing workspace and refreshes the id cache mutation routing
+   *  reads.
+   *
+   *  A single-file share's "whole workspace" IS its one file, so it asks the
+   *  server for that path instead: its cloudToLocal() maps EVERY cloud path
+   *  onto the one local file, and an unfiltered listing would surface an
+   *  unrelated backing-workspace thread as a comment on the shared file. The
+   *  server scopes by path OR file_id, so a thread still anchored to the
+   *  PRE-rename path comes back — a client-side path filter would instead hide
+   *  the conversation with no visible thread left to mutate and re-anchor. */
+  async fetchCloudComments(rel = null) {
+    if (!this.supportsComments()) return [];
+    // A single-file share's whole listing IS its one file.
+    const localRel = rel ?? (this.share.scope_kind === 'file' ? this.share.scope_path : null);
+    const cloudPath = localRel === null ? null : this.localToCloud(localRel);
+    const qs = cloudPath === null ? '' : `&path=${encodeURIComponent(cloudPath)}`;
+    const res = await this.cloudFetch(
+      `/api/workspace/local-agent/comments/mirror?workspaceId=${this.share.workspace_id}${qs}`,
+      { signal: this.#commentsReadSignal() },
+    );
+    // 404 means the ROUTE is absent (an older cloud): the GET handler itself
+    // never 404s, so this is unambiguous — unlike a mutation, where 404 is the
+    // ordinary "no such file/thread". Park quietly and keep the cache intact.
+    if (res.status === 404) {
+      this.#parkComments();
+      return [];
+    }
+    if (!res.ok) throw new Error(`cloud comments list failed status=${res.status}`);
+    const body = await res.json();
+    const threads = this.#localizeCloudThreads(body.threads, localRel);
+    // Full listings replace the cache (authoritative); file-scoped reads
+    // upsert into it — a thread the panel just rendered must stay routable
+    // for mutations without a second, possibly-timing-out full fetch.
+    if (rel === null) {
+      this.cloudComments = new Map(threads.map((thread) => [thread.id, thread]));
+    } else {
+      this.cloudComments ??= new Map();
+      for (const thread of threads) this.cloudComments.set(thread.id, thread);
+    }
+    return threads;
+  }
+
+  /** POST/PATCH/DELETE against the mirror route. Payload paths are LOCAL rels
+   *  (translated here); errors surface to the caller — a comment that cannot
+   *  reach the shared store must fail visibly, not fork into a local-only
+   *  copy the guests would never see. Returns the mirror's own echo (the
+   *  mutated file's threads, localized) so the response path never depends on
+   *  a SECOND cloud read that could time out and drop a persisted comment. */
+  async mutateCloudComment(method, payload) {
+    const body = { workspaceId: this.share.workspace_id, ...payload };
+    if (typeof body.filePath === 'string') body.filePath = this.localToCloud(body.filePath);
+    const res = await this.cloudFetch('/api/workspace/local-agent/comments/mirror', {
+      method,
+      body: JSON.stringify(body),
+    });
+    const parsed = await res.json().catch(() => null);
+    if (!res.ok) {
+      const error = new Error(parsed?.error || `cloud comment ${method} failed status=${res.status}`);
+      // A 404 with NO json body is the framework's "no such route" (older
+      // cloud); the mirror's own 404s ("File not found", "Comment thread not
+      // found") always carry `{error}`. Park so the caller can degrade to the
+      // local store instead of failing the comment — the poll that normally
+      // parks first is skipped while a share is ops-parked.
+      //
+      // The verdict rides on THIS error, never on engine state: a concurrent
+      // listing can park the engine while an unrelated failure (timeout, 500)
+      // is in flight, and degrading that one to a local row would fork a
+      // thread the cloud may already hold and still serve to link guests.
+      if (res.status === 404 && !parsed) {
+        this.#parkComments();
+        error.commentsMirrorMissing = true;
+      }
+      throw error;
+    }
+    const threads = this.#localizeCloudThreads(parsed?.threads);
+    // Keep the mutation-routing cache coherent: upsert the echoed threads and
+    // drop the target if the echo no longer lists it (thread-body delete).
+    if (this.cloudComments) {
+      for (const thread of threads) this.cloudComments.set(thread.id, thread);
+      if (payload.threadId && !threads.some((thread) => thread.id === payload.threadId)) {
+        this.cloudComments.delete(payload.threadId);
+      }
+    }
+    // `inserted` names OUR rows in the echoed listing (concurrent identical
+    // writes make content-matching ambiguous); null from pre-`inserted`
+    // mirrors — callers fall back.
+    threads.inserted = parsed?.inserted ?? null;
+    return threads;
+  }
+
+  /** Poll-driven change signal: refetch the backing workspace's threads and
+   *  emit `comments-changed` when their fingerprint moves. Baselines silently
+   *  on the first pass (reads merge live cloud data anyway). New messages
+   *  observed after the baseline also flow to the manager's comment hook so a
+   *  link GUEST's comment can wake local agents (owner-side posts trigger
+   *  inline in /comments; the clientId dedup makes double-observes no-ops). */
+  /** The delivery cursor is PERSISTED per share (bridge_comment_seen + a
+   *  baseline flag in settings): a restart must not re-baseline over guest
+   *  comments that arrived offline — they'd be skipped forever. */
+  #loadCommentCursor() {
+    if (this.commentsSeenMessageIds) return this.commentsSeenMessageIds;
+    this.commentsSeenMessageIds = new Set(this.store.loadCommentSeen(this.share.id));
+    this.commentsPollBaselined =
+      this.store.getSetting(`comments_baselined:${this.share.id}`) === '1';
+    return this.commentsSeenMessageIds;
+  }
+
+  #persistCommentSeen(messageIds) {
+    if (messageIds.length) this.store.addCommentSeen(this.share.id, messageIds);
+  }
+
+  /** Inline (owner-side) deliveries mark their message ids so the next poll
+   *  doesn't re-observe them as guest activity and fan them to watchers. Kept
+   *  apart from the baseline flag: marking must never make a cold poll treat
+   *  the whole backlog as deliverable. */
+  markCommentMessageSeen(messageId) {
+    if (!messageId) return;
+    this.#loadCommentCursor().add(messageId);
+    this.#persistCommentSeen([messageId]);
+  }
+
+  async pollCloudComments() {
+    if (!this.supportsComments()) return;
+    // The delivery cursor is POLL-OWNED: `cloudComments` is also updated by
+    // ordinary panel reads, which would silently consume pending deliveries.
+    // A stable id set also survives delete-then-add cycles counts miss.
+    const seen = this.#loadCommentCursor();
+    const baselined = this.commentsPollBaselined === true;
+    const threads = await this.fetchCloudComments(null);
+    // Parked mid-fetch (older cloud): the empty result is "we stopped asking",
+    // not "the guests deleted every thread" — don't fire a change for it.
+    if (!this.supportsComments()) return;
+    // Baselined only once a fetch SUCCEEDED and seeded the seen set — a
+    // failed first poll must not turn the next one into a backlog flood.
+    this.commentsPollBaselined = true;
+    this.store.setSetting(`comments_baselined:${this.share.id}`, '1');
+    const fingerprint = threads
+      .map((t) => `${t.id}:${t.updatedAt}:${t.status}:${t.messages.length}`)
+      .sort()
+      .join('|');
+    const previous = this.commentsFingerprint;
+    this.commentsFingerprint = fingerprint;
+    if (previous !== undefined && previous !== fingerprint) {
+      this.manager.emitCommentsChanged(this.project.id);
+    }
+    const newlySeen = [];
+    for (const thread of threads) {
+      for (const message of thread.messages) {
+        if (seen.has(message.id)) continue;
+        if (baselined && this.manager.onCloudCommentMessage) {
+          // Advance the cursor ONLY on a handled delivery — a transient store
+          // failure must retry next poll (clientId dedupe absorbs replays),
+          // not skip the comment forever.
+          let handled = false;
+          try {
+            handled =
+              this.manager.onCloudCommentMessage(this.project.id, {
+                thread,
+                message,
+                isNewThread: thread.messages[0]?.id === message.id,
+              }) !== false;
+          } catch (error) {
+            this.log(`cloud comment hook failed thread=${thread.id} error=${error?.message}`);
+          }
+          if (!handled) continue;
+        }
+        seen.add(message.id);
+        newlySeen.push(message.id);
+      }
+    }
+    this.#persistCommentSeen(newlySeen);
   }
 
   // ---- Blob sync (images & other binaries) --------------------------------
@@ -841,6 +1243,35 @@ class ShareEngine {
     }
   }
 
+  /** One-shot upload straight to storage via a server-signed URL — the
+   *  primary blob path. The cloud picks the content-addressed key and signs
+   *  it; the bytes never transit the app server, so the platform's request
+   *  body cap (~4.5 MB on Vercel, which 413'd a real user's main.pdf at
+   *  offset 0) does not apply. Returns 'done', or 'unsupported' when the
+   *  cloud predates the sign route (the TUS fallback handles those). */
+  async uploadBlobDirect({ workspaceId, sha, mime, bytes }) {
+    const sign = await this.cloudFetch('/api/workspace/uploads/sign', {
+      method: 'POST',
+      body: JSON.stringify({ projectId: workspaceId, sha }),
+    });
+    if (sign.status === 404 || sign.status === 405) return 'unsupported';
+    if (!sign.ok) throw new Error(`blob upload sign failed status=${sign.status}`);
+    const { url, exists } = await sign.json();
+    if (exists) return 'done'; // same sha already in storage — nothing to upload
+    if (!url) throw new Error('blob upload sign returned no url');
+    // No x-upsert: the sign route only ever hands out a non-upserting URL for
+    // a key it just proved absent, so a same-sha race lands as a 409 instead
+    // of silently overwriting another workspace's blob.
+    const put = await fetch(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': mime },
+      body: bytes,
+      signal: this.stopAbort.signal,
+    });
+    if (!put.ok) throw new Error(`blob upload failed status=${put.status} (direct)`);
+    return 'done';
+  }
+
   async uploadBlob(localRel, local) {
     const bytes = local.bytes ?? (await fsp.readFile(resolveInRoot(this.project.root, localRel)));
     const sha = local.sha;
@@ -853,9 +1284,12 @@ class ShareEngine {
     });
     if (!pre.ok) throw new Error(`blob precheck failed status=${pre.status}`);
     const { exists } = await pre.json();
-    if (!exists) {
-      // TUS: create the session, then a single whole-file PATCH (blobs are
-      // capped well under chunking territory).
+    if (!exists && (await this.uploadBlobDirect({ workspaceId, sha, mime, bytes })) === 'unsupported') {
+      // Older cloud without the sign route: the TUS proxy fallback. It only
+      // carries blobs under the platform's request-body cap (~4.5 MB on
+      // Vercel) — Supabase's TUS needs >=5 MiB non-final chunks, so bigger
+      // blobs cannot ride a proxied PATCH at all; the direct path above is
+      // how they upload.
       const meta = (values) =>
         Object.entries(values)
           .map(([k, v]) => `${k} ${Buffer.from(v, 'utf8').toString('base64')}`)
@@ -870,7 +1304,10 @@ class ShareEngine {
       });
       const location = create.headers.get('location');
       if (!(create.status === 200 || create.status === 201) || !location) {
-        throw new Error(`blob upload create failed status=${create.status}`);
+        // Carry the upstream reason: a bare status here cost a whole
+        // investigation once (the create was 400ing on a stray content-type).
+        const detail = await create.text().catch(() => '');
+        throw new Error(`blob upload create failed status=${create.status} ${detail.slice(0, 200)}`.trim());
       }
       for (let offset = 0; offset === 0 || offset < bytes.length; offset += BLOB_UPLOAD_CHUNK_BYTES) {
         const patch = await this.cloudFetch(location, {
@@ -918,7 +1355,24 @@ class ShareEngine {
   /** `basedOnLocalSha` is the local content the download decision was judged
    *  against (null = no local file existed) — re-checked right before the
    *  write so a local edit racing the transfer is never overwritten. */
+  /** True when this cloud path cannot exist on the local filesystem (Windows
+   *  reserved names, forbidden characters): skip the download LOUDLY once
+   *  instead of erroring on every poll. Upload-side never hits this — the
+   *  file could not have existed locally to begin with. */
+  skipUnwritableLocally(localRel) {
+    if (process.platform !== 'win32') return false;
+    const reason = windowsUnwritableReason(localRel);
+    if (!reason) return false;
+    if (!this.unwritableLogged) this.unwritableLogged = new Set();
+    if (!this.unwritableLogged.has(localRel)) {
+      this.unwritableLogged.add(localRel);
+      this.log(`share ${this.share.id} skip download ${localRel}: ${reason}. Rename it in the workspace to sync it here.`);
+    }
+    return true;
+  }
+
   async downloadBlob(localRel, expectedSha, basedOnLocalSha = null) {
+    if (this.skipUnwritableLocally(localRel)) return;
     if (this.skippedBlobDownloads.get(localRel) === (expectedSha ?? '')) return;
     const skipOversized = () => {
       this.skippedBlobDownloads.set(localRel, expectedSha ?? '');
@@ -985,8 +1439,18 @@ class ShareEngine {
 
   async flushPendingCloudOps() {
     if (this.pendingCloudOps.length > 0) {
+      // IN ORDER, stopping at the first failure: queued ops are causally
+      // ordered (a chained rename docs→papers→library queues two moves whose
+      // second only makes sense after the first) — running later ops past a
+      // failed earlier one would apply them against the wrong cloud state
+      // (the second move's 404 would read as "already moved" and clear its
+      // durable marker while the files sit at the intermediate path).
       const remaining = [];
       for (const op of this.pendingCloudOps) {
+        if (remaining.length > 0) {
+          remaining.push(op);
+          continue;
+        }
         try {
           await op.run();
         } catch {
@@ -1010,6 +1474,10 @@ class ShareEngine {
   async pollCloud() {
     if (this.stopped || !this.share.api_origin) return;
     await this.flushPendingCloudOps();
+    // Still parked (a queued delete/move hasn't landed): the cloud is in a
+    // state the queued ops haven't caught up with — pulling files or sweeping
+    // deletes against it would act on exactly the paths those ops own.
+    if (this.opsParked) return;
     const cloudPaths = await this.fetchCloudPaths();
     const { text: cloudTextPaths, stamps: cloudStamps } = cloudPaths;
     let cloudAllPaths = cloudPaths.all;
@@ -1034,7 +1502,11 @@ class ShareEngine {
     for (const cloudPath of cloudTextPaths) {
       const localRel = this.cloudToLocal(cloudPath);
       if (this.share.scope_kind === 'file' && cloudPath !== this.localToCloud(this.share.scope_path)) continue;
+      // Union shares: cloud files outside every scope (e.g. under a since-
+      // removed scope) never materialize locally.
+      if (!this.scopeContains(localRel)) continue;
       if (isIgnoredPath(localRel) || fileKind(localRel) !== 'text') continue;
+      if (this.skipUnwritableLocally(localRel)) continue;
       const bridge = this.bridges.get(localRel);
       if (bridge) {
         bridge.cloudSeen = true;
@@ -1104,7 +1576,7 @@ class ShareEngine {
         // file on absence would turn a rename into data loss. Keep the file
         // and park the share with a visible error instead.
         this.status = 'error';
-        this.error = `cloud file "${bridge.cloudPath}" was removed or renamed — sharing stopped, local file kept`;
+        this.error = `cloud file "${bridge.cloudPath}" was removed or renamed. Sharing stopped, local file kept.`;
         this.log(`file-share cloud path gone file=${localRel}; share parked`);
         continue;
       }
@@ -1125,7 +1597,7 @@ class ShareEngine {
       if (cloudAllPaths.has(this.localToCloud(localRel))) continue;
       if (this.share.scope_kind === 'file') {
         this.status = 'error';
-        this.error = `cloud file "${this.localToCloud(localRel)}" was removed or renamed — sharing stopped, local file kept`;
+        this.error = `cloud file "${this.localToCloud(localRel)}" was removed or renamed. Sharing stopped, local file kept.`;
         this.log(`file-share cloud path gone file=${localRel}; share parked`);
         continue;
       }
@@ -1154,8 +1626,10 @@ class ShareEngine {
 
     // A full poll pass succeeded: a lingering transient error (cloud-list
     // outage, per-file timeout) is over — clear it so the UI stops warning.
-    // Parked states (status 'error') stay until a token refresh / re-share.
-    if (this.error && this.status === 'active') {
+    // Parked states (status 'error') stay until a token refresh / re-share,
+    // and ledger errors are owned by syncLedger below (clearing here would
+    // flick a still-broken ledger's error off and on every poll).
+    if (this.error && this.status === 'active' && !this.error.startsWith('ledger-sync')) {
       this.error = null;
       this.manager.emitSharesChanged(this.project.id);
     }
@@ -1169,15 +1643,38 @@ class ShareEngine {
     // Single-flight: setInterval overlaps a slow pass with the next poll, and
     // a concurrent pass would read a chat-version reservation as a change and
     // mint a duplicate snapshot.
-    if (!this.ledgerSyncInFlight) {
-      this.ledgerSyncInFlight = true;
-      try {
-        await syncShareLedger(this);
-      } catch (error) {
-        this.log(`share ${this.share.id} ledger-sync: ${error?.message || error}`);
-      } finally {
-        this.ledgerSyncInFlight = false;
+    await this.syncLedger();
+
+    // Cloud-side comment changes (guest threads/replies on the backing
+    // workspace) become local SSE. Side channel like the ledger: log-only —
+    // a failed listing must never park document sync.
+    await this.pollCloudComments().catch((error) => {
+      this.log(`share ${this.share.id} comments-poll: ${error?.message || error}`);
+    });
+  }
+
+  async syncLedger() {
+    if (this.stopped || this.ledgerSyncInFlight) return;
+    this.ledgerSyncInFlight = true;
+    try {
+      await syncShareLedger(this);
+      // For chat-bearing shares the ledger is (part of) the sync — a full
+      // pass clears any lingering transient error (mirrors pollCloud's
+      // recovery).
+      if (this.ledgerCritical && this.error && this.status === 'active') {
+        this.error = null;
+        this.manager.emitSharesChanged(this.project.id);
       }
+    } catch (error) {
+      // Path-only shares: the ledger is a side channel — a rejected upload
+      // must never park document sync that is otherwise working (log only).
+      // Any CHAT scope makes it trust-critical: surface the failure
+      // (noteError parks the share on auth rejections; a token refresh
+      // revives it).
+      if (this.ledgerCritical) this.noteError('ledger-sync', error);
+      else this.log(`share ${this.share.id} ledger-sync: ${error?.message || error}`);
+    } finally {
+      this.ledgerSyncInFlight = false;
     }
   }
 
@@ -1208,6 +1705,17 @@ class ShareEngine {
   /** Local path created/changed/deleted (watcher or HTTP CRUD). */
   async handleLocalFileEvent(localRel) {
     if (this.stopped) return;
+    // Env-secret files never sync (isIgnoredPath covers every rail), but a
+    // silent skip would read as a bug to whoever just saved the file — say
+    // it once per path, with the supported alternative.
+    if (isEnvSecretPath(localRel) && this.scopeContains(localRel)) {
+      if (!this.envSkipLogged) this.envSkipLogged = new Set();
+      if (!this.envSkipLogged.has(localRel)) {
+        this.envSkipLogged.add(localRel);
+        this.log(`share ${this.share.id} secrets stay local: ${localRel} is never synced; use workspace secrets to share configuration`);
+      }
+      return;
+    }
     const abs = resolveInRoot(this.project.root, localRel);
     const stat = abs ? await fsp.stat(abs).catch(() => null) : null;
     if (stat?.isFile()) {
@@ -1341,28 +1849,128 @@ class ShareEngine {
     // After the bridges' final drops: rejects any still-hung cloud fetch so a
     // background resume blocked on it settles and shutdown's join returns.
     this.stopAbort.abort();
-    this.socket?.destroy();
+    this.destroySocket();
     this.status = 'stopped';
   }
 }
 
 export class SyncBridgeManager {
-  constructor({ store, docHost, log = () => {}, emitFilesChanged = () => {}, emitSharesChanged = () => {} }) {
+  constructor({
+    store,
+    docHost,
+    log = () => {},
+    emitFilesChanged = () => {},
+    emitSharesChanged = () => {},
+    emitCommentsChanged = () => {},
+    remoteOrigin = () => '',
+  }) {
     this.store = store;
     this.docHost = docHost;
     this.log = log;
+    /** () → the cloud origin this install proxies ('' = dev/direct). */
+    this.remoteOrigin = remoteOrigin;
     /** (projectId, path) → SSE notification, so cloud-driven creates/deletes
      *  refresh the local file tree like local ones do. */
     this.emitFilesChanged = emitFilesChanged;
     /** (projectId) → SSE notification on share STATUS transitions (parked,
      *  token-rejected, revived) — the UI's syncing badges must not lie. */
     this.emitSharesChanged = emitSharesChanged;
+    /** (projectId) → SSE notification when the BACKING workspace's comment
+     *  threads change (guest comments/replies), mirroring the local store's
+     *  own comments-changed events. */
+    this.emitCommentsChanged = emitCommentsChanged;
     this.engines = new Map(); // shareId -> ShareEngine
+    this.projectLocks = new Map(); // projectId -> promise-chain tail
     // Flipped by stopAll(): resumeAll() runs in the background after the
     // server binds, so shutdown must be able to cancel the remaining loop
     // instead of racing it (engines already mid-start are covered by their
     // own `stopped` flags).
     this.closed = false;
+  }
+
+  /** This install's own share rows. The ledger is ONE sqlite file per
+   *  machine, shared by every sidecar that has ever run on it, and each row is
+   *  bound to the deployment it was made against (`api_origin`) — its
+   *  workspace, token and audience all live in that cloud's database. So
+   *  another deployment's rows are not this app's to list, sync, block on or
+   *  revoke: prod shows prod's shares, dev shows dev's, and each set reappears
+   *  whole whenever a sidecar for that cloud runs again. (Rows a dev server
+   *  wrote into the packaged app's ledger — what starting a second sidecar
+   *  without SUNDIAL_LOCAL_HOME does — used to retry that dead cloud every
+   *  10s, veto new shares on the same path, and answer every Stop with
+   *  "Project not found".) An origin-less row predates the column and stays
+   *  ours; '' (dev/direct, no proxy) claims everything, as before. */
+  ownShares(projectId) {
+    const ours = this.remoteOrigin();
+    const rows = this.store.listShares(projectId);
+    if (!ours) return rows;
+    return rows.filter((share) => !share.api_origin || share.api_origin.replace(/\/$/, '') === ours);
+  }
+
+  /** The grants-model (union) row for THIS cloud. A project can hold one per
+   *  deployment — nothing in the ledger makes it unique — so selecting by
+   *  scope_kind alone could hand back another cloud's backing workspace and
+   *  fail every later share against it with "Project not found". */
+  unionShare(projectId) {
+    return this.ownShares(projectId).find((share) => share.scope_kind === 'union') ?? null;
+  }
+
+  /** The project's hidden backing workspace, remembered even when no scope
+   *  currently syncs (grants-model shares reuse it forever). */
+  backingWorkspaceId(projectId) {
+    return this.unionShare(projectId)?.workspace_id ?? null;
+  }
+
+  /** Per-project mutation lock (promise-chain mutex). Scope ADDS and STOPS
+   *  must serialize: a stop's "nothing survives → revoke every audience"
+   *  decision and its grant deletions are one critical section, and an add's
+   *  scope recording must land either before it (the stop then narrows) or
+   *  after it (the add's grant is only minted once this sidecar has recorded
+   *  the scope, i.e. after the stop's deletes finished). Without the lock an
+   *  add interleaving a stop could have its freshly minted grant swept by
+   *  the bulk revoke — a live scope left syncing with no audience. NOT
+   *  reentrant: locked sections call the `*Locked` internals, never the
+   *  public wrappers. */
+  withProjectLock(projectId, fn) {
+    const tail = this.projectLocks.get(projectId) ?? Promise.resolve();
+    const run = tail.then(fn);
+    // The stored tail must never reject — one failed mutation must not
+    // poison every later one.
+    this.projectLocks.set(projectId, run.catch(() => {}));
+    return run;
+  }
+
+  addShareScope(projectId, body) {
+    return this.withProjectLock(projectId, () => this.addShareScopeLocked(projectId, body));
+  }
+
+  removeShareScope(projectId, scopeId, opts) {
+    return this.withProjectLock(projectId, () => this.removeShareScopeLocked(projectId, scopeId, opts));
+  }
+
+  removeShare(projectId, shareId) {
+    return this.withProjectLock(projectId, () => this.removeShareLocked(projectId, shareId));
+  }
+
+  /** Mint-confirm: grant liveness is subordinate to sidecar truth. The modal
+   *  mints its cloud grant only AFTER addShareScope releases this lock, so a
+   *  stop can interleave — its target revoke finds no grant yet, removes the
+   *  scope, and the late mint would leave a live grant on a stopped scope.
+   *  Reading under the SAME lock means the answer lands strictly outside any
+   *  in-flight stop's critical section: scope gone → the caller revokes its
+   *  own mint (fail-closed); scope alive → the stop hasn't run, and its
+   *  post-removal re-revoke sweeps the grant when it does. */
+  confirmShareScope(projectId, { workspaceId, scopeKind, scopePath }) {
+    return this.withProjectLock(projectId, () => {
+      const share = this.unionShare(projectId);
+      const scope =
+        share?.enabled && share.workspace_id === workspaceId
+          ? this.store
+              .listShareScopes(share.id)
+              .find((entry) => entry.scope_kind === scopeKind && (scopeKind === 'project' || entry.scope_path === scopePath))
+          : null;
+      return { live: Boolean(scope), generation: scope?.generation ?? null };
+    });
   }
 
   async resumeAll({ interactiveSince = Date.now() } = {}) {
@@ -1374,8 +1982,10 @@ export class SyncBridgeManager {
     // deletes. Engines latch pre-start events (`resuming` arms at construct).
     const pending = [];
     for (const project of this.store.listProjects()) {
-      for (const share of this.store.listShares(project.id)) {
+      for (const share of this.ownShares(project.id)) {
         if (!share.enabled || this.engines.has(share.id)) continue;
+        // A union row with no scopes left has nothing to sync.
+        if (share.scope_kind === 'union' && this.store.listShareScopes(share.id).length === 0) continue;
         const engine = new ShareEngine({ manager: this, share, project, resumeHorizon: interactiveSince });
         this.engines.set(share.id, engine);
         pending.push(engine);
@@ -1412,44 +2022,326 @@ export class SyncBridgeManager {
     await engine.start();
   }
 
-  async createShare(projectId, body) {
+  /** First enabled LEGACY (pre-grants) share conflicting with (scopeKind,
+   *  scopePath): two engines would double-relay the same doc and eat each
+   *  other's echoes. Union scopes never conflict — one engine owns the whole
+   *  union, so overlapping audiences are legal — and legacy shares are no
+   *  longer creatable, so only rows predating the grants model land here. */
+  findOverlap(projectId, scopeKind, scopePath) {
+    const contains = (outer, inner) => !outer || inner === outer || inner.startsWith(`${outer}/`);
+    const conflicts = (otherKind, otherPath) => {
+      if (scopeKind === 'chat' || otherKind === 'chat') {
+        return scopeKind === 'chat' && otherKind === 'chat' && otherPath === scopePath;
+      }
+      return contains(otherPath, scopePath) || contains(scopePath, otherPath);
+    };
+    for (const existing of this.ownShares(projectId)) {
+      if (!existing.enabled || existing.scope_kind === 'union') continue;
+      if (conflicts(existing.scope_kind, existing.scope_path)) return existing;
+    }
+    return null;
+  }
+
+  /** Add one scope to the project's grants-model share, creating the union
+   *  share row (one per backing workspace) on first use, and (re)start its
+   *  engine. Called with a fresh 7-day token every time — the row's
+   *  connection info follows. */
+  async addShareScopeLocked(projectId, body) {
     const project = this.store.getProject(projectId);
     if (!project) throw Object.assign(new Error('unknown project'), { status: 404 });
     const workspaceId = typeof body.workspaceId === 'string' ? body.workspaceId.trim() : '';
     const collabUrl = typeof body.collabUrl === 'string' ? body.collabUrl.trim() : '';
     const apiOrigin = typeof body.apiOrigin === 'string' ? body.apiOrigin.trim().replace(/\/$/, '') : '';
     const token = typeof body.token === 'string' ? body.token.trim() : '';
-    const scopeKind = ['project', 'folder', 'file'].includes(body.scopeKind) ? body.scopeKind : 'project';
+    const scopeKind = ['project', 'folder', 'file', 'chat'].includes(body.scopeKind) ? body.scopeKind : 'project';
     const scopePath = scopeKind === 'project' ? '' : String(body.scopePath || '').trim();
-    if (!workspaceId || !collabUrl || !apiOrigin || !token) {
+    if (!workspaceId || !apiOrigin || !token || (!collabUrl && scopeKind !== 'chat')) {
       throw Object.assign(new Error('workspaceId, collabUrl, apiOrigin, token are required'), { status: 400 });
     }
     if (scopeKind !== 'project' && !scopePath) {
-      throw Object.assign(new Error('scopePath is required for folder/file shares'), { status: 400 });
+      throw Object.assign(new Error('scopePath is required for folder/file/chat shares'), { status: 400 });
     }
-    // Shares cover the PRIMARY root only: extra roots (multi-root mounts) are
-    // local context, not sync scopes — their events never reach engines below.
-    if (inExtraRoot(this.store, projectId, scopePath)) {
+    if (scopeKind === 'chat') {
+      const chat = this.store.getChat(scopePath);
+      if (chat?.project_id !== project.id) {
+        throw Object.assign(new Error('Import this chat before sharing it.'), { status: 400 });
+      }
+      // Watching chats can receive private comment deliveries at any moment
+      // (and the watcher exclusion would otherwise silently starve the watch
+      // while the chip still shows). Mirrors the cloud route's 409.
+      if (chat.comment_watch_path) {
+        throw Object.assign(
+          new Error('This chat is watching document comments. Stop watching before sharing it.'),
+          { status: 409 },
+        );
+      }
+      // Past deliveries leak too: the scope ledger uploads the chat's whole
+      // history, so a formerly-watching chat still carries private comment
+      // paths/quotes/bodies. Mirrors the cloud route's history 409.
+      if (this.store.chatHasCommentDeliveries(chat.id)) {
+        throw Object.assign(
+          new Error('This chat has received document-comment deliveries and cannot be shared.'),
+          { status: 409 },
+        );
+      }
+
+    }
+    if (scopeKind !== 'chat' && inExtraRoot(this.store, projectId, scopePath)) {
       throw Object.assign(new Error('Folders added from elsewhere on this computer cannot be shared yet.'), { status: 400 });
     }
-    // Overlapping enabled scopes are rejected: two engines relay the same
-    // local doc, and each filters BRIDGE_ORIGIN updates as its own echoes —
-    // so a cloud edit arriving through one share would never reach the other.
-    // One audience per subtree keeps sharing semantics predictable.
-    const contains = (outer, inner) => !outer || inner === outer || inner.startsWith(`${outer}/`);
-    const overlapping = this.store
-      .listShares(projectId)
-      .find((existing) => existing.enabled && (contains(existing.scope_path, scopePath) || contains(scopePath, existing.scope_path)));
-    if (overlapping) {
-      const label = overlapping.scope_path || 'the whole project';
+    const legacyOverlap = this.findOverlap(projectId, scopeKind, scopePath);
+    if (legacyOverlap) {
       throw Object.assign(
-        new Error(`Already synced by an existing share (${label}). Stop that share first.`),
+        new Error(`Already covered by an older share (${legacyOverlap.scope_path || 'the whole project'}). Stop that share first.`),
         { status: 409 },
       );
     }
-    const share = this.store.addShare({ projectId, workspaceId, scopePath, scopeKind, collabUrl, apiOrigin, token });
-    await this.startEngine(share, project);
-    return this.describeShare(share);
+    let share = this.unionShare(projectId);
+    if (share && share.workspace_id !== workspaceId) {
+      // The backing workspace is fixed per project. A different id means it
+      // was deleted/recreated cloud-side — only adoptable once no scope
+      // still syncs to the old one.
+      if (this.store.listShareScopes(share.id).length > 0) {
+        throw Object.assign(new Error('This project already syncs to a different backing workspace.'), { status: 409 });
+      }
+      await this.removeShareLocked(projectId, share.id);
+      share = null;
+    }
+    if (!share) {
+      // mintKey: the identity that owns an ATTACHED workspace (serve.sh
+      // --workspace), when it differs from the install's own — the daemon's
+      // daily re-mint presents it instead of the install identity.
+      // mintKind 'user': re-mint with the signed-in account's credentials
+      // (settings.agent_credentials) instead of any anon key.
+      const mintKey = typeof body.mintKey === 'string' && body.mintKey.trim() ? body.mintKey.trim() : null;
+      const mintKind = body.mintKind === 'user' ? 'user' : null;
+      share = this.store.addShare({ projectId, workspaceId, scopePath: '', scopeKind: 'union', collabUrl, apiOrigin, token, mintKey, mintKind });
+    } else {
+      this.store.updateShareConnection(share.id, {
+        collabUrl: collabUrl || share.collab_url,
+        apiOrigin,
+        token,
+      });
+    }
+    // Fresh scopes get the next per-project GENERATION; a re-add of a live
+    // scope keeps its existing one (conflict no-op).
+    const generation = this.store.nextScopeGeneration(projectId);
+    const { scope, inserted } = this.store.addShareScope(share.id, { scopeKind, scopePath, generation });
+    if (inserted) {
+      // Self-heal sweep: a FRESH scope's target must carry no grant — anything
+      // there is an orphan (a dead tab's mint for a PREVIOUS generation, or a
+      // generation-less mint from an older app). Revoke through generation-1
+      // with the fresh token we were just handed.
+      //
+      // FAIL CLOSED (Codex P2 round 33): a PRE-GENERATION (null) row is
+      // indistinguishable server-side from a live legacy share adopting its
+      // backfilled generation, so the mint route only resets the audience
+      // when it raises over a RECORDED generation — which leaves this sweep
+      // as the only thing standing between a stale null row and the re-added
+      // scope inheriting its link and members. `fetch` resolves on 4xx/5xx,
+      // so the status is checked too. Nothing is lost by refusing here: the
+      // very next thing this flow does is mint a grant against that same
+      // cloud, so an unreachable cloud cannot produce a working share anyway.
+      const sweep = await fetch(`${apiOrigin}/api/workspace/local-agent/path-shares`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspaceId,
+          ...(scopeKind === 'chat'
+            ? { chatId: `${scopePath}:${workspaceId}` }
+            : scopeKind === 'project'
+              ? { scope: 'workspace' }
+              : { path: scopePath }),
+          stoppedGeneration: generation - 1,
+        }),
+      }).catch((error) => {
+        this.log(`scope add sweep failed project=${projectId} error=${error?.message}`);
+        return null;
+      });
+      // 403 = this token has no grant standing on the workspace AT ALL (a
+      // non-owner attach: a collaborator syncing a workspace they can write
+      // but do not own). There is no orphan of OURS to clear — grant mint
+      // and revoke are both owner-gated, so this identity could never have
+      // created one, and failing closed could not remove someone else's
+      // either. The workspace's audience stays the owner's to manage;
+      // proceed. Every other failure still fails closed (see above).
+      if (!sweep?.ok && sweep?.status !== 403) {
+        // Roll the scope back so the share is not half-added: the engine has
+        // not started, and the union row (if this add created it) carries no
+        // scopes, exactly like after a stop.
+        this.store.removeShareScope(scope.id);
+        throw Object.assign(
+          new Error(
+            `Could not clear a previous share on this target (${sweep ? sweep.status : 'network error'}). Sharing NOT started.`,
+          ),
+          { status: 502 },
+        );
+      }
+    }
+    // Dekker verify vs watch activation: the watch path writes its column
+    // then re-checks shares, so we re-check the WATCH now that our scope row
+    // exists — in any interleaving one side sees the other. A raced watch
+    // rolls this scope back rather than shipping a watched chat's private
+    // comment history to link guests.
+    if (scopeKind === 'chat' && this.store.getChat(scopePath)?.comment_watch_path) {
+      this.store.removeShareScope(scope.id);
+      throw Object.assign(
+        new Error('This chat started watching document comments while being shared; the share was rolled back.'),
+        { status: 409 },
+      );
+    }
+    const engine = await this.restartUnionEngine(projectId, share.id);
+    if (engine) {
+      await engine.start().catch((error) => {
+        this.log(`union share start failed id=${share.id} error=${error?.message}`);
+      });
+    }
+    return this.describeScope(this.store.getShare(share.id), scope);
+  }
+
+  /** Remove one scope: the engine narrows to the remaining union. Cloud twins
+   *  are KEPT — the modal revokes the scope's audience (grants/ACL) first, so
+   *  the (private, hidden) backing workspace retains the synced data as
+   *  history. Bridge rows no remaining scope covers are forgotten, which
+   *  detaches the retained twins from local files: later local deletes or
+   *  renames never touch them, and a future re-share of the scope first-syncs
+   *  against the twin like any first contact (local wins on divergence). */
+  async removeShareScopeLocked(projectId, scopeId, { revoked = false, freshToken = null } = {}) {
+    const scope = this.store.getShareScope(scopeId);
+    const share = scope ? this.store.getShare(scope.share_id) : null;
+    if (!scope || !share || share.project_id !== projectId) {
+      throw Object.assign(new Error('unknown share'), { status: 404 });
+    }
+    // Under the project lock, so authoritative through every await below —
+    // concurrent adds queue behind this whole stop.
+    const remaining = this.store.listShareScopes(share.id).filter((entry) => entry.id !== scope.id);
+    const pending = this.store.pendingScopeRelocations(share.id, scope.id);
+    const stoppedGeneration = Math.max(scope.generation ?? 0, pending.generation);
+    const revokeCloud = async (target) => {
+      // A fresh caller-minted token wins over the stored one, which can be
+      // 7-day-stale — the final stop must not abort on it (fail-closed
+      // stays: no valid token at all still aborts with the scope intact).
+      const revoke = await fetch(`${share.api_origin}/api/workspace/local-agent/path-shares`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${freshToken || share.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceId: share.workspace_id, ...target }),
+      });
+      if (!revoke.ok) {
+        throw Object.assign(new Error(`audience revoke failed (${revoke.status}); sharing NOT stopped`), { status: 502 });
+      }
+    };
+    // Fail-closed, audience BEFORE teardown; ANY failure (a cloud without the
+    // route included) aborts with the scope intact — "stopped" must never
+    // leave the audience live. The scope's OWN grant is skipped for `revoked`
+    // callers (the modal already killed it with user auth, and repeating it
+    // on a stale bridge token would brick their stop). The LAST-scope bulk is
+    // never skipped: it belongs inside this locked section — that atomicity
+    // with concurrent adds is the whole point (see withProjectLock).
+    // …UNLESS an UNLANDED rename allocated a generation the modal cannot have
+    // seen: it revoked with the generation the scope still advertises, while
+    // the pending move may yet stamp the higher one onto the row — above the
+    // modal's watermark, leaving a live grant on a stopped scope. That window
+    // stays open as long as the cloud is unreachable, so it is worth the extra
+    // (fail-closed) call on the caller's fresh token. Once a move has LANDED
+    // the scope's own generation is authoritative and the skip holds again;
+    // the bump emits shares-changed so clients refresh onto it.
+    if (!revoked || stoppedGeneration > (scope.generation ?? 0)) {
+      await revokeCloud({
+        ...(scope.scope_kind === 'chat'
+          ? { chatId: `${scope.scope_path}:${share.workspace_id}` }
+          : scope.scope_kind === 'project'
+            ? { scope: 'workspace' }
+            : { path: scope.scope_path }),
+        // Generation-scoped: revoke THIS scope's grant (and older orphans),
+        // never a concurrently re-added scope's newer-generation grant.
+        // Through the highest generation an UNLANDED rename allocated too:
+        // that move may stamp it on the row at any moment (it runs off the
+        // poll, outside this lock), and a watermark below the stamp would
+        // leave the grant alive on a stopped scope.
+        ...(stoppedGeneration ? { stoppedGeneration } : {}),
+      });
+    }
+    // Every OTHER path an unlanded rename could still have this grant parked
+    // at (the chain's origin, and each hop of a chained A→B→C). The cloud row
+    // only moves when its queued move lands, so a chain stalled midway leaves
+    // the grant reachable wherever it stopped — revoking only the scope's
+    // current path would leave a stopped share live at B.
+    for (const path of pending.paths) {
+      if (path !== scope.scope_path) await revokeCloud({ path, stoppedGeneration });
+    }
+    if (remaining.length === 0) {
+      // Nothing survives this stop: every grant and the workspace ACL come
+      // off — the retained history must not stay reachable through anything.
+      // The wipe has no target of its own, so it carries this project's
+      // CURRENT generation counter as a workspace-wide revocation epoch: an
+      // audience mint already in flight (for any target, from any window)
+      // gates on it and dies, while the next scope add mints above it and
+      // passes. Read, never bumped — we hold the project lock, so the counter
+      // cannot move under us (Codex P1 round 32).
+      await revokeCloud({ all: true, stoppedGeneration: this.store.currentScopeGeneration(projectId) });
+    }
+    const engine = this.engines.get(share.id);
+    if (engine) {
+      await engine.stop();
+      this.engines.delete(share.id);
+    }
+    this.store.removeShareScope(scopeId);
+    for (const rel of this.store.listBridgeFiles(share.id)) {
+      if (scopeCoversPath(scope, rel) && !remaining.some((s) => scopeCoversPath(s, rel))) {
+        this.store.forgetBridgeFile(share.id, rel);
+      }
+    }
+    const next = await this.restartUnionEngine(projectId, share.id);
+    if (next) {
+      await next.start().catch((error) => {
+        this.log(`union share restart failed id=${share.id} error=${error?.message}`);
+      });
+    }
+  }
+
+  /** Stop + re-create the union engine from current store state. Returns the
+   *  new (unstarted) engine, or null when no scopes remain to sync. */
+  async restartUnionEngine(projectId, shareId) {
+    const engine = this.engines.get(shareId);
+    if (engine) {
+      await engine.stop();
+      this.engines.delete(shareId);
+    }
+    const share = this.store.getShare(shareId);
+    const project = this.store.getProject(projectId);
+    if (!share?.enabled || !project || this.store.listShareScopes(shareId).length === 0) return null;
+    const next = new ShareEngine({ manager: this, share, project });
+    this.engines.set(shareId, next);
+    return next;
+  }
+
+  /** Scope entries surface through the same shares list the UI already
+   *  consumes: one row per scope, `scope:<id>` ids (DELETE /shares routes on
+   *  the prefix), `share_id` pointing at the union row for token refresh. */
+  describeScope(share, scope) {
+    const engine = this.engines.get(share.id);
+    const synced = scope.scope_kind === 'chat' ? [] : this.store.listBridgeFiles(share.id);
+    return {
+      id: `scope:${scope.id}`,
+      share_id: share.id,
+      project_id: share.project_id,
+      workspace_id: share.workspace_id,
+      scope_path: scope.scope_path,
+      scope_kind: scope.scope_kind,
+      generation: scope.generation ?? null,
+      enabled: share.enabled,
+      // Which identity re-mints this share's token (attach-to-existing);
+      // null = the install's own headless identity, mint_kind 'user' = the
+      // signed-in account's credentials. Localhost-token-gated surface,
+      // same trust level as api_origin.
+      mint_key: share.mint_key ?? null,
+      mint_kind: share.mint_kind ?? null,
+      created_at: scope.created_at,
+      status: engine?.status ?? (share.enabled ? 'inactive' : 'disabled'),
+      error: engine?.error ?? null,
+      bridgedFiles: engine?.bridges.size ?? 0,
+      syncedFiles: synced.filter((rel) => scopeCoversPath(scope, rel)).length,
+    };
   }
 
   describeShare(share) {
@@ -1461,11 +2353,76 @@ export class SyncBridgeManager {
       status: engine?.status ?? (share.enabled ? 'inactive' : 'disabled'),
       error: engine?.error ?? null,
       bridgedFiles: engine?.bridges.size ?? 0,
+      // Durable "n files shared" count (text + blobs ever synced) — open
+      // bridges idle-close, so bridges.size reads 0 on a fully shared project.
+      syncedFiles: this.store.listBridgeFiles(share.id).length,
     };
   }
 
+  // ---- Doc comments on shared paths ---------------------------------------
+  // The single comment store for a shared conversation is the CLOUD backing
+  // workspace (guests can only ever see those rows); these helpers are what
+  // the sidecar's /comments handler routes through.
+
+  #commentEngines(projectId) {
+    return [...this.engines.values()].filter(
+      (engine) =>
+        engine.project.id === projectId &&
+        !engine.stopped &&
+        engine.share.api_origin &&
+        engine.supportsComments(),
+    );
+  }
+
+  /** Cloud threads visible to this project (optionally one file's), already
+   *  translated to local paths. Engines are read in PARALLEL — the panel's
+   *  worst case is one read timeout, not shares × timeout. Per-engine
+   *  failures degrade to fewer threads (logged) — a parked share must not
+   *  500 the whole comments listing. */
+  async listCloudCommentThreads(projectId, rel = null) {
+    const engines = this.#commentEngines(projectId).filter(
+      (engine) => rel === null || engine.scopeContains(rel),
+    );
+    const settled = await Promise.allSettled(engines.map((engine) => engine.fetchCloudComments(rel)));
+    return settled.flatMap((result, i) => {
+      if (result.status === 'fulfilled') return result.value;
+      this.log(`share ${engines[i].share.id} comments-list: ${result.reason?.message || result.reason}`);
+      return [];
+    });
+  }
+
+  /** Engine whose scope covers `rel`, if any — the signal that a NEW comment
+   *  belongs in the cloud store instead of the local one. */
+  commentEngineFor(projectId, rel) {
+    return this.#commentEngines(projectId).find((engine) => engine.scopeContains(rel)) ?? null;
+  }
+
+  /** Locate a cloud thread by id for mutation routing: engine caches first,
+   *  then one live refresh per engine (mutations are rare). */
+  async findCloudCommentThread(projectId, threadId) {
+    const engines = this.#commentEngines(projectId);
+    for (const engine of engines) {
+      const cached = engine.cloudComments?.get(threadId);
+      if (cached) return { engine, thread: cached };
+    }
+    for (const engine of engines) {
+      try {
+        await engine.fetchCloudComments(null);
+      } catch (error) {
+        this.log(`share ${engine.share.id} comments-lookup: ${error?.message || error}`);
+      }
+      const thread = engine.cloudComments?.get(threadId);
+      if (thread) return { engine, thread };
+    }
+    return null;
+  }
+
   describeShares(projectId) {
-    return this.store.listShares(projectId).map((share) => this.describeShare(share));
+    return this.ownShares(projectId).flatMap((share) =>
+      share.scope_kind === 'union'
+        ? this.store.listShareScopes(share.id).map((scope) => this.describeScope(share, scope))
+        : [this.describeShare(share)],
+    );
   }
 
   refreshShareToken(projectId, shareId, token) {
@@ -1489,7 +2446,7 @@ export class SyncBridgeManager {
     }
   }
 
-  async removeShare(projectId, shareId) {
+  async removeShareLocked(projectId, shareId) {
     const share = this.store.getShare(shareId);
     if (!share || share.project_id !== projectId) {
       throw Object.assign(new Error('unknown share'), { status: 404 });
@@ -1530,6 +2487,14 @@ export class SyncBridgeManager {
     if (inExtraRoot(this.store, projectId, fromRel) || inExtraRoot(this.store, projectId, toRel)) return;
     for (const [shareId, engine] of Array.from(this.engines.entries())) {
       if (engine.project.id !== projectId || engine.stopped) continue;
+      // Chat scopes are chat ids, not paths — never scope-follow a rename.
+      if (engine.share.scope_kind === 'chat') continue;
+      if (engine.isUnion) {
+        await this.handleUnionRename(shareId, engine, fromRel, toRel).catch((error) => {
+          this.log(`union rename failed from=${fromRel} error=${error?.message}`);
+        });
+        continue;
+      }
       const scope = engine.share.scope_path;
       if (scope && (scope === fromRel || scope.startsWith(`${fromRel}/`))) {
         // The scope root (or an ancestor folder) was renamed: the share
@@ -1593,6 +2558,61 @@ export class SyncBridgeManager {
         this.log(`bridge rename failed from=${fromRel} error=${error?.message}`);
       });
     }
+  }
+
+  /** Rename under a grants-model share. When the renamed path is a shared
+   *  scope root (or an ancestor of one), the scopes FOLLOW it: one cloud
+   *  subtree move keeps the twins' history, the covering path_shares grants
+   *  move with them (outstanding links keep working), bookkeeping re-keys,
+   *  and the engine restarts on the new union. Failed cloud ops park the
+   *  restarted engine behind the retry queue, same as the legacy model. */
+  async handleUnionRename(shareId, engine, fromRel, toRel) {
+    const affected = engine.scopes.filter(
+      (scope) =>
+        scope.scope_kind !== 'chat' &&
+        scope.scope_path &&
+        (scope.scope_path === fromRel || scope.scope_path.startsWith(`${fromRel}/`)),
+    );
+    if (affected.length === 0) {
+      // Plain rename inside/around the union — identity mapping makes the
+      // engine's own move/delete/bridge rails handle it.
+      await engine.handleLocalRename(fromRel, toRel);
+      return;
+    }
+    // Persist the WHOLE follow before any awaited teardown: the disk rename
+    // already happened, so a crash mid-stop() must find the durable marker
+    // (or restart reconciliation would misread re-keyed rows as cloud
+    // deletes and reap the renamed local files) AND the re-keyed scopes (or
+    // the share would keep pointing at the old, now-empty path). A stale
+    // bridge row the still-live engine writes in this instant is harmless —
+    // the narrowed scopes make every sweep skip it.
+    // Fresh generations ride the follow, durably in the move marker: the
+    // moved grant must land ABOVE any revocation watermark already keyed to
+    // its NEW path — a previous share stopped there at a higher generation
+    // would otherwise have the next mint 409 and self-delete the moved grant
+    // (Codex round 31). Allocated NOW (per-project monotonic, so they clear
+    // every prior watermark, and a stop can revoke through them while the
+    // move is still in flight) but stamped only when the cloud move lands.
+    const relocations = affected.map((scope) => ({
+      scopeId: scope.id,
+      path: scope.scope_path === fromRel ? toRel : toRel + scope.scope_path.slice(fromRel.length),
+      generation: this.store.nextScopeGeneration(engine.project.id),
+    }));
+    this.store.addPendingScopeMove(shareId, { from: fromRel, to: toRel, relocations });
+    this.store.renameBridgePaths(shareId, fromRel, toRel);
+    for (const entry of relocations) this.store.updateShareScopePath(entry.scopeId, entry.path);
+    await engine.stop();
+    this.engines.delete(shareId);
+    // The fresh engine re-queues the pending move from the marker (parked);
+    // one eager flush completes the happy path before start, and a failure
+    // keeps it parked — bridging the new paths while the old cloud twins
+    // still exist would fork fresh docs at the target.
+    const next = await this.restartUnionEngine(engine.project.id, shareId);
+    if (!next) return;
+    await next.flushPendingCloudOps().catch(() => {});
+    await next.start().catch((error) => {
+      this.log(`union rename restart failed id=${shareId} error=${error?.message}`);
+    });
   }
 
   async stopProject(projectId) {

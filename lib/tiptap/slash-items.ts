@@ -13,6 +13,7 @@ import { MATH_TEXT_REGEX } from '@/lib/tiptap/math-decorations';
 export type SlashItemAvailability = {
   hasImageUpload: boolean;
   hasAskSunny?: boolean;
+  hasGenerateImage?: boolean;
 };
 
 export type SlashItemContext = {
@@ -25,6 +26,9 @@ export type SlashItemContext = {
    *  surrounding paragraph as anchor context; an empty `instruction` means
    *  "open the ask popup" instead of sending directly. */
   askSunny?: (detail: { text: string; instruction: string; caret?: CaretAnchor['caret'] }) => void;
+  /** Opens the AI image-generation popup at the caret (wired by the
+   *  editor). An empty `prompt` derives one from the doc context. */
+  generateImage?: (detail: { prompt: string }) => void;
 };
 
 export type SlashItem = {
@@ -227,6 +231,29 @@ export const SLASH_ITEMS: SlashItem[] = [
       insertDefaultTable(editor);
     },
   },
+  // Before the upload item: both match "/image" and ties keep curated order,
+  // so the documented bare-"/image" flow must hit generation first.
+  {
+    title: 'Generate image',
+    description: 'AI image at the caret: /image <description>',
+    keywords: ['image', 'img', 'generate', 'gen', 'picture', 'illustration'],
+    icon: 'image-gen',
+    freeText: true,
+    isAvailable: ({ hasGenerateImage }) => !!hasGenerateImage,
+    // "/image a red fox in the fog[Enter]" — the description is everything
+    // after the matched trigger word; a bare "/image" opens the popup with
+    // an empty prompt (the route derives one from the doc context).
+    run: ({ editor, range, generateImage }) => {
+      const raw = editor.state.doc.textBetween(range.from, range.to).slice(1).trim();
+      const lower = raw.toLowerCase();
+      const trigger = ['image', 'img', 'generate', 'gen'].find(
+        (t) => lower === t || lower.startsWith(`${t} `),
+      );
+      const prompt = trigger ? raw.slice(trigger.length).trim() : raw;
+      editor.chain().focus().deleteRange(range).run();
+      generateImage?.({ prompt });
+    },
+  },
   {
     title: 'Image',
     description: 'Upload from your computer',
@@ -239,8 +266,8 @@ export const SLASH_ITEMS: SlashItem[] = [
     },
   },
   {
-    title: 'Ask Sunny',
-    description: 'AI edit in place — /ai <what to do>',
+    title: 'Ask agent',
+    description: 'AI edit in place: /ai <what to do>',
     keywords: ASK_KEYWORDS,
     icon: 'sparkle',
     freeText: true,

@@ -37,6 +37,8 @@ const INSTRUCTIONS_TEXTAREA_CLASSES =
 interface WorkspaceTabProps {
   workspaceId?: string;
   canWrite?: boolean;
+  /** Owner-only controls (agent-key revoke) render only when true. */
+  isOwner?: boolean;
   // Controlled by the parent so edits survive close+reopen of the settings
   // panel (this component unmounts when the user switches tabs).
   spaceInstructions: string;
@@ -162,7 +164,7 @@ function AgentsFileInstructions({
   return (
     <div>
       <p className="text-[13px] text-stone-500 mb-3">
-        Instructions live in AGENTS.md — edits here update that file.
+        Instructions live in AGENTS.md. Edits here update that file.
       </p>
       <textarea
         rows={8}
@@ -186,9 +188,81 @@ function AgentsFileInstructions({
   );
 }
 
+/**
+ * Owner-only revoke control for the workspace's creation key. A workspace
+ * created by an agent via /new keeps honoring that key in suggest mode even
+ * after the human claims it (lib/get-ops.ts authorize); this is the kill
+ * switch. Self-contained: GET /api/workspace reports `agent_key_active` only
+ * to the owner, so the card simply stays hidden for everyone else.
+ */
+function AgentAccessCard({ workspaceId, isOwner }: { workspaceId: string; isOwner: boolean }) {
+  const [state, setState] = useState<'hidden' | 'active' | 'revoking' | 'revoked' | 'error'>('hidden');
+
+  useEffect(() => {
+    setState('hidden');
+    // Owner-gated client-side too: for everyone else the GET can only ever
+    // come back without the flag, so skipping it saves the whole access
+    // chain the route would run just to say nothing.
+    if (!isOwner) return;
+    const controller = new AbortController();
+    void fetch(`/api/workspace?projectId=${encodeURIComponent(workspaceId)}`, {
+      credentials: 'include',
+      cache: 'no-store',
+      signal: controller.signal,
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((payload: { agent_key_active?: boolean } | null) => {
+        if (!controller.signal.aborted && payload?.agent_key_active) setState('active');
+      })
+      .catch(() => {});
+    return () => controller.abort();
+  }, [workspaceId, isOwner]);
+
+  const revoke = useCallback(async () => {
+    setState('revoking');
+    try {
+      const res = await fetch('/api/workspace', {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ projectId: workspaceId, revoke_agent_key: true }),
+      });
+      if (!res.ok) throw new Error(`Revoke failed (${res.status})`);
+      setState('revoked');
+    } catch {
+      setState('error');
+    }
+  }, [workspaceId]);
+
+  if (state === 'hidden') return null;
+  return (
+    <div data-testid="agent-access-section">
+      <p className="text-[13px] text-stone-500 mb-2">Agent access</p>
+      <div className="flex items-center gap-3 rounded-xl border border-stone-200 px-3 py-2">
+        <span className="min-w-0 flex-1 text-[13px] text-stone-600">
+          {state === 'revoked'
+            ? 'Revoked. The key is dead; any session it already opened expires within 30 minutes.'
+            : 'The agent that created this workspace can still read it and propose suggested edits with its creation key.'}
+        </span>
+        {state !== 'revoked' ? (
+          <button
+            type="button"
+            onClick={() => void revoke()}
+            disabled={state === 'revoking'}
+            className="shrink-0 text-[11px] text-stone-400 transition-colors hover:text-red-500 disabled:opacity-50"
+          >
+            {state === 'revoking' ? 'Revoking…' : state === 'error' ? 'Retry revoke' : 'Revoke'}
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 export function WorkspaceTab({
   workspaceId,
   canWrite = true,
+  isOwner = false,
   spaceInstructions,
   onSpaceInstructionsChange,
   agentsFile,
@@ -314,6 +388,7 @@ export function WorkspaceTab({
         </div>
       </div>
       )}
+      {workspaceId ? <AgentAccessCard workspaceId={workspaceId} isOwner={isOwner} /> : null}
       {archivedChats && archivedChats.length > 0 ? (
         // Archived chats live only here (never in the rail) — unarchive
         // returns them to the chat list.

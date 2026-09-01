@@ -15,8 +15,10 @@ export function useWorkspaceStartupIntents({
   chatsProjectId,
   preferencesLoaded,
   filesLoaded,
+  canWrite,
   chatThreadsCount,
   isChatMode,
+  chatSurfaceOpen,
   isMobile,
   deepLinkedFileId,
   deepLinkedFilePath,
@@ -37,8 +39,14 @@ export function useWorkspaceStartupIntents({
   chatsProjectId: string | null;
   preferencesLoaded: boolean;
   filesLoaded: boolean;
+  /** Resolved with the files payload — optimistically true before that. */
+  canWrite: boolean;
   chatThreadsCount: number;
   isChatMode: boolean;
+  /** Chat is part of the arrival layout (explicit chat link / stored chat
+   *  layout). False on the file-first default, where nothing may take the
+   *  center over once the chat list resolves. */
+  chatSurfaceOpen: boolean;
   isMobile: boolean;
   deepLinkedFileId: string | null;
   deepLinkedFilePath: string | null;
@@ -51,7 +59,7 @@ export function useWorkspaceStartupIntents({
   /** Replace the center with chat alone (stale deep-linked file → take over). */
   revealChatFullScreen: () => void;
   setSelectedFilePath: (path: string) => void;
-  setMobilePanel: (panel: 'chats' | 'files' | null) => void;
+  setMobilePanel: (panel: 'files' | null) => void;
   setShowMetaFiles: (value: boolean) => void;
 }) {
   const autoFileHandledRef = useRef<string | null>(null);
@@ -79,6 +87,25 @@ export function useWorkspaceStartupIntents({
     const urlParams = new URLSearchParams(window.location.search);
     if (urlParams.get('chatId')) return;
 
+    // canWrite is optimistic until the files payload resolves — wait, or a
+    // read-only guest gets a blank chat opened OVER the shared document. A
+    // resolved read-only visitor never gets one: their composer is disabled,
+    // and the arrival swap owns their landing surface.
+    if (!filesLoaded) return;
+    if (!canWrite) {
+      didAutoOpenInitialChatRef.current = true;
+      return;
+    }
+
+    // File-first arrival: a workspace whose chat list comes back empty must
+    // not pull the center off the document the landing already placed. The
+    // rail's auto-draft still gives this workspace a ready chat (page.tsx,
+    // `deferTab`); opening it is the user's click on the Chats section.
+    if (!chatSurfaceOpen) {
+      didAutoOpenInitialChatRef.current = true;
+      return;
+    }
+
     if (!isChatMode) {
       setWorkspaceViewMode('chat');
     }
@@ -86,6 +113,8 @@ export function useWorkspaceStartupIntents({
     didAutoOpenInitialChatRef.current = true;
     void startBlankChat();
   }, [
+    canWrite,
+    chatSurfaceOpen,
     chatThreadsCount,
     chatsProjectId,
     chatsLoaded,

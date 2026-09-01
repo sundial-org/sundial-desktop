@@ -78,7 +78,7 @@ export function JitGitHubConnectModal({
         <h2 className="mt-3 text-lg font-semibold text-stone-900">Connect GitHub to continue</h2>
         <p className="mt-2 text-sm text-stone-500">
           Sundial uses <span className="font-medium text-stone-700">your</span> GitHub token for
-          writes so commits show your identity — never a teammate&apos;s. Connect once and we&apos;ll use it
+          writes so commits show your identity, never a teammate&apos;s. Connect once and we&apos;ll use it
           for every workspace.
         </p>
         {action ? (

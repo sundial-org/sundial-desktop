@@ -68,12 +68,19 @@ export function resolveRestoredOpenPanels(
 
 /**
  * Open-set for arriving at a workspace. URL intents win: editor-intent URLs
- * (?fileId=, comment/diff anchors) land on the document, ?chat=1 forces chat
- * open. A plain workspace URL restores the workspace's stored layout — leaving
- * and coming back puts you where you left off (e.g. chat + review while
- * multitasking across workspaces) — and only a first visit (nothing stored)
- * lands on the chat box so the first act is telling the agent what you want,
- * not staring at a doc (Open-Knowledge-style onboarding; the blank-page fix).
+ * (?fileId=, comment/diff anchors) land on the document, ?chat=1 / ?chatId=
+ * force chat open. A plain workspace URL restores the workspace's stored
+ * layout — leaving and coming back puts you where you left off (e.g. chat +
+ * review while multitasking across workspaces).
+ *
+ * A first visit (nothing stored, no URL intent) lands on the DOCUMENT
+ * (founder decision, 2026-08-10 — this reverses the earlier chat-first
+ * arrival). Sundial is an editor: opening on an empty chat box read as a
+ * ChatGPT clone and left the file tree looking empty, so every workspace now
+ * opens on a file (a new workspace's seeded welcome.md, a returning visit's
+ * last file, otherwise the default document). Chat is one click away in the
+ * left rail's Chats section. An explicit chat deep link still lands on chat,
+ * which is what keeps shared-chat links working.
  */
 export function resolveArrivalOpenPanels(args: {
   /** Persisted openPanels (already legacy-migrated); null when nothing stored. */
@@ -87,14 +94,68 @@ export function resolveArrivalOpenPanels(args: {
 }): CenterPanel[] {
   const editorIntent = args.hasDeepLinkedFile || args.hasEditorAnchor;
   // Editor intent forces the editor into the restored set; otherwise the
-  // stored layout restores as-is. A first visit (nothing stored, no editor
-  // intent) lands on the chat box, which also satisfies any chat intent.
+  // stored layout restores as-is. Nothing stored (first visit, or a persisted
+  // empty center that is not a layout worth stranding an arrival on) lands on
+  // the document — unless the URL explicitly asked for chat, which lands on
+  // chat alone exactly as a shared chat link always has.
   let panels = editorIntent
     ? resolveRestoredOpenPanels(args.stored ?? ['editor'], true)
     : args.stored ?? [];
-  if (panels.length === 0) return ['chat'];
+  if (panels.length === 0) return args.chatIntent ? ['chat'] : ['editor'];
   if (args.chatIntent) panels = addPanel(panels, 'chat');
   return panels;
+}
+
+/**
+ * Whether an arrival that landed chat-sole should be swapped to the document.
+ *
+ * Since file-first arrival (2026-08-10) a plain URL never lands chat-sole, so
+ * `chatArrivalDefault` is now only true for a STORED chat-only layout — which
+ * leaves exactly one live case: a read-only visitor whose stored layout is
+ * chat-only gets swapped to the document, because chat isn't theirs to drive
+ * (the original security semantics). Owners and can-write members keep the
+ * layout they saved, and explicit chat deep links always stay on chat.
+ *
+ * This is the one arrival rule that still resolves ASYNCHRONOUSLY (isOwner /
+ * canWrite arrive with the files payload). It is unreachable on the default
+ * path; see the precedence list in the file-first rollout notes before making
+ * it reachable again.
+ */
+export function shouldSwapArrivalToDocument(args: {
+  isOwner: boolean;
+  canWrite: boolean;
+  /** The untouched chat-first arrival default is still up. */
+  chatArrivalDefault: boolean;
+  /** A stored layout existed for this workspace (not a first visit). */
+  hadStoredLayout: boolean;
+  /** ?chatId= / ?chat=1 (excluding another session's dead draft- ids). */
+  explicitChatIntent: boolean;
+}): boolean {
+  if (args.isOwner || !args.chatArrivalDefault || args.explicitChatIntent) return false;
+  return !args.canWrite || !args.hadStoredLayout;
+}
+
+/**
+ * A chat-sole arrival (an explicit ?chatId= / ?chat=1 link, or a stored
+ * chat-only layout), before the chat id resolves: the open-set already says
+ * the center belongs to chat, but no chat TAB exists yet. The primary pane must render the chat
+ * surface from the FIRST paint — never mount the preselected document and
+ * yank it seconds later when the chat tab lands (the arrival flash). Desktop
+ * only: mobile renders the chat column directly from the open-set. Any pane
+ * tab (a restored snapshot, an explicit open) means the arrival already has
+ * real content and the pending window is over — and until the persisted pane
+ * snapshot has been restored (`panesRestored`), the pane state can't be
+ * trusted as empty, so a stale `['chat']` open-set saved alongside a snapshot
+ * with real tabs must not flash the chat surface over the restoring layout.
+ */
+export function chatFirstArrivalPending(args: {
+  openPanels: CenterPanel[];
+  isMobile: boolean;
+  anyPaneTabs: boolean;
+  panesRestored: boolean;
+}): boolean {
+  if (args.isMobile || args.anyPaneTabs || !args.panesRestored) return false;
+  return args.openPanels.length === 1 && args.openPanels[0] === 'chat';
 }
 
 /**
@@ -102,6 +163,86 @@ export function resolveArrivalOpenPanels(args: {
  * pre-split shared key, kept only as a one-time migration source (and as the
  * fallback when no projectId is resolved).
  */
+// ---- Embedded panel view (`?view=panel`) ----------------------------------
+
+export const PANEL_VIEW_QUERY_PARAM = 'view';
+export const PANEL_VIEW_QUERY_VALUE = 'panel';
+const PANEL_VIEW_STORAGE_KEY = 'sundial:panel-view';
+
+/**
+ * True when this session runs as an embedded side panel (a ChatGPT / Claude
+ * desktop app view, or any host iframe): `?view=panel` on arrival, latched
+ * into sessionStorage — mirroring the desktop shell's `sundialDesktop=1`
+ * latch — so SPA navigation and the URL view-mirror, which rewrite the query,
+ * don't silently drop the mode mid-session. Panel sessions keep the
+ * URL-decided single-panel arrival: no stored-layout restore, no layout
+ * persistence (an embed must never clobber the user's real-browser layout).
+ */
+export function latchPanelView(): boolean {
+  if (typeof window === 'undefined') return false;
+  const inUrl =
+    new URLSearchParams(window.location.search).get(PANEL_VIEW_QUERY_PARAM) ===
+    PANEL_VIEW_QUERY_VALUE;
+  // The latch only persists inside an ACTUAL embed (rendered in an iframe — a
+  // ChatGPT / Claude side panel). A normal top-level tab tracks the URL
+  // exactly, so a human who clicks a handed-out ?view=panel link and then
+  // navigates elsewhere is not stranded in panel mode with no way out (the
+  // sticky-sessionStorage bug). Cross-origin frame access throws → treat as
+  // embedded, which is correct for a third-party host iframe.
+  let embedded: boolean;
+  try {
+    embedded = window.top !== window.self;
+  } catch {
+    embedded = true;
+  }
+  // A narrow window IS a side panel, param or not: humans open fresh tabs
+  // inside side-panel browsers themselves (observed live, 2026-08-27), and
+  // a desktop layout squeezed into 768-1023px serves nobody. Below 768 the
+  // mobile one-surface layout owns the width; the URL param wins anywhere.
+  const narrow = window.innerWidth >= 768 && window.innerWidth < 1024;
+  try {
+    if (inUrl) {
+      if (embedded) window.sessionStorage.setItem(PANEL_VIEW_STORAGE_KEY, '1');
+      return true;
+    }
+    if (narrow) return true;
+    return embedded && window.sessionStorage.getItem(PANEL_VIEW_STORAGE_KEY) === '1';
+  } catch {
+    return inUrl || narrow; // storage disabled: the visit still shapes itself
+  }
+}
+
+/** Per-workspace localStorage key for the editor pane snapshot (tab layout). */
+export const EDITOR_PANES_KEY_PREFIX = 'sundial:editor-panes:';
+
+/**
+ * The saved pane snapshot, or null when this session must not read it: an
+ * embedded panel (?view=panel) keeps the URL-decided single-panel arrival.
+ * Restoring the real browser's desktop tab layout (often with an active chat
+ * tab) would decide the embed's one visible surface instead of the URL.
+ */
+export function readPaneSnapshot(projectId: string): string | null {
+  if (latchPanelView()) return null;
+  try {
+    return window.localStorage.getItem(`${EDITOR_PANES_KEY_PREFIX}${projectId}`);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persist the pane snapshot — except from a panel session, which must never
+ * clobber the layout the user's real browser saved for the workspace.
+ */
+export function persistPaneSnapshot(projectId: string, snapshot: unknown): void {
+  if (latchPanelView()) return;
+  try {
+    window.localStorage.setItem(`${EDITOR_PANES_KEY_PREFIX}${projectId}`, JSON.stringify(snapshot));
+  } catch {
+    /* quota / private mode */
+  }
+}
+
 export const WORKSPACE_LAYOUT_STORAGE_KEY = 'sundial:workspace-layout';
 export function workspaceLayoutStorageKey(projectId: string | null | undefined): string {
   return projectId ? `${WORKSPACE_LAYOUT_STORAGE_KEY}:${projectId}` : WORKSPACE_LAYOUT_STORAGE_KEY;
@@ -160,13 +301,18 @@ export const MAX_LEFT_RAIL_WIDTH = 640;
 // progressively (see app/w/[slug]/page.tsx) rather than swapping to a different
 // chrome, so "desktop but lesser width" stays consistent with wide screens.
 //
-// Set at the Tailwind `md` boundary (767) rather than lower, because the desktop
-// layout tiles columns side by side: editor (min-w-[400px]) + chat (min-w-[360px])
-// already need ~760px, and the center wrapper is overflow-hidden, so a narrower
-// "desktop" range would clip the second panel instead of falling back to the
-// single-panel mobile layout. Phones / small tablets (<768) get the mobile layout.
+// Touch devices (coarse pointer) switch at the Tailwind `md` boundary (767):
+// phones and small tablets want the drawer chrome. A mouse/trackpad window that
+// merely got narrowed keeps the DESKTOP layout down to 520px, because that
+// layout is where the file tree and its drag-and-drop targets live — flipping a
+// 700px desktop window to the phone UI silently drops those. Below 520px even a
+// single center pane is unusable, so both pointer kinds collapse. The center
+// panes relax their min widths under `lg` (max-lg:min-w-*) so the 520-767 range
+// renders cramped-but-usable instead of clipping.
 export const MOBILE_MAX_WIDTH = 767;
-export const MOBILE_MEDIA_QUERY = `(max-width: ${MOBILE_MAX_WIDTH}px)`;
+export const MOBILE_FINE_POINTER_MAX_WIDTH = 520;
+export const MOBILE_MEDIA_QUERY =
+  `(max-width: ${MOBILE_MAX_WIDTH}px) and (any-pointer: coarse), (max-width: ${MOBILE_FINE_POINTER_MAX_WIDTH}px)`;
 
 function isWorkspaceViewMode(value: unknown): value is WorkspaceViewMode {
   return value === 'chat' || value === 'space';
@@ -291,8 +437,10 @@ export function resolvePopstateChatAction(args: {
 
 // Same rule for the file: a file is always preselected (the initial-file
 // heuristic runs even in chat-only layouts), so mirroring it unconditionally
-// would turn every reload into an editor-intent arrival and defeat the
-// chat-first landing. Keep fileId in the URL only while the editor is visible.
+// would turn a deliberate chat-only layout into an editor-intent arrival on
+// reload. Keep fileId in the URL only while the editor is visible — on the
+// file-first default that means the landing URL does carry the open file,
+// which is exactly the deep link a reload should reproduce.
 export function shouldMirrorFileIdToUrl(activeFileId: string | null, isEditorVisible: boolean): boolean {
   return Boolean(activeFileId) && isEditorVisible;
 }

@@ -13,6 +13,7 @@ import {
 import {
   applyContentTextIfChanged,
   applySuggestionIfChanged,
+  canonicalizeContentText,
   hasAnySuggestionMark,
   hasSuggestionMark,
   isMarkdownDocument,
@@ -61,11 +62,29 @@ export class DocHost {
     this.persistDebounceMs = persistDebounceMs;
     this.lastDiskText = new Map(); // documentName -> last text observed/written on disk
     this.lastStateVectors = new Map(); // documentName -> Uint8Array
+    this.lastPersistedDisk = new Map(); // documentName -> lastDiskText at the last completed persist
+    this.canonicalCache = new Map(); // documentName -> { source, canonical } for lastDisk
     this.loadedDocs = new Set();
     this.pendingPersist = new Map(); // documentName -> timer
     this.persistChains = new Map(); // documentName -> tail of in-flight persists
     this.detached = new Set(); // externally deleted while open — writeback disabled
     this.recentDeleteHashes = new Map(); // `project hash` -> deletedAt (rename detection)
+    // `project hash` -> [{ at, rel, state, contentHash, fileId }]: deleted
+    // docs' persisted Y.Doc history, held briefly so a watcher rename (delete
+    // + create pair from a raw `mv`) can move it to the destination. Without
+    // the move, the destination re-seeds from disk bytes; the fresh seed only
+    // matches the cloud copy while the bytes are IDENTICAL, so any later
+    // divergence (an offline edit before a restart) forks the histories and
+    // the next full sync CONCATENATES the file (the dev data-doubling bug,
+    // 2026-08-24). A LIST per hash: a folder rename can hold several
+    // identical-content files, each keeping its own identity. Same 10s window
+    // as recentDeleteHashes.
+    this.recentDeleteStates = new Map();
+    // `project hash` -> [{ at, rel }]: rename destinations whose CREATE event
+    // arrived before the source's delete (fs.watch guarantees no ordering
+    // between a rename's two events) — #stashDeletedState fulfills these
+    // instead of stashing, so adoption works in either event order.
+    this.pendingAdoptions = new Map();
     // documentName -> load time, for docs that loaded while their file was
     // ABSENT on disk AND the ledger's newest row is a delete tombstone (a
     // prior generation provably existed — brand-new paths get no shield). A
@@ -130,6 +149,8 @@ export class DocHost {
         this.pendingPersist.delete(documentName);
         this.lastDiskText.delete(documentName);
         this.lastStateVectors.delete(documentName);
+        this.lastPersistedDisk.delete(documentName);
+        this.canonicalCache.delete(documentName);
         this.loadedDocs.delete(documentName);
         this.detached.delete(documentName);
         this.loadedWithoutDisk.delete(documentName);
@@ -199,6 +220,14 @@ export class DocHost {
       // Deterministic seed: identical bytes → identical ops, so a concurrent
       // seed elsewhere (cloud bridge, another lifetime) merges as a no-op.
       seedDocumentFromText(meta.path, document, diskText);
+      // The seed IS this doc's lineage: save it NOW. persist()'s no-op skip
+      // (state vector unchanged since load) means an unedited doc never
+      // reaches the store, so every reload re-seeded a FRESH lineage —
+      // harmless only while disk bytes still equal the cloud copy, and a
+      // union (content doubling) the moment they diverge, with later
+      // deletions unable to touch the foreign lineage's copies (live
+      // 2026-08-27: sync_note.tex grew to four concatenated documents).
+      this.store.saveDocState(meta.projectId, meta.path, Y.encodeStateAsUpdate(document), contentHash(diskText));
     }
     this.lastDiskText.set(documentName, diskText);
     this.lastStateVectors.set(documentName, Y.encodeStateVector(document));
@@ -279,6 +308,18 @@ export class DocHost {
     if (!meta) return;
     const project = this.store.getProject(meta.projectId);
     if (!project) return;
+    const localMeta = document.getMap(LOCAL_META_ROOT);
+    const pendingCreation = localMeta.get('pendingCreation');
+    const prevVector = this.lastStateVectors.get(documentName);
+    const stateChanged = !prevVector || !uint8Equal(Y.encodeStateVector(document), prevVector);
+    const lastDisk = this.lastDiskText.get(documentName);
+    // Hocuspocus's own onStoreDocument debounce fires every couple of seconds
+    // during typing on top of our 500ms timer — when neither the doc state nor
+    // the observed disk text moved since the last completed persist, return
+    // before paying the full-document serialize + state encode below.
+    if (pendingCreation == null && !stateChanged && lastDisk === this.lastPersistedDisk.get(documentName)) {
+      return;
+    }
     const text = readDocumentText(meta.path, document);
     // A REJECTED creation suggestion (see pendingCreation in
     // stageAgentSuggestion) deletes the file it created — persisting would
@@ -289,8 +330,6 @@ export class DocHost {
     // creation status must survive until the replacement resolves). Cleared
     // BEFORE the state capture below, so the same persist records it
     // without an extra ledger row.
-    const localMeta = document.getMap(LOCAL_META_ROOT);
-    const pendingCreation = localMeta.get('pendingCreation');
     if (pendingCreation != null) {
       const resolution = isMarkdownDocument(documentName)
         ? markdownSuggestionResolution(document, pendingCreation)
@@ -330,12 +369,21 @@ export class DocHost {
         localMeta.delete('pendingCreation');
       }
     }
-    const previousLength = (this.lastDiskText.get(documentName) ?? text).length;
+    const previousLength = (lastDisk ?? text).length;
     const state = Y.encodeStateAsUpdate(document);
-    const prevVector = this.lastStateVectors.get(documentName);
-    const stateChanged = !prevVector || !uint8Equal(Y.encodeStateVectorFromUpdate(state), prevVector);
-    const textChanged = text !== this.lastDiskText.get(documentName);
-    if (!stateChanged && !textChanged) return;
+    let textChanged = text !== lastDisk;
+    // NEVER rewrite a file whose bytes are already an equivalent representation
+    // of the doc — the codec normalizes style (`*` bullets, `_emphasis_`,
+    // indent width…), and writing the normalized form back over an external
+    // editor's save makes Sundial and Obsidian rewrite each other's bytes
+    // forever. Disk keeps the user's own form; the doc holds the content.
+    if (textChanged && typeof lastDisk === 'string' && this.#canonicalDisk(meta.path, documentName, lastDisk) === text) {
+      textChanged = false;
+    }
+    if (!stateChanged && !textChanged) {
+      this.lastPersistedDisk.set(documentName, lastDisk);
+      return;
+    }
     // A detached doc's path was deleted or renamed away — persisting ANY of
     // it (file, doc state, ledger row) under the old path resurrects a ghost.
     if (this.detached.has(documentName)) return;
@@ -345,6 +393,12 @@ export class DocHost {
       const loc = this.#loc(project, meta.path);
       await writeTextFileAtomic(loc.root, loc.rel, text);
       this.lastDiskText.set(documentName, text);
+      // Our own serialization is its own canonical form (codec idempotence,
+      // pinned by the cross-equivalence suite) — seed the cache so typing
+      // persists never re-parse the whole doc just to re-learn that. Were an
+      // edge doc ever non-idempotent, the cost is one extra equivalent write
+      // (watcher suppressed), which converges — never a rewrite war.
+      this.canonicalCache.set(documentName, { source: text, canonical: text });
       this.loadedWithoutDisk.delete(documentName);
     }
     this.store.saveDocState(meta.projectId, meta.path, state, contentHash(this.lastDiskText.get(documentName) ?? text));
@@ -376,11 +430,29 @@ export class DocHost {
       authorId: remoteOnly ? 'cloud-bridge' : context?.userId ?? null,
       editMode: context?.editMode === 'suggest' ? 'suggest' : 'edit',
       chatId: remoteOnly ? null : context?.chatId ?? null,
+      // The RUN's assistant message id when the caller knows it (a
+      // watcher-attributed write from a run that may since have been
+      // replaced) — recordEdit's chat lookup would hand it to the wrong turn.
+      messageId: remoteOnly ? null : context?.messageId ?? null,
+      turnResolved: remoteOnly ? false : context?.turnResolved ?? false,
       suggestionId: context?.suggestionId ?? null,
       contentText: text,
       updateB64: Buffer.from(incremental).toString('base64'),
     });
     this.flushPendingDecisions(documentName, meta, context);
+    this.lastPersistedDisk.set(documentName, this.lastDiskText.get(documentName));
+  }
+
+  /** canonicalizeContentText(lastDisk), cached per doc — the full parse →
+   *  serialize fixed-point pass is O(doc), and lastDisk usually repeats
+   *  between persists (our own last write is seeded above; an external save
+   *  is canonicalized once, here). */
+  #canonicalDisk(path, documentName, source) {
+    const cached = this.canonicalCache.get(documentName);
+    if (cached && cached.source === source) return cached.canonical;
+    const canonical = canonicalizeContentText(path, source);
+    this.canonicalCache.set(documentName, { source, canonical });
+    return canonical;
   }
 
   /** Flush LOCAL-origin suggestion decisions queued by the update handler
@@ -411,7 +483,7 @@ export class DocHost {
    *  late delete echo was swallowed (must NOT reach the bridges), 'mutated'
    *  when a REAL change was staged/applied/recorded (a suppressed event that
    *  proves real must still be bridged and announced), undefined otherwise. */
-  async handleDiskChange(projectId, relPath, { record = true, actor = 'external', chatId = null, authorId = null, editMode = 'edit', fromWatcher = false } = {}) {
+  async handleDiskChange(projectId, relPath, { record = true, actor = 'external', chatId = null, messageId = null, turnResolved = false, authorId = null, editMode = 'edit', fromWatcher = false, heldSince = null } = {}) {
     const project = this.store.getProject(projectId);
     if (!project) return;
     const documentName = `${projectId}/${relPath}`;
@@ -441,6 +513,11 @@ export class DocHost {
         record: record || real,
         actor,
         chatId,
+        // A delete is as much a turn edit as a write — without this a
+        // watcher-attributed delete from a SUPERSEDED run falls back to the
+        // chat resolver and lands in the replacement turn's diff chip.
+        messageId,
+        turnResolved,
         authorId,
         fromWatcher,
       });
@@ -451,7 +528,7 @@ export class DocHost {
       // A tree delete can PRESERVE the folder (protected children like .git
       // stay behind) — the event then arrives for a still-existing directory,
       // but docs for its deleted children must still detach.
-      await this.detachMissingUnder(projectId, relPath, { record, actor, chatId, authorId });
+      await this.detachMissingUnder(projectId, relPath, { record, actor, chatId, messageId, turnResolved, authorId });
       return;
     }
     if (!stat.isFile() || fileKind(relPath) !== 'text') return;
@@ -464,9 +541,37 @@ export class DocHost {
     // recoverable baseline it returns false and the direct paths below apply.
     const watcher = this.watchers.get(projectId);
     const seenBefore = watcher ? watcher.seenBefore(relPath) : true;
+    // The definite variant (no walk-pending fallback), read BEFORE markSeen
+    // below corrupts it — it persists as existence PROOF further down.
+    const knownBefore = watcher ? watcher.knownBefore(relPath) === true : false;
     // Consumed on EVERY event (captures must not accumulate), used below.
     const firstSight = watcher?.takeFirstSight(relPath);
     watcher?.markSeen(relPath);
+    // First-sight bytes (captured at raw event time) that differ from the
+    // current ones suggest a PRIOR generation this callback coalesced over —
+    // an external create + agent overwrite in one debounce window. They are
+    // that generation's only surviving text. But an agent CREATION written in
+    // several strokes (`>` then `>>`, truncate-and-rewrite, a large write's
+    // chunk flushes) also captures mid-write. The run's attribution window
+    // (`heldSince`) tells the cases apart: a capture taken before the window
+    // opened cannot be the run's own stroke; one taken inside it is treated
+    // as the run's own work. Without window info (direct calls), a prefix
+    // capture reads as a single writer's growing intermediate. The suggest
+    // rail below keeps the stricter any-difference rule: there a misread
+    // creation is rejectable, and reject would delete the user's file.
+    const sight = firstSight ? await firstSight : undefined;
+    const firstText = sight?.text ?? undefined;
+    const firstSightDiffers = typeof firstText === 'string' && firstText !== disk.text;
+    // A brand-new path whose bytes match a just-deleted doc is the create
+    // half of a raw `mv`: adopt the deleted doc's history before anything
+    // seeds a fresh one, or the histories fork (see recentDeleteStates).
+    if (!seenBefore && !this.loadedDocs.has(documentName)) {
+      this.adoptRenamedState(projectId, relPath, disk.text);
+    }
+    const firstSightBefore =
+      firstSightDiffers && (heldSince !== null ? sight.at < heldSince : !disk.text.startsWith(firstText))
+        ? firstText
+        : null;
     // Staging runs even for SUPPRESSED events (record=false): suppression is
     // time-based, so a real Bash write landing within 2s of the agent writer's
     // own write to the same file arrives suppressed. Echoes are told apart by
@@ -488,13 +593,12 @@ export class DocHost {
       // Nor is a path whose FIRST-SIGHT bytes (captured at raw event time)
       // differ from the current ones: an external create + agent overwrite
       // can coalesce into this one callback, and that file is the user's.
-      const firstText = firstSight ? await firstSight : undefined;
       const newFile =
         !seenBefore &&
-        !(typeof firstText === 'string' && firstText !== disk.text) &&
+        !firstSightDiffers &&
         !(await this.isRenameDestination(project, contentHash(disk.text)));
       if (!unchanged) {
-        if (await this.stageAgentSuggestion(projectId, relPath, disk.text, { chatId, authorId, newFile })) return 'mutated';
+        if (await this.stageAgentSuggestion(projectId, relPath, disk.text, { chatId, messageId, turnResolved, authorId, newFile })) return 'mutated';
         // A content-verified change that staging DECLINED (spacing-only,
         // lost baseline) must not be swallowed by the time-based suppression
         // flag — let the direct paths below record it.
@@ -507,7 +611,15 @@ export class DocHost {
       if (record) {
         const stored = this.store.getDocState(projectId, relPath);
         if (!stored || stored.contentHash !== contentHash(disk.text)) {
-          this.store.recordEdit({ projectId, path: relPath, actor, authorId, chatId, contentText: disk.text });
+          this.#recordAgentBaseline(projectId, relPath, actor, firstSightBefore);
+          // `preExisted`: a never-opened, never-edited file leaves no text to
+          // recover, but the watcher's walk-seeded tree still knows the PATH
+          // was there — without the stamp the turn diff labels a real
+          // modification "Added". Watcher events only (a direct caller like
+          // the Tier-1 writer suppress()es first, marking its own creation
+          // seen), and knownBefore, not seenBefore: the walk-pending fallback
+          // is uncertainty and must not persist as proof.
+          this.store.recordEdit({ projectId, path: relPath, actor, authorId, chatId, messageId, turnResolved, contentText: disk.text, preExisted: (fromWatcher && knownBefore) || firstSightBefore !== null });
           return 'mutated';
         }
       }
@@ -516,6 +628,11 @@ export class DocHost {
 
     if (disk.text === this.lastDiskText.get(documentName)) return;
     this.lastDiskText.set(documentName, disk.text);
+    // BEFORE the apply: once the disk text lands in the live doc, the previous
+    // text is gone, and a baseline read afterwards would snapshot the agent's
+    // own result — the turn diff would then compare new against new and show
+    // nothing at all.
+    const priorText = this.store.hasEdits(projectId, relPath) ? null : this.knownText(projectId, relPath);
     const changed = applyContentTextIfChanged(relPath, document, disk.text);
     if (changed) {
       // The apply lands as a Yjs update → onChange → schedulePersist, which
@@ -524,28 +641,12 @@ export class DocHost {
       const pending = this.pendingPersist.get(documentName);
       if (pending) clearTimeout(pending);
       this.pendingPersist.delete(documentName);
-      await this.persist(documentName, document, { actor, chatId, userId: authorId }).catch((error) => {
+      this.#recordAgentBaseline(projectId, relPath, actor, priorText);
+      await this.persist(documentName, document, { actor, chatId, messageId, turnResolved, userId: authorId }).catch((error) => {
         this.log(`external persist failed doc=${documentName} error=${error?.message}`);
       });
     }
     return changed ? 'mutated' : undefined;
-  }
-
-  /** True when staging `contentText` over the given doc state would leave
-   *  actual suggestion marks for `suggestionId` — the markdown codec applies
-   *  some changes (code fences, images) without any markable region, and
-   *  those must fall back to an honest direct edit. */
-  probeMarkable(relPath, state, contentText, suggestionId, meta) {
-    const probe = new Y.Doc();
-    try {
-      Y.applyUpdate(probe, state);
-      return (
-        applySuggestionIfChanged(relPath, probe, contentText, suggestionId, meta) &&
-        hasSuggestionMark(probe, suggestionId)
-      );
-    } finally {
-      probe.destroy();
-    }
   }
 
   /** Stage `contentText` as a pending SUGGESTION (markdown marks / code
@@ -554,12 +655,18 @@ export class DocHost {
    *  accepted-view projection (same contract as cloud `content_text`), so
    *  Read-after-write sees the doc as if the suggestion landed and a reject
    *  reverts the file through the normal persist. Returns true when staged. */
-  async stageAgentSuggestion(projectId, relPath, contentText, { chatId = null, authorId = null, suggestionId = `a${randomUUID()}`, newFile = false } = {}) {
+  async stageAgentSuggestion(projectId, relPath, contentText, { chatId = null, messageId = null, turnResolved = false, authorId = null, suggestionId = `a${randomUUID()}`, newFile = false } = {}) {
     const project = this.store.getProject(projectId);
     if (!project) return false;
     const loc = this.#loc(project, relPath);
     const documentName = `${projectId}/${relPath}`;
-    const meta = { chatId };
+    // `agentTurnId` is the ledger's agent-authorship marker (cloud parity:
+    // hocuspocus stamps assistantMessageId) — the code-suggestion pill resolves
+    // it to the agent's face; without it the entry reads as an authorless human
+    // stage and renders "SA" initials. The engine id (`ai:claude-code`…) stays
+    // OFF the entry: agent runs post no user id, and stamping it would paint an
+    // external-agent brand mark on the app's own agent.
+    const meta = { chatId, agentTurnId: messageId };
     const live = this.loadedDocs.has(documentName) ? this.hocuspocus.documents.get(documentName) : null;
     // First-ever ledger touch of a PRE-EXISTING file: record its current text
     // as a baseline row first, or the session's diff has no "before" — the
@@ -587,13 +694,6 @@ export class DocHost {
       const creates =
         readDocumentText(relPath, live) === '' &&
         (newFile || !(liveAbs && (await fsp.stat(liveAbs).catch(() => null))));
-      // The markdown codec can APPLY a change it cannot represent as marks
-      // (code fences, images, empty list items) — that must not mutate the
-      // live doc as a phantom "suggestion". Probe on a clone first; the
-      // unmarkable case declines to the caller's direct rail.
-      if (isMarkdownDocument(relPath) && !this.probeMarkable(relPath, Y.encodeStateAsUpdate(live), contentText, suggestionId, meta)) {
-        return false;
-      }
       if (!applySuggestionIfChanged(relPath, live, contentText, suggestionId, meta)) return false;
       if (creates) live.getMap(LOCAL_META_ROOT).set('pendingCreation', String(suggestionId));
       // Same shape as handleDiskChange: cancel the hook-scheduled persist and
@@ -603,7 +703,7 @@ export class DocHost {
       this.pendingPersist.delete(documentName);
       // rethrow: a failed disk write / state save must fail the tool call, not
       // report a staged suggestion that was never durably written.
-      await this.queuePersist(documentName, live, { actor: 'agent', userId: authorId, chatId, editMode: 'suggest', suggestionId }, { rethrow: true });
+      await this.queuePersist(documentName, live, { actor: 'agent', userId: authorId, chatId, messageId, turnResolved, editMode: 'suggest', suggestionId }, { rethrow: true });
       return true;
     }
     // Closed file: stage into the stored CRDT state (or seed a baseline).
@@ -658,9 +758,6 @@ export class DocHost {
       // A brand-new file (no disk) diffs against the empty doc: the whole
       // content stages as one pending insertion, like cloud pending additions.
       if (!applySuggestionIfChanged(relPath, scratch, contentText, suggestionId, meta)) return false;
-      // Applied but unmarkable (see probeMarkable) — the scratch is discarded
-      // untouched-on-disk, and the caller's direct rail takes the write.
-      if (isMarkdownDocument(relPath) && !hasSuggestionMark(scratch, suggestionId)) return false;
       // This suggestion CREATES the file (nothing on disk, or a vouched
       // creation): the marker lets a later reject delete it instead
       // of persisting an empty husk. A pre-existing EMPTY file is NOT a
@@ -681,6 +778,10 @@ export class DocHost {
         authorId,
         editMode: 'suggest',
         chatId,
+        messageId,
+        // Without this the closed-file staging path drops the "ambiguous,
+        // claim no turn" decision and recordEdit guesses from the chat again.
+        turnResolved,
         suggestionId,
         contentText: text,
       });
@@ -847,6 +948,8 @@ export class DocHost {
       if (!this.loadedDocs.has(documentName)) {
         this.lastDiskText.delete(documentName);
         this.lastStateVectors.delete(documentName);
+        this.lastPersistedDisk.delete(documentName);
+        this.canonicalCache.delete(documentName);
       }
       scratch.destroy();
     }
@@ -905,7 +1008,9 @@ export class DocHost {
       const text = readDocumentText(meta.path, document);
       const diskText = this.lastDiskText.get(documentName);
       let onDisk = diskText ?? text;
-      if (text !== onDisk && project) {
+      // Same equivalence skip as persist(): a rename must not restyle a file
+      // whose bytes already express the doc (external-editor interop).
+      if (text !== onDisk && project && canonicalizeContentText(meta.path, onDisk) !== text) {
         const toPath = meta.path === fromRel ? toRel : `${toRel}${meta.path.slice(fromRel.length)}`;
         this.watchers.get(projectId)?.suppress(toPath);
         try {
@@ -919,6 +1024,101 @@ export class DocHost {
     this.store.renameDocState(projectId, fromRel, toRel);
     this.store.renameFileIds(projectId, fromRel, toRel);
     await this.detachUnder(projectId, fromRel);
+  }
+
+  /** Capture a to-be-deleted doc's history for rename adoption: live doc
+   *  state when loaded (keystrokes since the last persist live only there),
+   *  else the persisted row. Keyed by content hash — the same signal
+   *  isRenameDestination matches the create half of a `mv` on. */
+  #stashDeletedState(projectId, rel) {
+    const documentName = `${projectId}/${rel}`;
+    const document = this.loadedDocs.has(documentName)
+      ? this.hocuspocus.documents.get(documentName)
+      : null;
+    let state = null;
+    let hash = null;
+    if (document) {
+      state = Y.encodeStateAsUpdate(document);
+      hash = contentHash(this.lastDiskText.get(documentName) ?? readDocumentText(rel, document));
+    } else {
+      const stored = this.store.getDocState(projectId, rel);
+      if (!stored) return;
+      state = stored.state;
+      hash = stored.contentHash;
+    }
+    if (!state || !hash) return;
+    // The file id too: retireFileId (the teardown below the stash call) drops
+    // the row, so adoption must restore rather than rename it.
+    const fileId = this.store.knownFileId(projectId, rel);
+    const key = `${projectId} ${hash}`;
+    const entry = { at: Date.now(), rel, state, contentHash: hash, fileId };
+    // The create half already arrived and found nothing to adopt: fulfill its
+    // pending claim now, before the teardown drops this state for good.
+    const pending = this.#takeAdoptionMatch(this.pendingAdoptions, key, rel);
+    if (pending && this.#adoptState(projectId, pending.rel, entry)) return;
+    const list = this.recentDeleteStates.get(key);
+    if (list) list.push(entry);
+    else this.recentDeleteStates.set(key, [entry]);
+  }
+
+  /** Pop the entry pairing best with `rel` from a hash-keyed list map, after
+   *  expiring stale entries: same basename first (a folder rename moves
+   *  `dir/a.md` to `dir2/a.md`, and two identical-content files must each
+   *  keep their own identity), else oldest first. */
+  #takeAdoptionMatch(map, key, rel) {
+    this.#pruneAdoptionMap(map);
+    const entries = map.get(key);
+    if (!entries) return null;
+    const base = rel.split('/').pop();
+    const index = Math.max(entries.findIndex((entry) => entry.rel.split('/').pop() === base), 0);
+    const [entry] = entries.splice(index, 1);
+    if (!entries.length) map.delete(key);
+    return entry;
+  }
+
+  #pruneAdoptionMap(map) {
+    const cutoff = Date.now() - 10_000;
+    for (const [key, entries] of map) {
+      const fresh = entries.filter((entry) => entry.at >= cutoff);
+      if (fresh.length) map.set(key, fresh);
+      else map.delete(key);
+    }
+  }
+
+  /** Move a stashed doc's history and identity to `relPath`. */
+  #adoptState(projectId, relPath, entry) {
+    // Never clobber a destination that already has its own history.
+    if (this.loadedDocs.has(`${projectId}/${relPath}`) || this.store.getDocState(projectId, relPath)) return false;
+    this.store.saveDocState(projectId, relPath, entry.state, entry.contentHash);
+    // Restore the file identity under the new path (retireFileId dropped, or
+    // is about to drop, the source row) so the editor keeps treating it as
+    // the same file.
+    if (entry.fileId && !this.store.knownFileId(projectId, relPath)) {
+      this.store.setFileId(projectId, relPath, entry.fileId);
+    }
+    this.store.renameCommentPaths(projectId, entry.rel, relPath);
+    return true;
+  }
+
+  /** The create half of a watcher rename: when a brand-new path's bytes match
+   *  a just-deleted doc, move that doc's history (and file identity) to the
+   *  new path instead of letting the load re-seed from disk. Returns true on
+   *  adoption. Exact-hash only — a near-match is a different file. */
+  adoptRenamedState(projectId, relPath, diskText) {
+    const key = `${projectId} ${contentHash(diskText)}`;
+    const entry = this.#takeAdoptionMatch(this.recentDeleteStates, key, relPath);
+    if (!entry) {
+      // The create half arrived first: leave a pending claim for the delete
+      // half (#stashDeletedState) to fulfill before the teardown drops the
+      // source's state — otherwise the destination seeds fresh and the
+      // histories fork.
+      this.#pruneAdoptionMap(this.pendingAdoptions);
+      const list = this.pendingAdoptions.get(key);
+      if (list) list.push({ at: Date.now(), rel: relPath });
+      else this.pendingAdoptions.set(key, [{ at: Date.now(), rel: relPath }]);
+      return false;
+    }
+    return this.#adoptState(projectId, relPath, entry);
   }
 
   /** Remember WHAT was just deleted (by content hash): a "new" file matching
@@ -951,7 +1151,7 @@ export class DocHost {
     return false;
   }
 
-  async handleDiskDelete(projectId, rel, { record = true, actor = 'external', chatId = null, authorId = null, fromWatcher = false } = {}) {
+  async handleDiskDelete(projectId, rel, { record = true, actor = 'external', chatId = null, messageId = null, turnResolved = false, authorId = null, fromWatcher = false } = {}) {
     // fsevents can deliver a delete SECONDS late. If the doc at this exact
     // path loaded after the file was already gone, that event predates the
     // doc — detaching/purging would clobber the re-created doc and suppress
@@ -976,20 +1176,76 @@ export class DocHost {
     // so a rename destination is never misread as a creation.
     this.watchers.get(projectId)?.markGone(rel);
     if (fileKind(rel) === 'text') this.noteDeletedContent(projectId, rel);
+    // BEFORE the teardown below drops the live doc and the stored state: a
+    // tombstone needs a previous row to anchor on (recordDeleteTombstone is a
+    // no-op without one), so an agent deleting a file it never touched would
+    // leave NOTHING in the turn diff or the history. Capture what it deleted
+    // while that is still knowable.
+    // Tracked paths, NOT just ledger paths: a child with only doc_state /
+    // file_id (opened or listed, never edited) is exactly the case that has no
+    // baseline, and deleteDocState below is about to drop its last trace.
+    const childPaths =
+      fileKind(rel) === 'text'
+        ? [rel]
+        : [
+            ...new Set([
+              ...this.store.listEditPathsUnder(projectId, rel),
+              ...this.store.listTrackedPaths(projectId, rel),
+            ]),
+          ];
+    const deletedPaths =
+      record && actor === 'agent'
+        ? childPaths.filter(
+            (candidate) => fileKind(candidate) === 'text' && !this.store.hasEdits(projectId, candidate),
+          )
+        : [];
+    const baselines = new Map(deletedPaths.map((candidate) => [candidate, this.knownText(projectId, candidate)]));
+    // Existence, read BEFORE retireFileId below wipes it: a file that was
+    // listed but never opened and never edited has no recoverable text, but it
+    // was real — without this its deletion has nothing to anchor a tombstone
+    // on and drops out of the turn diff entirely.
+    const existedBefore = new Map(
+      deletedPaths.map((candidate) => [
+        candidate,
+        baselines.get(candidate) !== null || this.store.hasFileId(projectId, candidate),
+      ]),
+    );
+    // Stash each deleted text doc's history BEFORE the teardown drops it, so
+    // a rename destination (the create half of a raw `mv`) can adopt it and
+    // keep the CRDT history continuous across the move (see the field's
+    // comment in the constructor).
+    for (const candidate of fileKind(rel) === 'text' ? [rel] : childPaths) {
+      if (fileKind(candidate) === 'text') this.#stashDeletedState(projectId, candidate);
+    }
     await this.detachUnder(projectId, rel);
     this.store.deleteDocState(projectId, rel);
     this.store.retireFileId(projectId, rel);
     if (!record) return;
+    const tombstone = (candidate) => {
+      this.#recordAgentBaseline(projectId, candidate, actor, baselines.get(candidate) ?? null);
+      this.store.recordDeleteTombstone(
+        projectId,
+        candidate,
+        actor,
+        chatId,
+        authorId,
+        messageId,
+        turnResolved,
+        existedBefore.get(candidate) ?? false,
+      );
+    };
     if (fileKind(rel) === 'text') {
-      this.store.recordDeleteTombstone(projectId, rel, actor, chatId, authorId);
+      tombstone(rel);
       return;
     }
     // A deleted FOLDER arrives as one event for the folder path — stamp every
-    // tracked text child, or their history reads as still-alive forever.
-    for (const child of this.store.listEditPathsUnder(projectId, rel)) {
+    // tracked text child, or their history reads as still-alive forever. Same
+    // union as the baseline sweep: a child the agent deleted without ever
+    // editing has no ledger row to find it by.
+    for (const child of childPaths) {
       if (fileKind(child) === 'text') {
         this.noteDeletedContent(projectId, child);
-        this.store.recordDeleteTombstone(projectId, child, actor, chatId, authorId);
+        tombstone(child);
       }
     }
   }
@@ -1016,6 +1272,52 @@ export class DocHost {
   }
 
   /** Live doc text when the file is open (includes unflushed keystrokes). */
+  /** First-ever ledger touch of a pre-existing file by the AGENT: snapshot the
+   *  text it is about to replace, or the turn's diff has no "before" and the
+   *  chat's chip renders a modification as a whole-file insertion. The Tier-1
+   *  writer does this before writing; the watcher path can't (disk already
+   *  holds the new bytes), so the last text we still know is the live doc, then
+   *  the persisted Y.Doc state. A file that has never been opened AND has no
+   *  ledger history leaves no baseline anywhere — unless the watcher's
+   *  first-sight capture caught a prior generation's bytes (passed in as
+   *  `priorText`). Actor 'baseline' — a snapshot, not an edit anyone made. */
+  #recordAgentBaseline(projectId, relPath, actor, priorText = null) {
+    // An EXPLICIT priorText is the caller's own capture of what disk/doc held
+    // just now, and beats stale history: a recreated file's first-sight bytes
+    // must land even when an old tombstone means hasEdits — otherwise the
+    // diff's "before" is the tombstone, not the user's recreated content.
+    if (actor !== 'agent' || (priorText === null && this.store.hasEdits(projectId, relPath))) return;
+    // `priorText` is the caller's pre-teardown or first-sight capture — the
+    // open-doc and delete paths have dropped the live text by the time we run.
+    const previous = priorText ?? this.knownText(projectId, relPath);
+    // `null` is "we never knew this file's text"; '' is a file we know to be
+    // EMPTY, and it needs its baseline just as much — without a row, a delete
+    // finds no prior state and records no tombstone, so first-touching an
+    // empty file then deleting it vanished from the turn diff entirely.
+    if (typeof previous === 'string') {
+      this.store.recordEdit({ projectId, path: relPath, actor: 'baseline', contentText: previous });
+    }
+  }
+
+  /** The file's text as the sidecar still knows it: the live doc, else the
+   *  persisted Y.Doc state. Null when neither exists — a file that has never
+   *  been opened leaves no trace to recover once disk has moved on. */
+  knownText(projectId, relPath) {
+    const live = this.getLiveText(projectId, relPath);
+    if (live !== null) return live;
+    const stored = this.store.getDocState(projectId, relPath);
+    if (!stored?.state) return null;
+    const probe = new Y.Doc();
+    try {
+      Y.applyUpdate(probe, stored.state);
+      return readDocumentText(relPath, probe);
+    } catch {
+      return null;
+    } finally {
+      probe.destroy();
+    }
+  }
+
   getLiveText(projectId, relPath) {
     const documentName = `${projectId}/${relPath}`;
     if (!this.loadedDocs.has(documentName)) return null;

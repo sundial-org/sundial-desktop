@@ -1,4 +1,5 @@
 import type { Node as PMNode } from 'prosemirror-model';
+import { escapeHtml } from '@/lib/escape-html';
 import type { TurnEditLine } from '@/lib/workspace/turn-edits';
 import {
   normalizeForDiff,
@@ -375,14 +376,7 @@ function applySharedInlineMarkdownMarks(deletionLine: string, additionLine: stri
   return out;
 }
 
-export function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
+export { escapeHtml };
 
 /** Wrap word ranges in `<span class="${className}">` for HTML surfaces. */
 export function wrapRangesHtml(

@@ -15,6 +15,7 @@ import * as Y from 'yjs';
 import {
   clipCommentQuote,
   type CommentAnchorPayload,
+  threadReactionEmoji,
   type DraftDocCommentSelection,
   type ResolvedDocCommentRange,
   type DocCommentThread,
@@ -25,21 +26,52 @@ const WORD_CHAR = /[\p{L}\p{N}_]/u;
 // A non-word stand-in for inline leaf nodes (hard breaks, inline images/math)
 // so each one occupies exactly one index — keeps the scanned string's indices
 // aligned 1:1 with ProseMirror positions inside the block.
-const LEAF_PLACEHOLDER = '￼';
+export const LEAF_PLACEHOLDER = '￼';
+
+// ICU word segmentation — the SAME notion of "word" Blink and WebKit use for a
+// native double-click, so CJK/Thai (no spaces) split into real words instead of
+// one run of letters, and `snake_case_2` / `don't` stay whole. Built once: the
+// segmenter is stateless and its construction is the expensive part.
+const wordSegmenter =
+  typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function'
+    ? new Intl.Segmenter(undefined, { granularity: 'word' })
+    : null;
 
 /**
- * Word boundaries around `offset` within `text`, using letters/numbers/`_` as
- * word chars. Returns null when `offset` doesn't sit inside a word (e.g. on a
- * space, punctuation, or inline-leaf placeholder), so callers can fall back to
- * default behaviour. `offset` is clamped to `[0, text.length]`.
+ * Word boundaries around `offset` within `text`. Returns null when `offset`
+ * doesn't sit inside a word (e.g. on a space, punctuation, or an inline-leaf
+ * placeholder), so callers can fall back to default behaviour. `offset` is
+ * clamped to `[0, text.length]`. On a boundary between two segments the word to
+ * the LEFT wins (caret just past "working" selects it), then the one to the
+ * right — matching where a caret conceptually sits.
+ *
+ * Single source of the editor's "word": both the right-click-selects-the-word
+ * affordance below and the double-click handler (lib/tiptap/pointer-selection)
+ * read it, so the two gestures can never disagree.
  */
 export function wordBoundsAt(text: string, offset: number): { start: number; end: number } | null {
-  let start = Math.max(0, Math.min(offset, text.length));
-  let end = start;
-  while (start > 0 && WORD_CHAR.test(text[start - 1])) start--;
-  while (end < text.length && WORD_CHAR.test(text[end])) end++;
-  if (start === end) return null;
-  return { start, end };
+  const at = Math.max(0, Math.min(offset, text.length));
+  if (!wordSegmenter) {
+    // Engine without Intl.Segmenter: letters/numbers/underscore runs.
+    let start = at;
+    let end = at;
+    while (start > 0 && WORD_CHAR.test(text[start - 1])) start--;
+    while (end < text.length && WORD_CHAR.test(text[end])) end++;
+    return start === end ? null : { start, end };
+  }
+  let left: { start: number; end: number } | null = null;
+  let right: { start: number; end: number } | null = null;
+  for (const seg of wordSegmenter.segment(text)) {
+    const start = seg.index;
+    const end = start + seg.segment.length;
+    if (at > start && at < end) return seg.isWordLike ? { start, end } : null;
+    if (end === at) left = seg.isWordLike ? { start, end } : null;
+    if (start >= at) {
+      if (start === at) right = seg.isWordLike ? { start, end } : null;
+      break;
+    }
+  }
+  return left ?? right;
 }
 
 /**
@@ -105,7 +137,10 @@ export function buildDraftDocCommentSelection(
   };
 }
 
-function findQuoteRange(editor: Editor, quote: string): { from: number; to: number } | null {
+/** Substring-search the doc's concatenated text nodes for `quote` and map the
+ *  match back to ProseMirror positions. Shared with the rewrite anchor's
+ *  fallback path (quotes there use the same no-separator convention). */
+export function findQuoteRange(editor: Editor, quote: string): { from: number; to: number } | null {
   if (!quote) return null;
   const doc = editor.state.doc;
   type Segment = { charStart: number; pmStart: number; len: number };
@@ -125,7 +160,11 @@ function findQuoteRange(editor: Editor, quote: string): { from: number; to: numb
   let to: number | null = null;
   for (const seg of segments) {
     const segEndChar = seg.charStart + seg.len;
-    if (from === null && idx >= seg.charStart && idx <= segEndChar) {
+    // Strict `<`: a quote starting exactly at a segment boundary (typical for
+    // whole-paragraph quotes) must map into the segment that CONTAINS its
+    // first char, not to the end of the previous block — a range anchored
+    // there spans the block boundary, and replacing it merges paragraphs.
+    if (from === null && idx >= seg.charStart && idx < segEndChar) {
       from = seg.pmStart + (idx - seg.charStart);
     }
     if (endChar >= seg.charStart && endChar <= segEndChar) {
@@ -151,6 +190,7 @@ export function resolveDocCommentRanges(
 
   for (const thread of threads) {
     if (!isRecord(thread.anchor) || !isRecord(thread.head)) continue;
+    const reaction = threadReactionEmoji(thread);
 
     // Path 1: human comments — Yjs RelativePosition JSON, needs the y-sync
     // binding. Yields stable anchors that survive cross-block edits.
@@ -164,7 +204,7 @@ export function resolveDocCommentRanges(
           const from = Math.min(anchorPos, headPos);
           const to = Math.max(anchorPos, headPos);
           if (from !== to) {
-            ranges.push({ id: thread.id, from, to, status: thread.status });
+            ranges.push({ id: thread.id, from, to, status: thread.status, reaction });
             continue;
           }
         }
@@ -182,7 +222,7 @@ export function resolveDocCommentRanges(
     if (!quote) continue;
     const range = findQuoteRange(editor, quote);
     if (!range) continue;
-    ranges.push({ id: thread.id, from: range.from, to: range.to, status: thread.status });
+    ranges.push({ id: thread.id, from: range.from, to: range.to, status: thread.status, reaction });
   }
 
   return ranges;

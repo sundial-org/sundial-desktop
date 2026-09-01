@@ -18,20 +18,32 @@ function submitOnCmdEnter(
 }
 import {
   CaretUpIcon,
+  ChatCircleIcon,
   CheckIcon,
+  CircleIcon,
   ClockCounterClockwiseIcon,
   DotsThreeVerticalIcon,
   LinkSimpleIcon,
+  PaperPlaneTiltIcon,
+  TrashIcon,
   XIcon,
 } from '@phosphor-icons/react';
 import {
   layoutCommentLane,
+  threadReactionEmoji,
+  hasAgentMention,
+  isAgentCommentAuthor,
   isOptimisticCommentId,
+  findCommentMentionQuery,
+  buildCommentMentionOptions,
+  AGENT_MENTION_OPTION,
+  type CommentMentionOption,
   type DraftDocCommentSelection,
   type DocCommentAuthor,
   type DocCommentMessage,
   type DocCommentThread,
 } from '@/lib/workspace/doc-comments';
+import { DEFAULT_SUNNY_AVATAR } from '@/lib/workspace/sunny-avatars';
 
 // Grow a comment textarea to fit its content (Google-Docs style) instead of
 // cropping a long comment behind a fixed 2-row box. Re-measures on every value
@@ -53,6 +65,193 @@ type CurrentUser = {
   imageUrl: string | null;
 };
 
+// Mentioning an agent in a comment is the whole summon trigger — the server links
+// the thread to an agent chat and answers on it. The button only seeds the draft.
+// Dragging a page selection over a card paints an (empty) textarea as one
+// solid selected bar — a textarea selects whole, and user-select:none can't
+// opt an editing host out. Transparent only while unfocused, so the user's
+// own selection inside the box still highlights.
+const commentTextareaClass =
+  'max-h-[40vh] min-h-[40px] w-full resize-none overflow-y-auto bg-transparent text-[13px] leading-5 text-stone-800 outline-none [&:not(:focus)::selection]:bg-transparent placeholder:text-stone-500 disabled:cursor-not-allowed';
+
+const AGENT_MENTION = `${AGENT_MENTION_OPTION.handle} `;
+function withAgentMention(body: string) {
+  return /^@(agent|sunny|claude|codex)\b/i.test(body.trimStart()) ? body : `${AGENT_MENTION}${body}`;
+}
+
+// Right-aligned pill on a thread's reply row that hands the thread to an agent.
+// The new-comment composer has none — its footer is Cancel/Comment only (the
+// pill crowded and clipped Comment); there, @agent is typed via autocomplete.
+function DelegateToAgentButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      title="Tag @Agent so an agent answers on this thread"
+      data-tour-id="delegate-pill"
+      onClick={(event) => {
+        event.stopPropagation();
+        onClick();
+      }}
+      className="inline-flex min-w-0 items-center gap-1.5 overflow-hidden whitespace-nowrap rounded-full border border-stone-200 px-2.5 py-1 text-[12px] font-medium text-stone-600 transition-colors hover:border-beige-300 hover:bg-beige-50 hover:text-beige-600"
+    >
+      <PaperPlaneTiltIcon className="h-4 w-4 shrink-0" weight="fill" aria-hidden />
+      Delegate
+    </button>
+  );
+}
+
+// The @ autocomplete: typing "@" in a comment/reply offers the agent handle
+// first, then the workspace's human collaborators. Without the agent row nobody
+// discovers that a comment can be handed to an agent at all, so it is pinned to
+// the top and carries a face + badge — never a product name, since users don't
+// know who "Sunny" is and the engine behind the handle may be Claude or Codex.
+function useMentionAutocomplete(
+  value: string,
+  setValue: (next: string) => void,
+  ref: { current: HTMLTextAreaElement | null },
+  people: readonly CommentMentionOption[] = [],
+) {
+  const [query, setQuery] = useState<{ start: number; text: string } | null>(null);
+  const [highlight, setHighlight] = useState(0);
+  const options = useMemo(
+    () => (query ? buildCommentMentionOptions(people, query.text) : []),
+    [query, people],
+  );
+  const active = options.length > 0;
+
+  // Re-derive the pending mention from the caret after every edit.
+  const sync = (el: HTMLTextAreaElement) => {
+    const next = findCommentMentionQuery(el.value, el.selectionStart ?? el.value.length);
+    setQuery(next ? { start: next.start, text: next.query } : null);
+    setHighlight(0);
+  };
+
+  const insert = (handle: string) => {
+    if (!query) return;
+    const tail = value.slice(query.start + 1 + query.text.length);
+    // One space after the handle — never a second one when the tail has its own.
+    const spacer = tail.startsWith(' ') ? '' : ' ';
+    setValue(`${value.slice(0, query.start)}${handle}${spacer}${tail}`);
+    setQuery(null);
+    const caret = query.start + handle.length + spacer.length;
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el) return;
+      el.focus({ preventScroll: true });
+      el.setSelectionRange(caret, caret);
+    });
+  };
+
+  // Returns true once it owns the keystroke, so the caller stops there.
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (event.key === 'Escape' && active) {
+      event.preventDefault();
+      setQuery(null);
+      return true;
+    }
+    if (!active) return false;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      setHighlight((current) => {
+        const delta = event.key === 'ArrowDown' ? 1 : options.length - 1;
+        return (current + delta) % options.length;
+      });
+      return true;
+    }
+    if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') {
+      event.preventDefault();
+      insert(options[Math.min(highlight, options.length - 1)].handle);
+      return true;
+    }
+    return false;
+  };
+
+  return { options, highlight, setHighlight, sync, insert, onKeyDown, active };
+}
+
+function MentionMenu({
+  options,
+  highlight,
+  onHighlight,
+  onPick,
+}: {
+  options: readonly CommentMentionOption[];
+  highlight: number;
+  onHighlight: (index: number) => void;
+  onPick: (handle: string) => void;
+}) {
+  if (options.length === 0) return null;
+  return (
+    <div
+      role="listbox"
+      aria-label="Mention the agent or a collaborator"
+      data-testid="comment-mention-menu"
+      className="absolute left-2 top-full z-30 mt-1 w-72 rounded-xl border border-stone-200 bg-white py-1 shadow-[0_8px_24px_rgba(60,64,67,0.18)]"
+    >
+      {options.map((option, index) => (
+        <button
+          key={option.handle}
+          type="button"
+          role="option"
+          aria-selected={index === highlight}
+          data-handle={option.handle}
+          data-agent={option.isAgent ? 'true' : undefined}
+          onMouseEnter={() => onHighlight(index)}
+          onMouseDown={(event) => {
+            event.preventDefault(); // keep the textarea focused
+            onPick(option.handle);
+          }}
+          onClick={(event) => event.stopPropagation()} // never re-open the card
+          className={`flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[13px] ${
+            index === highlight ? 'bg-beige-50' : ''
+          }`}
+        >
+          {option.isAgent ? (
+            <img
+              src={DEFAULT_SUNNY_AVATAR}
+              alt=""
+              className="h-5 w-5 shrink-0 rounded-full object-cover ring-2 ring-beige-300"
+            />
+          ) : option.imageUrl ? (
+            <img src={option.imageUrl} alt="" className="h-5 w-5 shrink-0 rounded-full object-cover" />
+          ) : (
+            <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-stone-100 text-[10px] font-medium text-stone-500">
+              {option.handle[1]?.toUpperCase()}
+            </span>
+          )}
+          <span className="shrink-0 whitespace-nowrap font-medium text-stone-800">{option.handle}</span>
+          {/* The badge is what separates the one non-human row at a glance. */}
+          {option.isAgent ? (
+            <span className="shrink-0 rounded-full bg-beige-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase leading-3 tracking-wide text-beige-600">
+              Agent
+            </span>
+          ) : null}
+          <span className="ml-auto min-w-0 truncate text-[11px] text-stone-400">{option.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Which watch covers the open doc: a file-scoped one, a workspace-wide one,
+ *  or none. The panel only reports it — watches are managed from the chat. */
+type CommentWatchScope = 'doc' | 'workspace' | null;
+
+/** Passive status pill: a chat is listening here. Deliberately not clickable —
+ *  the doc header's "Agent watching" toggle owns starting and stopping it. */
+function CommentWatchBadge() {
+  return (
+    <span
+      data-testid="comment-watch-badge"
+      title="The Agent replies to every comment here. Stop it from its chat's menu."
+      className="inline-flex items-center gap-1 rounded-full bg-beige-50 px-2 py-0.5 text-[10px] leading-4 text-stone-500"
+    >
+      <CircleIcon className="h-2 w-2 text-beige-600" weight="fill" aria-hidden />
+      agent watching
+    </span>
+  );
+}
+
 type CommentPanelMode = 'document' | 'workspace';
 
 interface DocCommentsPanelProps {
@@ -61,6 +260,11 @@ interface DocCommentsPanelProps {
   threads: DocCommentThread[];
   resolvedThreads?: DocCommentThread[];
   threadAnchorOffsets?: Record<string, number>;
+  /** Ids (thread ids + '__draft__') a measurement pass has attempted for the
+   *  current file. An offset-less card is hidden only while its id was never in
+   *  a pass — after the pass that tried (and failed) it, it falls back to
+   *  visible. Omitted (e.g. workspace mode) → nothing is hidden. */
+  measuredAnchorIds?: ReadonlySet<string> | null;
   draftAnchorOffset?: number | null;
   activeThreadId: string | null;
   draftSelection: DraftDocCommentSelection | null;
@@ -71,13 +275,29 @@ interface DocCommentsPanelProps {
   currentUser: CurrentUser;
   currentUserId: string | null;
   canComment: boolean;
-  canResolve: boolean;
+  /** Write capability driving Resolve + moderation-Delete. Pass a function of
+   *  the thread's filePath so All-comments cards (which span files) each gate
+   *  on their own file; a boolean applies uniformly. */
+  canResolve: boolean | ((filePath: string) => boolean);
   loading?: boolean;
   error?: string | null;
   busyAction?: string | null;
   onModeChange: (mode: CommentPanelMode) => void;
   onSelectThread: (threadId: string | null) => void;
   onOpenWorkspaceThread: (thread: DocCommentThread) => void;
+  /** Switch the workspace to the agent chat linked to a thread. */
+  onOpenThreadChat?: (chatId: string) => void;
+  /** Live run state for a linked chat: 'working' | 'idle', or null when
+   *  unknown (then the reply-derived fallback applies). Idle overrides the
+   *  fallback — engines like Codex answer only in the chat, never on the
+   *  thread, and would otherwise read as working forever. */
+  chatActivity?: (chatId: string) => 'working' | 'answering' | 'idle' | null;
+  /** Watch state for the OPEN doc. Non-null renders the passive badge in the
+   *  All-comments header (the document lane carries no header). */
+  commentWatchScope?: CommentWatchScope;
+  /** Workspace collaborators offered by the composer's `@` menu, below the
+   *  always-first agent row. Exclude the current user — you don't tag yourself. */
+  mentionPeople?: readonly CommentMentionOption[];
   onClose: () => void;
   onCreateComment: (body: string) => Promise<void> | void;
   onCancelDraft: () => void;
@@ -92,7 +312,7 @@ interface DocCommentsPanelProps {
 // Cards float on the page white (no gray lane field), so they carry a real
 // elevation shadow — the new-Google-Docs look.
 const COMMENT_CARD_CLASS =
-  'rounded-2xl border border-[#dadce0] bg-white shadow-[0_1px_2px_rgba(60,64,67,0.2),0_2px_6px_2px_rgba(60,64,67,0.1)]';
+  'rounded-2xl border border-stone-200 bg-white shadow-[0_1px_2px_rgba(60,64,67,0.2),0_2px_6px_2px_rgba(60,64,67,0.1)]';
 const COMMENT_MENU_WIDTH = 220;
 const COMMENT_LANE_GAP = 12;
 
@@ -147,7 +367,7 @@ function Avatar({
   }
   return (
     <div
-      className={`${className} inline-flex items-center justify-center rounded-full bg-[#f1e5d7] font-medium text-[#866646]`}
+      className={`${className} inline-flex items-center justify-center rounded-full bg-beige-200 font-medium text-beige-500`}
     >
       {getInitials(author.name)}
     </div>
@@ -175,8 +395,8 @@ function ActionButton({
       disabled={disabled}
       className={`inline-flex h-7 w-7 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
         active
-          ? 'bg-[#f1e5d7] text-[#634a31]'
-          : 'text-[#5f6368] hover:bg-[#f6f1ea] hover:text-[#202124]'
+          ? 'bg-beige-200 text-beige-600'
+          : 'text-stone-500 hover:bg-stone-100 hover:text-stone-800'
       }`}
     >
       {children}
@@ -198,12 +418,12 @@ function TabButton({
       type="button"
       onClick={onClick}
       className={`relative px-1.5 py-2 text-[12px] font-medium transition-colors ${
-        active ? 'text-[#866646]' : 'text-[#5f6368] hover:text-[#202124]'
+        active ? 'text-beige-500' : 'text-stone-500 hover:text-stone-800'
       }`}
     >
       {children}
       {active ? (
-        <span className="absolute inset-x-0 bottom-0 h-[2px] rounded-t-full bg-[#c9a57a]" />
+        <span className="absolute inset-x-0 bottom-0 h-[2px] rounded-t-full bg-beige-400" />
       ) : null}
     </button>
   );
@@ -227,8 +447,8 @@ function MenuItem({
       disabled={disabled}
       className={`flex w-full items-center rounded-lg px-3 py-2 text-left text-[13px] leading-5 transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
         destructive
-          ? 'text-[#c5221f] hover:bg-[#fce8e6]'
-          : 'text-[#202124] hover:bg-[#f1f3f4]'
+          ? 'text-red-700 hover:bg-red-50'
+          : 'text-stone-800 hover:bg-stone-100'
       }`}
     >
       {children}
@@ -236,12 +456,13 @@ function MenuItem({
   );
 }
 
-function CommentComposer({
+export function CommentComposer({
   currentUser,
   draftSelection,
   initialBody = '',
   canComment,
   busy,
+  mentionPeople = [],
   onSubmit,
   onCancel,
 }: {
@@ -251,12 +472,15 @@ function CommentComposer({
   initialBody?: string;
   canComment: boolean;
   busy: boolean;
+  /** Human collaborators for the `@` menu; the agent row is added on top. */
+  mentionPeople?: readonly CommentMentionOption[];
   onSubmit: (body: string) => Promise<void> | void;
   onCancel: () => void;
 }) {
   const [body, setBody] = useState(initialBody);
   const textareaRef = useAutoGrowTextarea(body);
   const trimmedBody = body.trim();
+  const mention = useMentionAutocomplete(body, setBody, textareaRef, mentionPeople);
 
   useEffect(() => {
     setBody(initialBody);
@@ -281,40 +505,54 @@ function CommentComposer({
       <div className="flex items-start gap-2.5">
         <Avatar author={currentUser} />
         <div className="min-w-0 flex-1">
-          <div className="text-[13px] font-medium leading-5 text-[#202124]">
+          <div className="text-[13px] font-medium leading-5 text-stone-800">
             {currentUser.name?.trim() || 'You'}
           </div>
-          <textarea
-            ref={textareaRef}
-            value={body}
-            onChange={(event) => setBody(event.target.value)}
-            onKeyDown={(event) =>
-              submitOnCmdEnter(event, canComment && !busy && trimmedBody.length > 0, () =>
-                void onSubmit(trimmedBody),
-              )
-            }
-            placeholder="Comment or add others with @"
-            rows={2}
-            disabled={!canComment || busy}
-            className="mt-2 max-h-[40vh] min-h-[44px] w-full resize-none overflow-y-auto rounded-xl border-2 border-[#c9a57a] bg-white px-3 py-2 text-[13px] leading-5 text-[#202124] outline-none transition-shadow placeholder:text-[#5f6368] focus:shadow-[0_0_0_1px_#c9a57a] disabled:cursor-not-allowed disabled:border-[#dadce0] disabled:bg-[#f8f9fa] disabled:text-[#5f6368]"
-          />
+          <div className="relative">
+            <textarea
+              ref={textareaRef}
+              value={body}
+              onChange={(event) => {
+                setBody(event.target.value);
+                mention.sync(event.target);
+              }}
+              onKeyDown={(event) => {
+                if (mention.onKeyDown(event)) return;
+                submitOnCmdEnter(event, canComment && !busy && trimmedBody.length > 0, () =>
+                  void onSubmit(trimmedBody),
+                );
+              }}
+              placeholder="Comment, or tag @Agent to get a reply"
+              data-tour-id="comment-draft-input"
+              rows={2}
+              disabled={!canComment || busy}
+              className="mt-2 max-h-[40vh] min-h-[44px] w-full resize-none overflow-y-auto rounded-xl border-2 border-beige-400 bg-white px-3 py-2 text-[13px] leading-5 text-stone-800 outline-none transition-shadow [&:not(:focus)::selection]:bg-transparent placeholder:text-stone-500 focus:shadow-[0_0_0_1px_var(--beige-dark)] disabled:cursor-not-allowed disabled:border-stone-200 disabled:bg-stone-50 disabled:text-stone-500"
+            />
+            <MentionMenu
+              options={mention.options}
+              highlight={mention.highlight}
+              onHighlight={mention.setHighlight}
+              onPick={mention.insert}
+            />
+          </div>
           <div className="mt-2 flex items-center justify-end gap-2">
             <button
               type="button"
               onClick={onCancel}
               disabled={busy}
-              className="rounded-full px-2 py-1 text-[12px] font-medium text-[#866646] transition-colors hover:bg-[#f6f1ea] disabled:opacity-60"
+              className="shrink-0 rounded-full px-2 py-1 text-[12px] font-medium text-beige-500 transition-colors hover:bg-stone-100 disabled:opacity-60"
             >
               Cancel
             </button>
             <button
               type="button"
+              data-tour-id="comment-draft-post"
               onClick={() => void onSubmit(trimmedBody)}
               disabled={!canComment || busy || trimmedBody.length === 0}
-              className={`rounded-full px-3 py-1 text-[12px] font-medium transition-colors ${
+              className={`shrink-0 rounded-full px-3 py-1 text-[12px] font-medium transition-colors ${
                 !canComment || busy || trimmedBody.length === 0
-                  ? 'bg-[#f1f3f4] text-[#9aa0a6]'
-                  : 'bg-[#f1e5d7] text-[#634a31] hover:bg-[#ead9c6]'
+                  ? 'bg-stone-100 text-stone-400'
+                  : 'bg-beige-200 text-beige-600 hover:bg-beige-300'
               }`}
             >
               Comment
@@ -345,7 +583,7 @@ function CollapsibleBody({ body }: { body: string }) {
     <div className="mt-2">
       <p
         ref={ref}
-        className="whitespace-pre-wrap text-[13px] leading-5 text-[#3c4043]"
+        className="whitespace-pre-wrap text-[13px] leading-5 text-stone-700"
         style={
           expanded
             ? undefined
@@ -366,7 +604,7 @@ function CollapsibleBody({ body }: { body: string }) {
             event.stopPropagation();
             setExpanded((value) => !value);
           }}
-          className="mt-0.5 text-[12px] font-medium text-[#866646] transition-colors hover:text-[#634a31]"
+          className="mt-0.5 text-[12px] font-medium text-beige-500 transition-colors hover:text-beige-600"
         >
           {expanded ? 'Show less' : 'Show more'}
         </button>
@@ -425,7 +663,10 @@ export function ThreadMessageRow({
   // server id arrives (covers a pending reply inside an otherwise real thread).
   const actionsDisabled = isOptimisticCommentId(thread.id) || isOptimisticCommentId(message.id);
   const canEdit = isOwnMessage && !actionsDisabled;
-  const canDelete = isOwnMessage && !actionsDisabled;
+  // `canResolve` carries the per-file write capability (the UI mirror of the
+  // server's canWritePath), which also moderates: writers delete any message,
+  // including agent-authored ones. Editing stays author-only.
+  const canDelete = (isOwnMessage || canResolve) && !actionsDisabled;
   const trimmedDraftBody = draftBody.trim();
   const deleteLabel = isFirstMessage && thread.messages.length > 1 ? 'Delete thread' : 'Delete';
 
@@ -504,10 +745,13 @@ export function ThreadMessageRow({
       <div className="min-w-0 flex-1">
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
-            <div className="truncate text-[13px] font-medium leading-5 text-[#202124]">
-              {message.author.name?.trim() || message.author.username || 'Collaborator'}
+            <div className="truncate text-[13px] font-medium leading-5 text-stone-800">
+              {/* Nameless own messages read 'You' — the same word the composer
+                  falls back to — so an identity-less author doesn't change
+                  labels the instant the comment posts. */}
+              {message.author.name?.trim() || message.author.username || (isOwnMessage ? 'You' : 'Collaborator')}
             </div>
-            <div className="text-[11px] leading-4 text-[#5f6368]">
+            <div className="text-[11px] leading-4 text-stone-500">
               {formatCommentTime(message.createdAt)}
             </div>
           </div>
@@ -526,9 +770,9 @@ export function ThreadMessageRow({
                 disabled={resolveBusy}
               >
                 {isResolved ? (
-                  <ClockCounterClockwiseIcon className="h-3.5 w-3.5 text-[#866646]" weight="bold" />
+                  <ClockCounterClockwiseIcon className="h-3.5 w-3.5 text-beige-500" weight="bold" />
                 ) : (
-                  <CheckIcon className="h-3.5 w-3.5 text-[#866646]" weight="bold" />
+                  <CheckIcon className="h-3.5 w-3.5 text-beige-500" weight="bold" />
                 )}
               </ActionButton>
             ) : null}
@@ -563,7 +807,7 @@ export function ThreadMessageRow({
                 ? createPortal(
                     <div
                       ref={menuRef}
-                      className="fixed z-[80] min-w-[220px] rounded-xl border border-[#dadce0] bg-white py-1.5 shadow-[0_8px_24px_rgba(60,64,67,0.18)]"
+                      className="fixed z-[80] min-w-[220px] rounded-xl border border-stone-200 bg-white py-1.5 shadow-[0_8px_24px_rgba(60,64,67,0.18)]"
                       style={{
                         left: menuPosition.left,
                         top: menuPosition.top,
@@ -604,7 +848,7 @@ export function ThreadMessageRow({
         </div>
         {isEditing ? (
           <div className="mt-2" onClick={(event) => event.stopPropagation()}>
-            <div className="rounded-xl border border-[#80868b] bg-white px-3 py-2 transition-colors focus-within:border-[#c9a57a]">
+            <div className="rounded-xl border border-stone-400 bg-white px-3 py-2 transition-colors focus-within:border-beige-400">
               <textarea
                 ref={editRef}
                 value={draftBody}
@@ -616,7 +860,7 @@ export function ThreadMessageRow({
                 }
                 rows={2}
                 disabled={isEditBusy}
-                className="max-h-[40vh] min-h-[40px] w-full resize-none overflow-y-auto bg-transparent text-[13px] leading-5 text-[#202124] outline-none placeholder:text-[#5f6368] disabled:cursor-not-allowed"
+                className={commentTextareaClass}
               />
             </div>
             <div className="mt-2 flex items-center justify-end gap-2">
@@ -627,7 +871,7 @@ export function ThreadMessageRow({
                   setIsEditing(false);
                 }}
                 disabled={isEditBusy}
-                className="rounded-full px-2 py-1 text-[12px] font-medium text-[#866646] transition-colors hover:bg-[#f6f1ea] disabled:opacity-60"
+                className="rounded-full px-2 py-1 text-[12px] font-medium text-beige-500 transition-colors hover:bg-stone-100 disabled:opacity-60"
               >
                 Cancel
               </button>
@@ -637,8 +881,8 @@ export function ThreadMessageRow({
                 disabled={isEditBusy || trimmedDraftBody.length === 0}
                 className={`rounded-full px-3 py-1 text-[12px] font-medium transition-colors ${
                   isEditBusy || trimmedDraftBody.length === 0
-                    ? 'bg-[#f1f3f4] text-[#9aa0a6]'
-                    : 'bg-[#f1e5d7] text-[#634a31] hover:bg-[#ead9c6]'
+                    ? 'bg-stone-100 text-stone-400'
+                    : 'bg-beige-200 text-beige-600 hover:bg-beige-300'
                 }`}
               >
                 Save
@@ -663,6 +907,10 @@ function ThreadCard({
   busyAction,
   onSelect,
   onOpenWorkspaceThread,
+  onOpenThreadChat,
+  chatActivity,
+  watched = false,
+  mentionPeople = [],
   onReply,
   onResolve,
   onReopen,
@@ -674,12 +922,23 @@ function ThreadCard({
   mode: CommentPanelMode;
   thread: DocCommentThread;
   active: boolean;
+  /** A chat already watches this doc, so every comment reaches an agent
+   *  anyway — the Delegate pill would only be noise. */
+  watched?: boolean;
   currentUserId: string | null;
   canComment: boolean;
   canResolve: boolean;
   busyAction: string | null;
   onSelect: () => void;
   onOpenWorkspaceThread: (thread: DocCommentThread) => void;
+  onOpenThreadChat?: (chatId: string) => void;
+  /** Live run state for a linked chat: 'working' | 'idle', or null when
+   *  unknown (then the reply-derived fallback applies). Idle overrides the
+   *  fallback — engines like Codex answer only in the chat, never on the
+   *  thread, and would otherwise read as working forever. */
+  chatActivity?: (chatId: string) => 'working' | 'answering' | 'idle' | null;
+  /** Human collaborators for the `@` menu; the agent row is added on top. */
+  mentionPeople?: readonly CommentMentionOption[];
   onReply: (body: string) => Promise<void> | void;
   /** Set when an optimistic reply to this thread failed — re-seed the box. */
   replyRestore?: { threadId: string; body: string; token: number } | null;
@@ -691,6 +950,7 @@ function ThreadCard({
 }) {
   const [replyBody, setReplyBody] = useState('');
   const replyRef = useAutoGrowTextarea(replyBody);
+  const replyMention = useMentionAutocomplete(replyBody, setReplyBody, replyRef, mentionPeople);
   const isResolveBusy = busyAction === `resolve:${thread.id}` || busyAction === `reopen:${thread.id}`;
   const isReplyBusy = busyAction === `reply:${thread.id}`;
   const latestMessage = thread.messages[thread.messages.length - 1] ?? null;
@@ -707,6 +967,49 @@ function ThreadCard({
   // While the thread is still an optimistic placeholder, reply/resolve would hit
   // the API with the temp id (404). Hide those actions until it reconciles.
   const isOptimistic = isOptimisticCommentId(thread.id);
+  // Set once someone mentioned an agent on the thread — its dedicated chat.
+  const agentChatId = thread.chatId ?? null;
+  // Delegated is wider than "linked": the server mints the thread's chat AFTER
+  // the POST responds, so a just-posted @agent comment has no chatId for a beat
+  // — keying the pill only off chatId flashed Delegate on a thread that was
+  // already handed off. Pending (optimistic/in-flight) posts count too.
+  const agentDelegated =
+    Boolean(agentChatId) ||
+    isReplyBusy ||
+    thread.messages.some((m) => isOptimisticCommentId(m.id) || hasAgentMention(m.body));
+  // Live run state wins when known; otherwise fall back to "linked + the last
+  // word is still a human's". Clearing the badge the moment the run stopped
+  // being live hid the agent well before its answer: a triggered turn ALWAYS
+  // ends with a reply (or its error) ON THE THREAD, and that lands AFTER the
+  // run settles — and across the retry gaps in between, where it is briefly
+  // not live at all. 'answering' is exactly that window (the sidecar's shared
+  // per-chat state, so every watcher agrees), and it ends when the answer
+  // lands. A run that was stopped, never started, or is already done owes
+  // nothing, so it reports 'idle' and the badge clears as it always did.
+  const activity = agentChatId ? chatActivity?.(agentChatId) ?? null : null;
+  const answered = Boolean(latestMessage && isAgentCommentAuthor(latestMessage.author));
+  const agentWorking =
+    Boolean(agentChatId) &&
+    (activity === 'working' || (!answered && (activity === 'answering' || activity === null)));
+  // The seconds between "Reply" and the minted chat link landing used to show
+  // NOTHING — a summon that looks ignored. A fresh human @Agent message with
+  // no chat yet is that startup window; freshness-capped so a run that never
+  // starts (brain down) can't pin "starting" to the thread forever.
+  const latestSummonAt =
+    latestMessage && !isAgentCommentAuthor(latestMessage.author) && hasAgentMention(latestMessage.body)
+      ? Date.parse(latestMessage.createdAt)
+      : null;
+  const [startupNow, setStartupNow] = useState(() => Date.now());
+  const summonFresh =
+    latestSummonAt !== null && Number.isFinite(latestSummonAt) && startupNow - latestSummonAt < 90_000;
+  const agentStarting = !agentChatId && summonFresh;
+  useEffect(() => {
+    // Tick only while the indicator could be showing, so it ages out even if
+    // nothing else re-renders the lane.
+    if (!agentStarting) return;
+    const interval = window.setInterval(() => setStartupNow(Date.now()), 10_000);
+    return () => window.clearInterval(interval);
+  }, [agentStarting]);
 
   // Re-seed the reply box if an optimistic reply to this thread failed (the box
   // is cleared on submit for an instant feel, so the text would otherwise be lost).
@@ -730,6 +1033,92 @@ function ThreadCard({
     onSelect();
   };
 
+  // An emoji reaction is a comment thread with a single one-emoji message. The
+  // emoji lives ONLY here — in the margin, at its anchor's height, Google-Docs
+  // style — never inline in the document. It rides the same lane as the comment
+  // cards (same list, same anchor-offset layout), so a doc with both shows
+  // both; a reaction is just a small pill instead of a card, so it can sit next
+  // to comments without competing with them. Replying makes it an ordinary
+  // thread, `threadReactionEmoji` stops matching, and it renders as a card again.
+  const reaction = threadReactionEmoji(thread);
+  if (reaction && latestMessage) {
+    const canRemove = (Boolean(currentUserId && currentUserId === latestMessage.author.userId) || canResolve) && !isOptimistic;
+    const who = latestMessage.author.name?.trim() || latestMessage.author.username || 'Collaborator';
+    // Accepting a reaction IS resolving its thread: it leaves the open lane and
+    // joins the resolved set, exactly like a comment (and the resolved section
+    // renders it through this same branch, so it stays a pill there). Gated on
+    // `canResolve` like the card's own resolve, and always shown rather than
+    // only on the active pill — a two-icon pill has no clutter to protect, and
+    // hiding the checkmark behind a click is the opposite of "close it".
+    const showAccept = mode === 'document' && canResolve && !isOptimistic;
+    const isResolved = thread.status === 'resolved';
+    return (
+      <div
+        role="button"
+        tabIndex={0}
+        data-testid="comment-reaction-row"
+        // Explicit: without it the accessible name is computed from the
+        // contents, which swallows the Remove button's own label. The quote
+        // lives here rather than on screen — a pill wide enough to show it
+        // would be a card again.
+        aria-label={`${reaction} reaction by ${who} on “${thread.quote}”`}
+        title={`${who} reacted ${reaction} on “${thread.quote}”`}
+        onClick={handleOpen}
+        onKeyDown={(event) => {
+          if (event.target !== event.currentTarget) return;
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            handleOpen();
+          }
+        }}
+        // `w-fit`, not `w-full`: the pill hugs its content so the lane still
+        // reads as comments-with-reactions-beside-them, not a stack of cards.
+        className={`${COMMENT_CARD_CLASS} flex w-fit max-w-full items-center gap-1.5 rounded-full py-1 pl-2.5 text-left ${
+          canRemove || showAccept ? 'pr-1' : 'pr-2.5'
+        } ${isResolved ? 'opacity-80' : ''} ${
+          active && mode === 'document' ? 'border-beige-200 bg-beige-50' : ''
+        }`}
+      >
+        <span className="text-[15px] leading-none" aria-hidden>
+          {reaction}
+        </span>
+        <span className="min-w-0 truncate text-[12px] leading-5 text-stone-600">{who}</span>
+        {showAccept ? (
+          <ActionButton
+            label={isResolved ? 'Reopen reaction' : 'Resolve reaction'}
+            disabled={isResolveBusy}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (isResolved) {
+                void onReopen();
+              } else {
+                void onResolve();
+              }
+            }}
+          >
+            {isResolved ? (
+              <ClockCounterClockwiseIcon className="h-3.5 w-3.5 text-beige-500" weight="bold" />
+            ) : (
+              <CheckIcon className="h-3.5 w-3.5 text-beige-500" weight="bold" />
+            )}
+          </ActionButton>
+        ) : null}
+        {canRemove ? (
+          <ActionButton
+            label="Remove reaction"
+            disabled={busyAction === `delete:${latestMessage.id}`}
+            onClick={(event) => {
+              event.stopPropagation();
+              void onDeleteMessage(thread, latestMessage.id);
+            }}
+          >
+            <TrashIcon className="h-3.5 w-3.5" weight="bold" />
+          </ActionButton>
+        ) : null}
+      </div>
+    );
+  }
+
   return (
     <div
       role="button"
@@ -748,17 +1137,19 @@ function ThreadCard({
       }}
       className={`${COMMENT_CARD_CLASS} w-full px-4 py-3 text-left ${
         active && mode === 'document'
-          ? 'border-[#eadfce] bg-[#fbf6ef]'
+          ? 'border-beige-200 bg-beige-50'
           : ''
-      } ${thread.status === 'resolved' ? 'opacity-80' : ''}`}
+      } ${thread.status === 'resolved' ? 'opacity-80' : ''} ${
+        agentWorking ? 'comment-thread-working border-beige-300' : ''
+      }`}
     >
       <div className="space-y-3">
         {mode === 'workspace' ? (
           <div className="flex items-start justify-between gap-2">
-            <p className="text-[12px] leading-5 text-[#3c4043]">
+            <p className="text-[12px] leading-5 text-stone-700">
               {getWorkspaceThreadHeading(thread)}
             </p>
-            <CaretUpIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#5f6368]" weight="bold" />
+            <CaretUpIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-stone-500" weight="bold" />
           </div>
         ) : null}
 
@@ -782,52 +1173,103 @@ function ThreadCard({
           />
         ))}
 
+        {agentChatId || agentStarting ? (
+          <div className="flex items-center gap-2 text-[11px] leading-4 text-stone-500">
+            {agentWorking || agentStarting ? (
+              <>
+                <span className="comment-agent-dot h-1.5 w-1.5 shrink-0 rounded-full bg-beige-500" aria-hidden />
+                <span className="truncate">{agentStarting ? 'Agent is starting' : 'Agent is working'}</span>
+              </>
+            ) : null}
+            {agentChatId ? (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onOpenThreadChat?.(agentChatId);
+                }}
+                className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-1 text-[11px] font-medium text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-600"
+              >
+                <ChatCircleIcon className="h-3.5 w-3.5" weight="bold" aria-hidden />
+                Open chat
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+
         {mode === 'document' && active && canComment && thread.status === 'open' && !isOptimistic ? (
           <div>
-            <div className="rounded-xl border border-[#80868b] bg-white px-3 py-2 transition-colors focus-within:border-[#c9a57a]">
-              <textarea
-                ref={replyRef}
-                value={replyBody}
-                onChange={(event) => setReplyBody(event.target.value)}
-                onKeyDown={(event) =>
-                  submitOnCmdEnter(event, !isReplyBusy && replyBody.trim().length > 0, submitReply)
-                }
-                rows={2}
-                placeholder="Reply or add others with @"
-                disabled={isReplyBusy}
-                className="max-h-[40vh] min-h-[40px] w-full resize-none overflow-y-auto bg-transparent text-[13px] leading-5 text-[#202124] outline-none placeholder:text-[#5f6368] disabled:cursor-not-allowed"
+            <div className="relative">
+              <div className="rounded-xl border border-stone-400 bg-white px-3 py-2 transition-colors focus-within:border-beige-400">
+                <textarea
+                  ref={replyRef}
+                  value={replyBody}
+                  onChange={(event) => {
+                    setReplyBody(event.target.value);
+                    replyMention.sync(event.target);
+                  }}
+                  onKeyDown={(event) => {
+                    if (replyMention.onKeyDown(event)) return;
+                    submitOnCmdEnter(event, !isReplyBusy && replyBody.trim().length > 0, submitReply);
+                  }}
+                  rows={2}
+                  placeholder="Reply, or tag @Agent to get a reply"
+                  disabled={isReplyBusy}
+                  className={commentTextareaClass}
+                />
+              </div>
+              <MentionMenu
+                options={replyMention.options}
+                highlight={replyMention.highlight}
+                onHighlight={replyMention.setHighlight}
+                onPick={replyMention.insert}
               />
             </div>
-            {showReplyActions ? (
-              <div className="mt-2 flex items-center justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    setReplyBody('');
+            <div className="mt-2 flex items-center justify-end gap-2">
+              {/* Once the thread is delegated — a linked chat, or a mention
+                  whose link is still landing — a second Delegate is noise. So
+                  is one on a watched doc: the watching chat already gets every
+                  comment here. */}
+              {agentDelegated || watched ? null : (
+                <DelegateToAgentButton
+                  onClick={() => {
+                    setReplyBody(withAgentMention(replyBody));
+                    replyRef.current?.focus({ preventScroll: true });
                   }}
-                  disabled={isReplyBusy}
-                  className="rounded-full px-2 py-1 text-[12px] font-medium text-[#866646] transition-colors hover:bg-[#f6f1ea] disabled:opacity-60"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    submitReply();
-                  }}
-                  disabled={isReplyBusy || replyBody.trim().length === 0}
-                  className={`rounded-full px-3 py-1 text-[12px] font-medium transition-colors ${
-                    isReplyBusy || replyBody.trim().length === 0
-                      ? 'bg-[#f1f3f4] text-[#9aa0a6]'
-                      : 'bg-[#f1e5d7] text-[#634a31] hover:bg-[#ead9c6]'
-                  }`}
-                >
-                  Reply
-                </button>
-              </div>
-            ) : null}
+                />
+              )}
+              {showReplyActions ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setReplyBody('');
+                    }}
+                    disabled={isReplyBusy}
+                    className="shrink-0 rounded-full px-2 py-1 text-[12px] font-medium text-beige-500 transition-colors hover:bg-stone-100 disabled:opacity-60"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    data-tour-id="reply-send"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      submitReply();
+                    }}
+                    disabled={isReplyBusy || replyBody.trim().length === 0}
+                    className={`shrink-0 rounded-full px-3 py-1 text-[12px] font-medium transition-colors ${
+                      isReplyBusy || replyBody.trim().length === 0
+                        ? 'bg-stone-100 text-stone-400'
+                        : 'bg-beige-200 text-beige-600 hover:bg-beige-300'
+                    }`}
+                  >
+                    Reply
+                  </button>
+                </>
+              ) : null}
+            </div>
           </div>
         ) : null}
       </div>
@@ -841,6 +1283,7 @@ export function DocCommentsPanel({
   threads,
   resolvedThreads = [],
   threadAnchorOffsets = {},
+  measuredAnchorIds = null,
   draftAnchorOffset = null,
   activeThreadId,
   draftSelection,
@@ -856,6 +1299,10 @@ export function DocCommentsPanel({
   onModeChange,
   onSelectThread,
   onOpenWorkspaceThread,
+  onOpenThreadChat,
+  chatActivity,
+  commentWatchScope = null,
+  mentionPeople = [],
   onClose,
   onCreateComment,
   onCancelDraft,
@@ -866,6 +1313,8 @@ export function DocCommentsPanel({
   onDeleteMessage,
   onCopyMessageLink,
 }: DocCommentsPanelProps) {
+  const canResolvePath = (filePath: string) =>
+    typeof canResolve === 'function' ? canResolve(filePath) : canResolve;
   const showWorkspaceHeader = mode === 'workspace';
   const [showResolved, setShowResolved] = useState(false);
   const visibleThreads = useMemo(
@@ -889,6 +1338,13 @@ export function DocCommentsPanel({
       return Date.parse(left.createdAt) - Date.parse(right.createdAt);
     });
   }, [activeThreadId, mode, threadAnchorOffsets, visibleThreads]);
+  // Resolved-only document lane: this state is only ever on screen when the
+  // user explicitly opened comments on a doc whose threads are all resolved
+  // (resolving the last open thread auto-releases the lane — see the
+  // workspace-comments hook). So show the resolved cards outright, with no
+  // Show/Hide toggle: a toggle would leave a mostly-empty 320px column in its
+  // hidden state (Sean's dead-column report).
+  const resolvedOnly = mode === 'document' && !draftSelection && orderedThreads.length === 0;
   // Lane layout is keyed by the stable clientKey (falls back to id), so an
   // optimistic comment reconciling to its persisted id doesn't reset its
   // measured position for a frame and re-slide. Offsets stay keyed by the real
@@ -970,7 +1426,7 @@ export function DocCommentsPanel({
     <aside
       // Lane stays page-white; a hairline editor↔comments separator fades in
       // only while the pointer is over the lane (new-Google-Docs style).
-      className={`group/lane relative flex h-full min-h-0 w-[320px] shrink-0 px-3 pb-4 ${
+      className={`group/lane relative flex h-full min-h-0 w-[320px] max-w-full shrink-0 px-3 pb-4 ${
         showWorkspaceHeader ? 'pt-4' : 'pt-2'
       }`}
     >
@@ -983,10 +1439,10 @@ export function DocCommentsPanel({
           <div className="mb-3">
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
-                <div className="text-[15px] font-medium tracking-[-0.01em] text-[#202124]">
+                <div className="text-[15px] font-medium tracking-[-0.01em] text-stone-800">
                   Comments
                 </div>
-                <div className="mt-2 flex items-center gap-3 border-b border-[#dadce0]">
+                <div className="mt-2 flex items-center gap-3 border-b border-stone-200">
                   {documentLabel ? (
                     <TabButton active={false} onClick={() => onModeChange('document')}>
                       This doc
@@ -997,9 +1453,12 @@ export function DocCommentsPanel({
                   </TabButton>
                 </div>
               </div>
-              <ActionButton label="Close comments" onClick={() => onClose()}>
-                <XIcon className="h-3.5 w-3.5" weight="bold" />
-              </ActionButton>
+              <div className="flex shrink-0 items-center gap-1">
+                {commentWatchScope ? <CommentWatchBadge /> : null}
+                <ActionButton label="Close comments" onClick={() => onClose()}>
+                  <XIcon className="h-3.5 w-3.5" weight="bold" />
+                </ActionButton>
+              </div>
             </div>
           </div>
         ) : null}
@@ -1019,6 +1478,12 @@ export function DocCommentsPanel({
                     className="absolute inset-x-0"
                     style={{
                       top: docLaneTops.__draft__ ?? Math.max(0, Math.round(draftAnchorOffset ?? 0)),
+                      // Never paint at an unmeasured position — stay hidden
+                      // until the anchor offset exists, then appear in place.
+                      visibility:
+                        draftAnchorOffset == null && measuredAnchorIds != null && !measuredAnchorIds.has('__draft__')
+                          ? 'hidden'
+                          : undefined,
                     }}
                   >
                     <CommentComposer
@@ -1027,6 +1492,7 @@ export function DocCommentsPanel({
                       initialBody={draftBody}
                       canComment={canComment}
                       busy={busyAction === 'create'}
+                      mentionPeople={mentionPeople}
                       onSubmit={onCreateComment}
                       onCancel={onCancelDraft}
                     />
@@ -1044,19 +1510,38 @@ export function DocCommentsPanel({
                     className="absolute inset-x-0"
                     style={{
                       top: docLaneTops[laneKeyOf(thread)] ?? Math.max(0, Math.round(threadAnchorOffsets[thread.id] ?? 0)),
+                      // Before the first measurement pass, an offset-less card
+                      // must never paint — it would sit at the top:0 fallback
+                      // and then jump to its anchor once measured (the
+                      // founder's top-flash bug). It stays in the DOM (so its
+                      // height feeds the layout pass) and becomes visible in
+                      // place. After a pass, a thread whose anchor can't
+                      // resolve falls back to visible so it stays reachable.
+                      visibility:
+                        threadAnchorOffsets[thread.id] == null &&
+                        measuredAnchorIds != null &&
+                        !measuredAnchorIds.has(thread.id)
+                          ? 'hidden'
+                          : undefined,
                       zIndex: thread.id === activeThreadId ? 1 : undefined,
                     }}
                   >
                     <ThreadCard
+                      chatActivity={chatActivity}
+                      mentionPeople={mentionPeople}
                       mode={mode}
                       thread={thread}
                       active={thread.id === activeThreadId}
                       currentUserId={currentUserId}
                       canComment={canComment}
-                      canResolve={canResolve}
+                      canResolve={canResolvePath(thread.filePath)}
                       busyAction={busyAction}
+                      // Document lane ⇒ these threads ARE the open doc, which
+                      // `commentWatchScope` describes.
+                      watched={commentWatchScope != null}
                       onSelect={() => onSelectThread(thread.id)}
                       onOpenWorkspaceThread={onOpenWorkspaceThread}
+                      onOpenThreadChat={onOpenThreadChat}
                       onReply={(body) => onReply(thread.id, body)}
                       onResolve={() => onResolve(thread.id)}
                       onReopen={() => onReopen(thread.id)}
@@ -1071,13 +1556,13 @@ export function DocCommentsPanel({
             ) : null}
 
             {!loading && error ? (
-              <div className="rounded-xl border border-[#f3c7c3] bg-[#fce8e6] px-4 py-3 text-[12px] text-[#c5221f] shadow-[0_1px_2px_rgba(60,64,67,0.12)]">
+              <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-[12px] text-red-700 shadow-[0_1px_2px_rgba(60,64,67,0.12)]">
                 {error}
               </div>
             ) : null}
 
             {!loading && mode === 'workspace' && orderedThreads.length === 0 && resolvedThreads.length === 0 ? (
-              <div className={`${COMMENT_CARD_CLASS} flex flex-col items-center gap-2 px-4 py-5 text-[12px] leading-5 text-[#5f6368]`}>
+              <div className={`${COMMENT_CARD_CLASS} flex flex-col items-center gap-2 px-4 py-5 text-[12px] leading-5 text-stone-500`}>
                 <SunnyAnimation name="sleepy" className="w-20 opacity-90" />
                 No comments across this workspace yet.
               </div>
@@ -1086,16 +1571,19 @@ export function DocCommentsPanel({
             {mode === 'workspace'
               ? orderedThreads.map((thread) => (
                   <ThreadCard
+                    chatActivity={chatActivity}
+                    mentionPeople={mentionPeople}
                     key={thread.clientKey ?? thread.id}
                     mode={mode}
                     thread={thread}
                     active={false}
                     currentUserId={currentUserId}
                     canComment={canComment}
-                    canResolve={canResolve}
+                    canResolve={canResolvePath(thread.filePath)}
                     busyAction={busyAction}
                     onSelect={() => onSelectThread(thread.id)}
                     onOpenWorkspaceThread={onOpenWorkspaceThread}
+                    onOpenThreadChat={onOpenThreadChat}
                     onReply={(body) => onReply(thread.id, body)}
                     onResolve={() => onResolve(thread.id)}
                     onReopen={() => onReopen(thread.id)}
@@ -1108,35 +1596,40 @@ export function DocCommentsPanel({
 
             {resolvedThreads.length > 0 ? (
               <div className="pt-1">
-                <button
-                  type="button"
-                  onClick={() => setShowResolved((value) => !value)}
-                  className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 text-[12px] font-medium text-[#5f6368] transition-colors hover:bg-[#f1f3f4] hover:text-[#202124]"
-                  aria-expanded={showResolved}
-                >
-                  <ClockCounterClockwiseIcon className="h-3.5 w-3.5" weight="regular" />
-                  <span>
-                    {showResolved ? 'Hide' : 'Show'} resolved ({resolvedThreads.length})
-                  </span>
-                  <CaretUpIcon
-                    className={`ml-auto h-3 w-3 transition-transform ${showResolved ? '' : 'rotate-180'}`}
-                    weight="bold"
-                  />
-                </button>
-                {showResolved ? (
+                {resolvedOnly ? null : (
+                  <button
+                    type="button"
+                    onClick={() => setShowResolved((value) => !value)}
+                    className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 text-[12px] font-medium text-stone-500 transition-colors hover:bg-stone-100 hover:text-stone-800"
+                    aria-expanded={showResolved}
+                  >
+                    <ClockCounterClockwiseIcon className="h-3.5 w-3.5" weight="regular" />
+                    <span>
+                      {showResolved ? 'Hide' : 'Show'} resolved ({resolvedThreads.length})
+                    </span>
+                    <CaretUpIcon
+                      className={`ml-auto h-3 w-3 transition-transform ${showResolved ? '' : 'rotate-180'}`}
+                      weight="bold"
+                    />
+                  </button>
+                )}
+                {resolvedOnly || showResolved ? (
                   <div className="mt-1 space-y-2">
                     {resolvedThreads.map((thread) => (
                       <ThreadCard
+                        chatActivity={chatActivity}
+                        mentionPeople={mentionPeople}
                         key={thread.clientKey ?? thread.id}
                         mode={mode}
                         thread={thread}
                         active={thread.id === activeThreadId}
                         currentUserId={currentUserId}
                         canComment={canComment}
-                        canResolve={canResolve}
+                        canResolve={canResolvePath(thread.filePath)}
                         busyAction={busyAction}
                         onSelect={() => onSelectThread(thread.id)}
                         onOpenWorkspaceThread={onOpenWorkspaceThread}
+                        onOpenThreadChat={onOpenThreadChat}
                         onReply={(body) => onReply(thread.id, body)}
                         onResolve={() => onResolve(thread.id)}
                         onReopen={() => onReopen(thread.id)}

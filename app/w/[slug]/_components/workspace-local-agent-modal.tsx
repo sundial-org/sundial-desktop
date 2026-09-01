@@ -244,7 +244,7 @@ function JoinedState({
       <div className="px-7 pb-7 pt-6 text-center">
         <h2 className="text-xl font-semibold text-stone-900">{brand.displayName} joined the workspace</h2>
         <p className="mx-auto mt-2 max-w-xs text-sm text-stone-500">
-          You&apos;re connected. Keep working here — every edit it makes shows up as a tracked change.
+          You&apos;re connected. Keep working here. Every edit it makes shows up as a tracked change.
         </p>
         <button
           type="button"
@@ -326,7 +326,7 @@ function ConnectState({
       <div className="px-7 pb-7 pt-6">
         <h2 className="text-xl font-semibold text-stone-900">Bring your agent into this workspace</h2>
         <p className="mt-2 text-sm leading-relaxed text-stone-500">
-          Run one command in your terminal — or paste the prompt into any agent. We&apos;ll watch for
+          Run one command in your terminal, or paste the prompt into any agent. We&apos;ll watch for
           it to join, then it reads your files and edits right alongside you.
         </p>
 
@@ -364,8 +364,8 @@ function ConnectState({
         )}
         <p className="mt-2 text-xs text-stone-400">
           {tab === 'any'
-            ? 'Paste it into any agent that can run shell commands — Cursor, Gemini CLI, anything.'
-            : 'Run it in your terminal and approve the sign-in — it connects straight to this workspace.'}
+            ? 'Paste it into any agent that can run shell commands: Cursor, Gemini CLI, anything.'
+            : 'Run it in your terminal and approve the sign-in. It connects straight to this workspace.'}
         </p>
 
         {armed ? (
@@ -466,7 +466,7 @@ export function LocalAgentModeModal({
           <span className="text-sm">
             <span className="font-medium text-stone-900">Suggest only</span>
             <span className="mt-0.5 block text-xs text-stone-500">
-              Every edit shows up as a reviewable diff you accept or reject — never a direct
+              Every edit shows up as a reviewable diff you accept or reject, never a direct
               change. Delete, rename, and shell commands are blocked.
             </span>
           </span>

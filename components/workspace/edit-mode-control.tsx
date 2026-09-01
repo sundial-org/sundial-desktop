@@ -38,11 +38,17 @@ type EditModeControlProps = {
   menuPlacement?: 'up' | 'down';
   /** Hide the text label, showing icon + caret only. */
   compact?: boolean;
+  /** Extra classes on the text label — the chat toolbar hides it by container
+   *  query when the row is too narrow for every control's label. */
+  labelClassName?: string;
   disabled?: boolean;
   className?: string;
   /** Which modes to offer. Defaults to the document toolbar set (edit/suggest);
    *  the chat composer passes CHAT_EDIT_MODES to include read-only Viewing. */
   modes?: WorkspaceEditMode[];
+  /** `quiet` matches the sibling doc-header icons; `strong` is the composer
+   *  toolbar, where the quiet grey read as disabled. */
+  tone?: 'quiet' | 'strong';
 };
 
 export function EditModeControl({
@@ -50,9 +56,11 @@ export function EditModeControl({
   onChange,
   menuPlacement = 'up',
   compact = false,
+  labelClassName = '',
   disabled = false,
   className = '',
   modes = DOC_EDIT_MODES,
+  tone = 'quiet',
 }: EditModeControlProps) {
   const [open, setOpen] = useState(false);
   const [anchorRect, setAnchorRect] = useState<DOMRect | null>(null);
@@ -87,8 +95,14 @@ export function EditModeControl({
 
   const TriggerIcon = MODE_ICON[mode];
   // Every mode shares the neutral "Editing" styling — no per-mode colored
-  // trigger tint or filled icon (2026-06-09 feedback).
-  const triggerTone = 'text-stone-600 hover:bg-stone-200/50 hover:text-stone-800';
+  // trigger tint or filled icon (2026-06-09 feedback). Same grey as the
+  // sibling header icons (2026-08-01 feedback).
+  // stone-200/60, not stone-100: in the Docs style this trigger rides ON the
+  // stone-100 toolbar pill, where a stone-100 hover is invisible.
+  const triggerTone =
+    tone === 'strong'
+      ? 'font-medium text-stone-700 hover:bg-stone-300 hover:text-stone-900'
+      : 'text-stone-400 hover:bg-stone-200/60 hover:text-stone-600';
   // `up` anchors the menu's bottom to the trigger top (translateY(-100%)), so
   // height never needs measuring; `down` drops it below. Left edge clamps to
   // the viewport so a right-aligned trigger can't push it off-screen.
@@ -114,7 +128,7 @@ export function EditModeControl({
         className={`relative group/tip flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[13px] transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${triggerTone}`}
       >
         <TriggerIcon className="h-3.5 w-3.5" aria-hidden weight="regular" />
-        {!compact ? <span>{EDIT_MODE_LABEL[mode]}</span> : null}
+        {!compact ? <span className={labelClassName}>{EDIT_MODE_LABEL[mode]}</span> : null}
         <CaretDownIcon className="h-3 w-3 opacity-60" weight="bold" aria-hidden />
         <IconTooltip label={EDIT_MODE_TOOLTIP[mode]} side={menuPlacement === 'up' ? 'top' : 'bottom'} open={open} />
       </button>

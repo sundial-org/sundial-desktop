@@ -1,3 +1,5 @@
+import { withPathShareToken } from '@/lib/workspace/path-share-token-client';
+
 export type ConnectionStatus = 'local' | 'connecting' | 'connected' | 'disconnected';
 
 const LOCAL_COLLAB_URL = 'ws://localhost:8080';
@@ -36,7 +38,9 @@ export async function fetchWorkspaceHost(
   const qs = new URLSearchParams({ workspaceId });
   if (options.ensure !== false) qs.set('ensure', '1');
   if (options.editMode === 'suggest') qs.set('editMode', 'suggest');
-  const res = await fetch(`/api/workspace/host?${qs.toString()}`, {
+  // Forwards the sticky ?pshare= token (when present) so path-share guests
+  // get a grants-scoped collab token instead of a 403.
+  const res = await withPathShareToken(fetch)(`/api/workspace/host?${qs.toString()}`, {
     method: 'GET',
     credentials: 'include',
     signal: options.signal,

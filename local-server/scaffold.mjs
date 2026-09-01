@@ -3,6 +3,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 import { starterPackById } from '../lib/local/starter-packs.ts';
+import { WELCOME_MD, WELCOME_PATH } from '../lib/workspace/welcome-doc.ts';
 
 /** Local YYYY-MM-DD (the machine the files land on, not UTC). */
 export function localDateStamp(now = new Date()) {
@@ -34,8 +35,15 @@ async function isVacant(dir) {
 
 /**
  * Create `<location>/<name>` and write the pack's folders + files into it.
- * `pack` may be null/'blank' for an empty project. Throws Error with a
- * user-facing `.message` (the endpoint surfaces it verbatim).
+ * `pack` may be null/'blank', which seeds the same welcome.md a new cloud
+ * workspace gets — a blank project used to open on an empty file tree with
+ * nothing to open. Throws Error with a user-facing `.message` (the endpoint
+ * surfaces it verbatim).
+ *
+ * This is the ONLY local path that writes files, and it only ever runs after
+ * `isVacant` proves the root is empty (or absent), so opening an existing
+ * folder as a project (POST /projects) can never drop a file into work the
+ * user already has.
  */
 export async function createProjectDir({ name, location, pack }) {
   if (!validProjectName(name)) throw new Error('Project name must not contain / \\ : or start with a dot');
@@ -47,10 +55,12 @@ export async function createProjectDir({ name, location, pack }) {
 
   const definition = pack && pack !== 'blank' ? starterPackById(pack) : null;
   if (pack && pack !== 'blank' && !definition) {
-    throw new Error(`Unknown starter pack "${pack}" — update Sundial to use it`);
+    throw new Error(`Unknown starter pack "${pack}". Update Sundial to use it.`);
   }
   await fsp.mkdir(root, { recursive: true });
-  if (definition) {
+  if (!definition) {
+    await fsp.writeFile(path.join(root, WELCOME_PATH), WELCOME_MD, 'utf8');
+  } else {
     const date = localDateStamp();
     const fill = (text) => text.replaceAll('{{date}}', date);
     for (const folder of definition.folders) {

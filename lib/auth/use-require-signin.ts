@@ -1,6 +1,7 @@
 'use client';
 
-import { useAuth, useClerk } from '@/lib/auth/optional-auth';
+import { useClerk } from '@/lib/auth/optional-auth';
+import { useHybridAuth } from '@/lib/auth/use-auth-ready';
 import { useCallback } from 'react';
 
 /**
@@ -26,13 +27,15 @@ export function buildReturnPath(params: Record<string, string>): string | undefi
  * `signedIn` lets callers skip account-scoped fetches that would 401.
  */
 export function useRequireSignIn() {
-  const { isLoaded, isSignedIn } = useAuth();
   const { openSignIn } = useClerk();
+  // Hybrid (Clerk OR sd_ desktop credentials): without this, every
+  // account-scoped panel gates on "Sign in" for a signed-in desktop user.
+  const { signedIn, ready: loaded } = useHybridAuth();
 
   const requireSignIn = useCallback(
     (returnTo?: string) => {
-      if (!isLoaded) return false;
-      if (isSignedIn) return true;
+      if (signedIn) return true;
+      if (!loaded) return false;
       // Use a RELATIVE path — an absolute URL on an origin outside
       // `allowedRedirectOrigins` (localhost, previews, per-worktree dev) is
       // rejected by Clerk as unsafe and falls back to "/", bouncing the user out.
@@ -44,8 +47,8 @@ export function useRequireSignIn() {
       openSignIn(redirectUrl ? { redirectUrl } : undefined);
       return false;
     },
-    [isLoaded, isSignedIn, openSignIn],
+    [loaded, signedIn, openSignIn],
   );
 
-  return { signedIn: Boolean(isSignedIn), isLoaded, requireSignIn };
+  return { signedIn, isLoaded: loaded, requireSignIn };
 }

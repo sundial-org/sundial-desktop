@@ -167,7 +167,7 @@ export function LinkedRepoBadge({
         type="button"
         onClick={open}
         data-testid="linked-repo-badge"
-        aria-label={`${PROVIDER_LABEL[repo.provider]} — ${repo.repoLabel}`}
+        aria-label={`${PROVIDER_LABEL[repo.provider]} · ${repo.repoLabel}`}
         className="relative group/tip ml-1 inline-flex items-center gap-1"
       >
         {icon}

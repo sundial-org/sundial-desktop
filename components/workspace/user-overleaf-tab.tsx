@@ -106,7 +106,7 @@ export function UserOverleafTab() {
             <h2 className="text-lg font-semibold text-stone-900">Overleaf</h2>
             <p className="mt-1 text-sm text-stone-500">
               Sync Overleaf projects into a Sundial subfolder. Requires an Overleaf Premium
-              git-integration token —{' '}
+              git-integration token:{' '}
               <a
                 href="https://www.overleaf.com/user/settings#authentication"
                 target="_blank"
@@ -163,7 +163,7 @@ export function UserOverleafTab() {
         ) : (
           <section className="rounded-2xl border border-stone-200 bg-white p-5">
             <p className="text-sm text-stone-600">
-              Paste your Overleaf git-integration token. This is optional — workspace members can
+              Paste your Overleaf git-integration token. This is optional. Workspace members can
               share a token via the linker&apos;s account, but a personal token gives you authorship on
               commits you push.
             </p>

@@ -166,18 +166,30 @@ export function formatFileName(name: string) {
 // tooltips/menus, so neighboring rows bleed into the ghost.
 export function setSidebarDragGhost(event: { dataTransfer: DataTransfer }, label: string) {
   const ghost = document.createElement('div');
+  // Literal colors (the ghost is rasterized before CSS vars from a class
+  // would resolve) — pick the palette by the applied theme class so the
+  // ghost isn't a glaring light chip on a dark desk.
+  const dark = document.documentElement.classList.contains('dark');
+  const palette = dark
+    ? 'background:#2a2723;border:1px solid #44403c;color:#d6d3d1;'
+    : 'background:#f5f5f4;border:1px solid #d6d3d1;color:#44403c;';
   ghost.style.cssText =
-    'display:flex;align-items:center;gap:6px;padding:4px 10px;border-radius:8px;background:#f5f5f4;border:1px solid #d6d3d1;font:500 13px/1 system-ui;color:#44403c;white-space:nowrap;position:fixed;top:-100px;left:-100px;pointer-events:none;z-index:9999;';
+    `display:flex;align-items:center;gap:6px;padding:4px 10px;border-radius:8px;${palette}font:500 13px/1 system-ui;white-space:nowrap;position:fixed;top:-100px;left:-100px;pointer-events:none;z-index:9999;`;
   ghost.textContent = label;
   document.body.appendChild(ghost);
   event.dataTransfer.setDragImage(ghost, 0, 0);
   requestAnimationFrame(() => ghost.remove());
 }
 
-export function getSidebarListItemStateClasses(isSelected: boolean) {
-  return isSelected
-    ? 'bg-stone-300/80 text-stone-800 transition-colors'
-    : 'bg-transparent text-stone-600 hover:bg-stone-200/80 hover:text-stone-800 transition-colors';
+export function getSidebarListItemStateClasses(isSelected: boolean, isHovered?: boolean) {
+  if (isSelected) return 'bg-stone-300/80 text-stone-800 transition-colors';
+  // JS-tracked hover (files tree): Chromium strands CSS :hover on a row across
+  // window switches, so rows that track the pointer pass the state explicitly.
+  if (isHovered !== undefined)
+    return isHovered
+      ? 'bg-stone-200/80 text-stone-800 transition-colors'
+      : 'bg-transparent text-stone-600 transition-colors';
+  return 'bg-transparent text-stone-600 hover:bg-stone-200/80 hover:text-stone-800 transition-colors';
 }
 
 export function formatRelativeTime(value?: string | null) {
@@ -241,13 +253,6 @@ export function isCompileArtifactPath(path: string): boolean {
   return COMPILE_ARTIFACT_RE.test(path);
 }
 
-/**
- * The first source file a turn changed — skipping deletions and compile
- * artifacts — i.e. what an auto-open / "open diff" should surface.
- */
-export function firstEditableTurnEditPath(turn: TurnEditsResponse | null | undefined): string | null {
-  return turn?.files.find((f) => !f.isDeleted && !isCompileArtifactPath(f.filePath))?.filePath ?? null;
-}
 
 /**
  * `binary` and `blob_ref` are both stored-bytes types — only the storage
@@ -355,149 +360,36 @@ export function WorkspaceRootGlyph({ className }: { className: string }) {
   );
 }
 
-function WorkspaceSvgIcon({
-  className,
-  toneClassName = 'text-stone-400',
-  children,
-  withTile = true,
-}: {
-  className: string;
-  toneClassName?: string;
-  children: ReactNode;
-  withTile?: boolean;
-}) {
+/** Wireframe thin-line icon language (prototypes/desktop): 16-grid, 1.3
+ *  stroke, monochrome — exact types collapse into a few calm glyph families. */
+function WireGlyph({ className, children }: { className: string; children: ReactNode }) {
   return (
-    <svg className={`${className} ${toneClassName}`} viewBox="0 0 24 24" fill="none" aria-hidden>
-      {withTile && <rect x="2.75" y="3.75" width="18.5" height="16.5" rx="4.25" fill="currentColor" opacity="0.18" />}
-      <g stroke="currentColor" strokeWidth={1.9} strokeLinecap="round" strokeLinejoin="round">
-        {children}
-      </g>
+    <svg
+      className={/\btext-/.test(className) ? className : `${className} text-stone-400`}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.3}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      {children}
     </svg>
   );
 }
 
-function WorkspaceMonogramIcon({
-  className,
-  toneClassName,
-  label,
-}: {
-  className: string;
-  toneClassName: string;
-  label: string;
-}) {
-  const length = label.length;
-  const fontSize = length <= 1 ? 14 : length === 2 ? 10 : length === 3 ? 7.5 : 6.5;
-
+function WireDocGlyph({ className, children }: { className: string; children?: ReactNode }) {
   return (
-    <svg className={`${className} ${toneClassName}`} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <rect x="3.5" y="4.5" width="17" height="15" rx="4" fill="currentColor" opacity="0.18" />
-      <text
-        x="12"
-        y="15"
-        textAnchor="middle"
-        fill="currentColor"
-        fontFamily="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
-        fontSize={fontSize}
-        fontWeight="700"
-      >
-        {label}
-      </text>
-    </svg>
+    <WireGlyph className={className}>
+      <path d="M4 2h5l3 3v9H4z" />
+      <path d="M9 2v3h3" />
+      {children}
+    </WireGlyph>
   );
 }
 
-function WorkspaceFolderGlyph({ className }: { className: string }) {
-  return (
-    <svg className={`${className} text-stone-400`} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <path d="M3 8a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8Z" fill="currentColor" opacity="0.08" />
-      <path d="M3 8a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8Z" stroke="currentColor" strokeWidth={1.9} strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  );
-}
-
-function WorkspaceGitGlyph({ className }: { className: string }) {
-  return (
-    <WorkspaceSvgIcon className={className} toneClassName="text-sky-600">
-      <circle cx="7" cy="6.5" r="1.75" />
-      <circle cx="17" cy="6.5" r="1.75" />
-      <circle cx="12" cy="17.5" r="1.75" />
-      <path d="M8.5 7.75 11 16m4.5-8.25L13 16" />
-    </WorkspaceSvgIcon>
-  );
-}
-
-function WorkspaceSettingsGlyph({ className }: { className: string }) {
-  return (
-    <WorkspaceSvgIcon className={className} toneClassName="text-stone-500">
-      <circle cx="12" cy="12" r="3" />
-      <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1" />
-    </WorkspaceSvgIcon>
-  );
-}
-
-function WorkspaceTableGlyph({ className }: { className: string }) {
-  return (
-    <WorkspaceSvgIcon className={className} toneClassName="text-emerald-600">
-      <rect x="4" y="5" width="16" height="14" rx="2" />
-      <path d="M4 10h16M9.5 5v14M14.5 5v14" />
-    </WorkspaceSvgIcon>
-  );
-}
-
-function WorkspaceImageGlyph({ className }: { className: string }) {
-  return (
-    <WorkspaceSvgIcon className={className} toneClassName="text-rose-500">
-      <rect x="4" y="5" width="16" height="14" rx="2" />
-      <circle cx="9" cy="10" r="1.5" />
-      <path d="m6 17 4-4 3 3 3-5 2 2" />
-    </WorkspaceSvgIcon>
-  );
-}
-
-function WorkspaceAudioGlyph({ className }: { className: string }) {
-  return (
-    <WorkspaceSvgIcon className={className} toneClassName="text-emerald-600">
-      <path d="M4 12h2l2-4 3 8 2-6 2 4h5" />
-    </WorkspaceSvgIcon>
-  );
-}
-
-function WorkspaceVideoGlyph({ className }: { className: string }) {
-  return (
-    <WorkspaceSvgIcon className={className} toneClassName="text-rose-500">
-      <rect x="4" y="6" width="16" height="12" rx="2" />
-      <path d="m10 10 5 2-5 2Z" fill="currentColor" stroke="none" />
-    </WorkspaceSvgIcon>
-  );
-}
-
-function WorkspaceDatabaseGlyph({ className }: { className: string }) {
-  return (
-    <WorkspaceSvgIcon className={className} toneClassName="text-cyan-700">
-      <ellipse cx="12" cy="7" rx="6.5" ry="2.5" />
-      <path d="M5.5 7v10c0 1.4 2.9 2.5 6.5 2.5s6.5-1.1 6.5-2.5V7" />
-      <path d="M5.5 12c0 1.4 2.9 2.5 6.5 2.5s6.5-1.1 6.5-2.5" />
-    </WorkspaceSvgIcon>
-  );
-}
-
-function WorkspaceArchiveGlyph({ className }: { className: string }) {
-  return (
-    <WorkspaceSvgIcon className={className} toneClassName="text-stone-600">
-      <path d="M7 4h10v16H7z" />
-      <path d="M10 4v4h4V4M12 8v8M10.5 10h3M10.5 13h3" />
-    </WorkspaceSvgIcon>
-  );
-}
-
-function WorkspaceDocumentGlyph({ className }: { className: string }) {
-  return (
-    <WorkspaceSvgIcon className={className} toneClassName="text-stone-400" withTile={false}>
-      <path d="M7 4h7l4 4v12H7z" />
-      <path d="M14 4v4h4M9 13h6M9 17h6" />
-    </WorkspaceSvgIcon>
-  );
-}
+const CODE_LANG_EXTENSIONS = new Set(['.py', '.go', '.rb', '.java', '.rs', '.php', '.swift', '.kt', '.kts', '.lua', '.r', '.xml']);
 
 export function WorkspaceEntryIcon({
   path,
@@ -508,48 +400,139 @@ export function WorkspaceEntryIcon({
   isFolder?: boolean;
   className: string;
 }) {
-  if (isFolder) return <WorkspaceFolderGlyph className={className} />;
+  if (isFolder) {
+    return (
+      <WireGlyph className={className}>
+        <path d="M2 4.5h4l1.4 1.6H14v6.4H2z" />
+      </WireGlyph>
+    );
+  }
 
   const ext = getExtension(path);
   const lowerPath = path.toLowerCase();
   const fileName = getFileName(lowerPath);
 
-  if (fileName === '.env') return <WorkspaceSettingsGlyph className={className} />;
-  if (fileName.startsWith('.env.')) return <WorkspaceMonogramIcon className={className} toneClassName="text-emerald-600" label="$" />;
-  if (fileName.startsWith('.git')) return <WorkspaceGitGlyph className={className} />;
-  if (WORKSPACE_LOCKFILE_NAMES.has(fileName)) return <WorkspaceMonogramIcon className={className} toneClassName="text-stone-500" label="{}" />;
-  if (isPolicyMarkdownFile(path)) return <WorkspaceMonogramIcon className={className} toneClassName="text-violet-500" label="MD" />;
-  if (ext === '.py') return <WorkspaceMonogramIcon className={className} toneClassName="text-emerald-600" label="PY" />;
-  if (TYPESCRIPT_EXTENSIONS.has(ext)) return <WorkspaceMonogramIcon className={className} toneClassName="text-sky-600" label="TS" />;
-  if (JAVASCRIPT_EXTENSIONS.has(ext)) return <WorkspaceMonogramIcon className={className} toneClassName="text-stone-500" label="JS" />;
-  if (HTML_EXTENSIONS.has(ext)) return <WorkspaceMonogramIcon className={className} toneClassName="text-orange-600" label="</>" />;
-  if (STYLE_EXTENSIONS.has(ext)) return <WorkspaceMonogramIcon className={className} toneClassName="text-blue-600" label="#" />;
-  if (CSV_EXTENSIONS.has(ext)) return <WorkspaceTableGlyph className={className} />;
-  if (IMAGE_EXTENSIONS.has(ext)) return <WorkspaceImageGlyph className={className} />;
-  if (isPolicyPdfFile(path)) return <WorkspaceMonogramIcon className={className} toneClassName="text-red-600" label="PDF" />;
-  if (SLIDES_EXTENSIONS.has(ext)) return <WorkspaceMonogramIcon className={className} toneClassName="text-orange-600" label="PPT" />;
-  if (WORD_EXTENSIONS.has(ext)) return <WorkspaceMonogramIcon className={className} toneClassName="text-sky-700" label="DOC" />;
-  if (SPREADSHEET_EXTENSIONS.has(ext)) return <WorkspaceTableGlyph className={className} />;
-  if (AUDIO_EXTENSIONS.has(ext)) return <WorkspaceAudioGlyph className={className} />;
-  if (VIDEO_EXTENSIONS.has(ext)) return <WorkspaceVideoGlyph className={className} />;
-  if (ext === '.sql') return <WorkspaceDatabaseGlyph className={className} />;
-  if (CPP_EXTENSIONS.has(ext)) return <WorkspaceMonogramIcon className={className} toneClassName="text-sky-700" label="C++" />;
-  if (CSHARP_EXTENSIONS.has(ext)) return <WorkspaceMonogramIcon className={className} toneClassName="text-emerald-600" label="C#" />;
-  if (lowerPath.endsWith('/dockerfile') || lowerPath === 'dockerfile') return <WorkspaceMonogramIcon className={className} toneClassName="text-sky-600" label=">_" />;
-  if (SHELL_EXTENSIONS.has(ext)) return <WorkspaceMonogramIcon className={className} toneClassName="text-lime-600" label=">_" />;
-  if (ext === '.go') return <WorkspaceMonogramIcon className={className} toneClassName="text-cyan-600" label="GO" />;
-  if (ext === '.rb') return <WorkspaceMonogramIcon className={className} toneClassName="text-red-600" label="RB" />;
-  if (ext === '.java') return <WorkspaceMonogramIcon className={className} toneClassName="text-orange-700" label="JV" />;
-  if (ext === '.rs') return <WorkspaceMonogramIcon className={className} toneClassName="text-orange-600" label="RS" />;
-  if (ext === '.php') return <WorkspaceMonogramIcon className={className} toneClassName="text-indigo-500" label="PHP" />;
-  if (ext === '.swift') return <WorkspaceMonogramIcon className={className} toneClassName="text-orange-500" label="SW" />;
-  if (ext === '.kt' || ext === '.kts') return <WorkspaceMonogramIcon className={className} toneClassName="text-violet-600" label="KT" />;
-  if (ext === '.lua') return <WorkspaceMonogramIcon className={className} toneClassName="text-blue-700" label="LUA" />;
-  if (ext === '.r' || ext === '.R') return <WorkspaceMonogramIcon className={className} toneClassName="text-blue-600" label="R" />;
-  if (ext === '.xml') return <WorkspaceMonogramIcon className={className} toneClassName="text-orange-600" label="XML" />;
-  if (ARCHIVE_EXTENSIONS.has(ext)) return <WorkspaceArchiveGlyph className={className} />;
-  if (ext === '.m') return <WorkspaceSettingsGlyph className={className} />;
-  if (CONFIG_EXTENSIONS.has(ext)) return <WorkspaceMonogramIcon className={className} toneClassName="text-stone-500" label="{}" />;
-  if (CODE_EXTENSIONS.has(ext)) return <WorkspaceMonogramIcon className={className} toneClassName="text-stone-500" label="</>" />;
-  return <WorkspaceDocumentGlyph className={className} />;
+  if (fileName === '.env' || fileName.startsWith('.env.') || ext === '.m') {
+    return (
+      <WireGlyph className={className}>
+        <circle cx="8" cy="8" r="2" />
+        <path d="M8 2.5v2M8 11.5v2M2.5 8h2M11.5 8h2M4.1 4.1l1.4 1.4M10.5 10.5l1.4 1.4M11.9 4.1l-1.4 1.4M5.5 10.5l-1.4 1.4" />
+      </WireGlyph>
+    );
+  }
+  if (fileName.startsWith('.git')) {
+    return (
+      <WireGlyph className={className}>
+        <circle cx="4.5" cy="4" r="1.2" />
+        <circle cx="11.5" cy="4" r="1.2" />
+        <circle cx="8" cy="12" r="1.2" />
+        <path d="M5.5 5 7.3 10.9M10.5 5 8.7 10.9" />
+      </WireGlyph>
+    );
+  }
+  if (WORKSPACE_LOCKFILE_NAMES.has(fileName) || CONFIG_EXTENSIONS.has(ext)) {
+    return (
+      <WireGlyph className={className}>
+        <path d="M6.2 2.8c-1.5.3-1.1 2-1.1 3.2S3.4 8 3.4 8s1.7.8 1.7 2-.4 2.9 1.1 3.2M9.8 2.8c1.5.3 1.1 2 1.1 3.2S12.6 8 12.6 8s-1.7.8-1.7 2 .4 2.9-1.1 3.2" />
+      </WireGlyph>
+    );
+  }
+  if (ext === '.tex') {
+    return (
+      <WireDocGlyph className={className}>
+        <path d="M6.1 9h4M7.2 9v2.7M9.4 9v2.7" />
+      </WireDocGlyph>
+    );
+  }
+  if (ext === '.ipynb') {
+    return (
+      <WireGlyph className={className}>
+        <rect x="4.3" y="2.3" width="8.2" height="11.4" rx="1.2" />
+        <path d="M2.6 4.6h1.7M2.6 8h1.7M2.6 11.4h1.7M7 5.4h3.2M7 8h3.2" />
+      </WireGlyph>
+    );
+  }
+  if (CSV_EXTENSIONS.has(ext) || SPREADSHEET_EXTENSIONS.has(ext)) {
+    return (
+      <WireGlyph className={className}>
+        <rect x="2.5" y="3.5" width="11" height="9" rx="1" />
+        <path d="M2.5 7h11M6.5 3.5v9M10 3.5v9" />
+      </WireGlyph>
+    );
+  }
+  if (IMAGE_EXTENSIONS.has(ext)) {
+    return (
+      <WireGlyph className={className}>
+        <rect x="2.5" y="3.5" width="11" height="9" rx="1" />
+        <circle cx="5.6" cy="6.2" r="1" />
+        <path d="m4 11.2 3-3 2 2 2.4-2.8 2.1 2.4" />
+      </WireGlyph>
+    );
+  }
+  if (isPolicyPdfFile(path) || WORD_EXTENSIONS.has(ext) || SLIDES_EXTENSIONS.has(ext)) {
+    return (
+      <WireDocGlyph className={className}>
+        <path d="M6 8.6h4M6 10.8h4" />
+      </WireDocGlyph>
+    );
+  }
+  if (AUDIO_EXTENSIONS.has(ext)) {
+    return (
+      <WireGlyph className={className}>
+        <path d="M2.5 8h1.3l1.4-2.7 2 5.4 1.4-4 1.3 2.7h3.6" />
+      </WireGlyph>
+    );
+  }
+  if (VIDEO_EXTENSIONS.has(ext)) {
+    return (
+      <WireGlyph className={className}>
+        <rect x="2.5" y="4" width="11" height="8" rx="1" />
+        <path d="m6.8 6.4 3.4 1.6-3.4 1.6z" />
+      </WireGlyph>
+    );
+  }
+  if (ext === '.sql') {
+    return (
+      <WireGlyph className={className}>
+        <ellipse cx="8" cy="4.4" rx="4.4" ry="1.7" />
+        <path d="M3.6 4.4v7.2c0 .9 2 1.7 4.4 1.7s4.4-.8 4.4-1.7V4.4" />
+        <path d="M3.6 8c0 .9 2 1.7 4.4 1.7S12.4 8.9 12.4 8" />
+      </WireGlyph>
+    );
+  }
+  if (ARCHIVE_EXTENSIONS.has(ext)) {
+    return (
+      <WireGlyph className={className}>
+        <path d="M4.6 2.5h6.8v11H4.6z" />
+        <path d="M6.6 2.5v2.7h2.8V2.5M8 5.2v5.4M7 6.6h2M7 8.6h2" />
+      </WireGlyph>
+    );
+  }
+  if (lowerPath.endsWith('/dockerfile') || lowerPath === 'dockerfile' || SHELL_EXTENSIONS.has(ext)) {
+    return (
+      <WireGlyph className={className}>
+        <path d="m3 5 3 3-3 3M8.5 11.5H13" />
+      </WireGlyph>
+    );
+  }
+  // CODE_EXTENSIONS is the "opens in the code editor" set — .txt/.log belong
+  // there but read as documents, not code, in the tree.
+  if (ext === '.txt' || ext === '.log') return <WireDocGlyph className={className} />;
+  if (
+    TYPESCRIPT_EXTENSIONS.has(ext) ||
+    JAVASCRIPT_EXTENSIONS.has(ext) ||
+    HTML_EXTENSIONS.has(ext) ||
+    STYLE_EXTENSIONS.has(ext) ||
+    CPP_EXTENSIONS.has(ext) ||
+    CSHARP_EXTENSIONS.has(ext) ||
+    CODE_EXTENSIONS.has(ext) ||
+    CODE_LANG_EXTENSIONS.has(ext)
+  ) {
+    return (
+      <WireGlyph className={className}>
+        <path d="M5 5.4 2.6 8 5 10.6M11 5.4 13.4 8 11 10.6M9.2 4.2 6.8 11.8" />
+      </WireGlyph>
+    );
+  }
+  return <WireDocGlyph className={className} />;
 }

@@ -14,7 +14,6 @@
 // user's personal CLAUDE.md/hooks/permissions out of Sundial runs.
 
 import { execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -22,8 +21,7 @@ import path from 'node:path';
 import { z } from 'zod';
 
 import { modelMessagesToClaudePrompt } from '../../agent-ts/src/harness/history.ts';
-import { MAX_AGENT_STEPS } from '../../agent-ts/src/harness/types.ts';
-import { rowsUnseenByEngine, rowsToModelMessages, systemPrompt } from './runner.mjs';
+import { appendThinkingRow, rowsUnseenByEngine, rowsToModelMessages, systemPrompt, topUpTurnEdits, turnEditsMetadata, writeTurnEditsMetadata } from './runner.mjs';
 
 const MCP_PREFIX = 'mcp__sundial__';
 
@@ -102,7 +100,17 @@ function buildMcpServer(sdk, tools) {
       } catch (error) {
         result = { isError: true, content: error?.message ?? 'Tool failed' };
       }
-      return { content: [{ type: 'text', text: result.content ?? '' }], ...(result.isError ? { isError: true } : {}) };
+      // An image Read hands back bytes alongside its label — forward them as
+      // an MCP image block, or this engine would report a SUCCESSFUL Read
+      // carrying nothing but a filename and the model would answer from thin
+      // air (the exact retry/hallucination loop the honest error avoided).
+      return {
+        content: [
+          { type: 'text', text: result.content ?? '' },
+          ...(result.image ? [{ type: 'image', data: result.image.data, mimeType: result.image.mediaType }] : []),
+        ],
+        ...(result.isError ? { isError: true } : {}),
+      };
     }),
   );
   return sdk.createSdkMcpServer({ name: 'sundial', version: '1.0.0', tools: sdkTools });
@@ -117,16 +125,55 @@ function toolResultText(content) {
   return '';
 }
 
-const LOGIN_ERROR = /please run \/login|invalid api key|not logged in|oauth|authentication_error/i;
+// Unambiguous sign-in signals ONLY. A bare `oauth` alternative matched any
+// line merely carrying the word — a URL, a transient refresh warning, an
+// unrelated stderr tail (which `withStderr` appends BEFORE this runs) — and
+// answered it with "you're not signed in": wrong advice, and it replaced the
+// real error instead of showing it. Anchor to what the CLI actually prints.
+const LOGIN_ERROR = /please run \/login|invalid api key|not logged in|authentication_error|failed to authenticate|oauth (?:session|token) (?:expired|invalid|revoked)/i;
 
-function friendlyClaudeError(error) {
-  const message = error instanceof Error ? error.message : String(error);
+// A CLI that dies during startup (never onboarded, unusable --model, a crash)
+// can exit 0 having printed NOTHING: the SDK ends its stream without a result
+// and without throwing. That used to finish the turn clean and silent — the
+// user saw no reply, no error, nothing at all.
+// "Sign in" is the wrong advice for the daily user who IS signed in, so the
+// ask is neutral: run the same CLI in a terminal and see what it says.
+const NO_OUTPUT =
+  'Claude Code ran but returned nothing — open a terminal, run `claude` there once to see what it says, then try again.';
+
+/** Silent exit, empty stderr: the CLI told us NOTHING, and "sign in" is the
+ *  wrong advice for the daily user whose CLI simply can't start here. Ask the
+ *  binary what it is — `--version` needs no auth, no network and no tokens —
+ *  which separates "can't start from a GUI app" (missing runtime on the
+ *  desktop app's minimal PATH, broken install) from "started fine and said
+ *  nothing", and names the exact build to report. */
+export function diagnoseSilence(binary, env) {
+  if (!binary) return NO_OUTPUT;
+  try {
+    const version = execFileSync(binary, ['--version'], { env, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    // A silent `--version` is itself the answer: whatever that file is, it
+    // isn't a working Claude Code.
+    if (version) return `${NO_OUTPUT} (${binary}, ${version})`;
+    throw new Error('`--version` printed nothing');
+  } catch (error) {
+    const detail = String(error?.stderr || error?.message || '').trim().slice(0, 200);
+    return `Claude Code at ${binary} won't start from the Sundial app${detail ? `: ${detail}` : ''}.`;
+  }
+}
+
+export function friendlyClaudeError(error) {
+  const message = (error instanceof Error ? error.message : String(error)).trim();
   if (LOGIN_ERROR.test(message)) {
-    return new Error('Claude Code isn\'t signed in on this computer — run `claude login` in a terminal, then try again.');
+    // Name the reason. "Signed in" is exactly what the user believes they are,
+    // so the bare advice reads as flat-out wrong and they ignore it; the CLI's
+    // own words (an expired OAuth session, a rejected key) are what make it
+    // actionable and what they can report back.
+    return new Error(`Claude Code isn't signed in on this computer (${message.slice(0, 200)}). Run \`claude login\` in a terminal, then try again.`);
   }
   if (/ENOENT|not found|failed to launch/i.test(message)) {
-    return new Error('Claude Code isn\'t installed on this machine — install it and run `claude login`, then try again.');
+    return new Error('Claude Code isn\'t installed on this machine. Install it and run `claude login`, then try again.');
   }
+  if (!message) return new Error(NO_OUTPUT);
   return error instanceof Error ? error : new Error(message);
 }
 
@@ -155,10 +202,23 @@ export function sanitizedEnv() {
   return env;
 }
 
+/** The env the CLI itself is spawned with. A Finder-launched app inherits
+ *  launchd's minimal PATH — no nvm, no homebrew — but an
+ *  `npm i -g @anthropic-ai/claude-code` install is a `#!/usr/bin/env node`
+ *  shim: detection's nvm probe FINDS it and the exec then dies 127 "env: node:
+ *  No such file or directory". The shim's own directory holds the node that
+ *  runs it (same fix as codex-runner). */
+export function engineEnv(enginePath) {
+  const env = sanitizedEnv();
+  if (enginePath) env.PATH = `${path.dirname(enginePath)}${path.delimiter}${env.PATH ?? ''}`;
+  return env;
+}
+
 /** One turn on the user's Claude. `queryFn` (tests) replaces the SDK: it gets
  *  `{ prompt, options, tools }` and yields SDK-shaped messages. */
 export async function runClaudeTurn({
-  project, chatId, model, editMode, tools, stream, abort, store, log, isReplaced, external = null, queryFn = null,
+  project, chatId, model, editMode, tools, stream, abort, store, log, isReplaced, settleWatcher, assistantMessageId, external = null, queryFn = null,
+  untrustedCommentTurn = false, historyRows = null,
 }) {
   // Offline e2e seam: tests script the SDK by pointing this env at a module
   // exporting `queryFn` — the whole HTTP surface runs real, nothing spawns.
@@ -169,7 +229,7 @@ export async function runClaudeTurn({
   let sdk = null;
   if (!queryFn) {
     if (!engine.available) {
-      throw new Error('Claude Code isn\'t installed on this machine — install it and run `claude login`, then pick Claude Code again.');
+      throw new Error('Claude Code isn\'t installed on this machine. Install it and run `claude login`, then pick Claude Code again.');
     }
     sdk = await loadSdk();
   }
@@ -182,15 +242,20 @@ export async function runClaudeTurn({
   // subprocess launches from that cwd, and a deleted subfolder would fail the
   // turn instead of falling back.
   let resume = null;
-  if (external?.agent === 'claude' && external.cwd && fs.existsSync(external.cwd)) {
+  // Never resume a native session for a guest turn — the CLI's own session
+  // file carries the full prior context the sanitized historyRows exclude.
+  if (!untrustedCommentTurn && external?.agent === 'claude' && external.cwd && fs.existsSync(external.cwd)) {
     const { claudeSessionFileExists } = await import('../external-sessions.mjs');
     if (claudeSessionFileExists(external.cwd, external.sessionId)) resume = { cwd: external.cwd };
   }
-  const rows = store.listChatMessages(project.id, chatId);
+  const rows = historyRows ?? store.listChatMessages(project.id, chatId);
   const messages = rowsToModelMessages(resume ? rowsUnseenByEngine(rows) : rows);
   const prompt = modelMessagesToClaudePrompt(messages);
   const system =
-    systemPrompt(project, store.listExtraRoots(project.id)) +
+    systemPrompt(project, store.listExtraRoots(project.id), {
+      folderScope: store.getChat(chatId)?.folder_scope || null,
+      untrustedComment: untrustedCommentTurn,
+    }) +
     (editMode === 'view'
       ? '\n\nThe user has this document in VIEWING mode: you are READ-ONLY this turn. Do not attempt writes.'
       : '');
@@ -206,9 +271,19 @@ export async function runClaudeTurn({
   const toolAliases = { web_search: 'WebSearch', web_fetch: 'WebFetch' };
   for (const full of toolNames) toolAliases[stripPrefix(full)] = full;
 
-  const env = sanitizedEnv();
+  const env = engineEnv(engine.path);
+  // Without this callback the SDK pipes the CLI's stderr to /dev/null, so a
+  // startup failure reaches us as a bare "process exited with code 1" and the
+  // real reason (not onboarded, bad model, missing runtime) is lost.
+  let stderrTail = '';
+  const withStderr = (message) =>
+    [message, stderrTail.trim()].filter(Boolean).join(': ').slice(0, 500) ||
+    (queryFn ? NO_OUTPUT : diagnoseSilence(engine.path, env));
 
   const options = {
+    stderr: (chunk) => {
+      stderrTail = (stderrTail + String(chunk)).slice(-2000);
+    },
     // anthropic/claude-sonnet-4.6 → claude-sonnet-4-6; other providers fall
     // through to the CLI's default model.
     ...(model?.startsWith('anthropic/') ? { model: model.slice('anthropic/'.length).replace(/\./g, '-') } : {}),
@@ -220,14 +295,16 @@ export async function runClaudeTurn({
     // load alongside it and run un-prompted (bypassPermissions), outside the
     // DocHost attribution rails — and straight through view mode.
     strictMcpConfig: true,
-    allowedTools: [...toolNames, 'WebSearch', 'WebFetch', 'TodoWrite'],
+    // Untrusted (guest-comment) turns also lose the network tools — a guest
+    // prompt could exfiltrate file contents through a WebFetch URL.
+    allowedTools: [...toolNames, ...(untrustedCommentTurn ? [] : ['WebSearch', 'WebFetch']), 'TodoWrite'],
     // Native fs/exec tools are REMOVED from the model's context in every
     // mode, not just alias-shadowed: aliases are built from the (edit-mode
     // filtered) Sundial toolset, so in view mode a bare `Edit`/`Bash` would
     // otherwise resolve to the live native tool and mutate disk outside the
     // attributed DocHost path. `tools` sets the built-in base set; the
     // explicit `disallowedTools` list covers CLIs too old to know `tools`.
-    tools: ['WebSearch', 'WebFetch', 'TodoWrite'],
+    tools: [...(untrustedCommentTurn ? [] : ['WebSearch', 'WebFetch']), 'TodoWrite'],
     disallowedTools: [
       'Task', 'Bash', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
       'Glob', 'Grep', 'BashOutput', 'KillShell',
@@ -236,25 +313,31 @@ export async function runClaudeTurn({
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
     includePartialMessages: true,
-    maxTurns: MAX_AGENT_STEPS,
+    // No maxTurns: runs are uncapped — only interrupt/finish end a turn.
     abortController: ac,
     settingSources: [],
     env,
     ...(engine.path ? { pathToClaudeCodeExecutable: engine.path } : {}),
   };
 
-  const assistantMessageId = randomUUID();
   stream.write({ type: 'start', messageId: assistantMessageId });
 
   let seq = 0;
   let openText = null;
   let openReasoning = null;
+  let reasoningText = ''; // deltas since reasoning-start, persisted on close
+  let persistedReasoning = false; // a thinking row exists, so the turn needs its anchor
+  // Survives a flush, unlike segmentText. Anything the model actually said
+  // means the turn produced output — needed both to keep it anchored and to
+  // keep it out of the "the CLI returned nothing" diagnosis.
+  let sawText = false;
   let segmentText = ''; // streamed text since the last tool call
   let ranTools = false;
   let finalText = '';
   let resultError = null;
   let continuedSessionId = null; // resume forks: the id the NEXT turn resumes
   const toolNameById = new Map();
+  const toolByIndex = new Map(); // content_block index → tool_use id, while its input streams
 
   const closeText = () => {
     if (openText) stream.write({ type: 'text-end', id: openText });
@@ -262,13 +345,25 @@ export async function runClaudeTurn({
   };
   const closeReasoning = () => {
     if (openReasoning) stream.write({ type: 'reasoning-end', id: openReasoning });
+    // Persist the thought as its own row, in stream order, like the cloud-step
+    // loop does. Streaming it alone meant any reconnect + history reconcile
+    // wiped the reasoning and left a bare "Thinking…".
+    if (!isReplaced() && appendThinkingRow(store, project.id, chatId, reasoningText)) persistedReasoning = true;
+    reasoningText = '';
     openReasoning = null;
   };
   // Text announced BEFORE a tool call persists as its own row so a reload
   // renders the turn in stream order (same rule as the cloud-step loop).
+  // `streaming: true` marks it IN-FLIGHT (same marker the cloud-step loop and
+  // the brain use): only the final anchor row is unmarked, and that asymmetry
+  // is what tells reload / gone-recovery the turn actually ended.
   const flushSegment = () => {
     if (segmentText.trim()) {
-      store.appendChatMessage(project.id, chatId, { role: 'assistant', content: segmentText, metadata: {} });
+      store.appendChatMessage(project.id, chatId, {
+        role: 'assistant',
+        content: segmentText,
+        metadata: { streaming: true },
+      });
     }
     segmentText = '';
   };
@@ -276,20 +371,52 @@ export async function runClaudeTurn({
   const onMessage = (msg) => {
     switch (msg.type) {
       case 'system': {
-        if (msg.subtype === 'init' && typeof msg.session_id === 'string') continuedSessionId = msg.session_id;
+        if (msg.subtype === 'init' && typeof msg.session_id === 'string') {
+          continuedSessionId = msg.session_id;
+          // The CLI is writing a transcript for this turn under ~/.claude.
+          // Claim it NOW (not at turn end): an interrupted or crashed turn
+          // still leaves the file behind, and an unclaimed file comes back
+          // as an "external session" the user is invited to import — the
+          // duplicate-chat bug. Unresumed turns open a session per turn, so
+          // every id gets claimed, not just the last.
+          store.recordEngineSession('claude', msg.session_id, chatId);
+        }
         break;
       }
       case 'stream_event': {
         const ev = msg.event;
+        // Tool inputs stream too: a long Write (hundreds of lines) is minutes
+        // of generation the user would otherwise watch as a blank bubble.
+        if (ev.type === 'content_block_start' && ev.content_block?.type === 'tool_use') {
+          const { id, name } = ev.content_block;
+          closeText();
+          // Segment BEFORE reasoning, and HERE: with includePartialMessages the
+          // SDK emits this block start ahead of the assembled assistant
+          // message, so this is the handler that actually decides row order on
+          // a text -> thinking -> tool turn. The announcement was spoken first,
+          // so its row has to land first. (thinking -> text already persisted
+          // its thought at the text delta, so closeReasoning is a no-op there.)
+          // Flushing here clears segmentText while `ranTools` is still false,
+          // which would open an anchor-loss window for a Stop during tool-input
+          // streaming — `sawText` is what keeps that turn anchored.
+          flushSegment();
+          closeReasoning();
+          toolByIndex.set(ev.index, id);
+          stream.write({ type: 'tool-input-start', toolCallId: id, toolName: stripPrefix(name) });
+          break;
+        }
         if (ev.type !== 'content_block_delta') break;
         const d = ev.delta;
-        if (d.type === 'text_delta' && d.text) {
+        if (d.type === 'input_json_delta' && d.partial_json && toolByIndex.has(ev.index)) {
+          stream.write({ type: 'tool-input-delta', toolCallId: toolByIndex.get(ev.index), inputTextDelta: d.partial_json });
+        } else if (d.type === 'text_delta' && d.text) {
           closeReasoning();
           if (!openText) {
             openText = `t${seq++}`;
             stream.write({ type: 'text-start', id: openText });
           }
           segmentText += d.text;
+          if (d.text.trim()) sawText = true;
           stream.write({ type: 'text-delta', id: openText, delta: d.text });
         } else if (d.type === 'thinking_delta' && d.thinking) {
           closeText();
@@ -297,6 +424,7 @@ export async function runClaudeTurn({
             openReasoning = `r${seq++}`;
             stream.write({ type: 'reasoning-start', id: openReasoning });
           }
+          reasoningText += d.thinking;
           stream.write({ type: 'reasoning-delta', id: openReasoning, delta: d.thinking });
         }
         break;
@@ -306,8 +434,12 @@ export async function runClaudeTurn({
           if (block.type !== 'tool_use') continue;
           const name = stripPrefix(block.name);
           closeText();
-          closeReasoning();
+          // Segment BEFORE reasoning: on a text → thinking → tool sequence the
+          // announcement was spoken first, so its row has to land first.
+          // (thinking → text already persisted its thought at the text delta,
+          // so closeReasoning is a no-op there and the order still holds.)
           flushSegment();
+          closeReasoning();
           ranTools = true;
           toolNameById.set(block.id, name);
           store.appendChatMessage(project.id, chatId, {
@@ -315,7 +447,11 @@ export async function runClaudeTurn({
             content: '',
             metadata: { type: 'tool_use', tool_use_id: block.id, tool: { name, input: block.input ?? {} } },
           });
-          stream.write({ type: 'tool-input-start', toolCallId: block.id, toolName: name });
+          // Already opened by the streamed content_block_start (partial
+          // messages on); a CLI without them opens it here.
+          if (![...toolByIndex.values()].includes(block.id)) {
+            stream.write({ type: 'tool-input-start', toolCallId: block.id, toolName: name });
+          }
           stream.write({ type: 'tool-input-available', toolCallId: block.id, toolName: name, input: block.input ?? {} });
         }
         break;
@@ -368,7 +504,7 @@ export async function runClaudeTurn({
       if (isReplaced()) return;
     } else if (!resultError && !segmentText.trim() && !ranTools) {
       // Nothing streamed and no verdict — fail the turn outright.
-      throw friendlyClaudeError(error);
+      throw friendlyClaudeError(new Error(withStderr(error?.message)));
     } else if (!resultError) {
       // Real work streamed, then the subprocess died without a terminal
       // result — persist the partial turn as FAILED below, don't lose it.
@@ -387,10 +523,16 @@ export async function runClaudeTurn({
   }
 
   // The CLI reports failures (not-logged-in, error_max_turns,
-  // error_during_execution) as a RESULT message, not a thrown error. With
-  // nothing streamed that's the whole turn — fail it.
-  if (!ranTools && !segmentText.trim() && (resultError || LOGIN_ERROR.test(finalText))) {
-    throw friendlyClaudeError(new Error(resultError || finalText));
+  // error_during_execution) as a RESULT message, not a thrown error — and a
+  // CLI that never got going emits no result at ALL and exits 0. Either way,
+  // with nothing streamed that's the whole turn: fail it rather than finish
+  // clean on an empty transcript, which reads as the agent ignoring you.
+  // `sawText`, not segmentText alone: a segment FLUSHED at a tool block start
+  // is still output the model produced, and judging by the cleared buffer
+  // would report "the CLI returned nothing" about a turn that spoke.
+  const nothingStreamed = !ranTools && !segmentText.trim() && !sawText;
+  if (nothingStreamed && (resultError || LOGIN_ERROR.test(finalText) || (!finalText.trim() && !abort.signal.aborted))) {
+    throw friendlyClaudeError(new Error(withStderr(resultError || finalText)));
   }
 
   // Deltas are the source of truth; `result` covers a turn whose stream
@@ -410,16 +552,37 @@ export async function runClaudeTurn({
   // the work is real and persists, but the turn must not read as a clean
   // completion — run_status:'error' makes reload's latestTurnOutcome call it
   // 'failed', and the live stream gets an error instead of 'finish'.
-  if (text.trim() || ranTools || resultError) {
+  const editsMeta = turnEditsMetadata(store, project.id, assistantMessageId);
+  // `persistedReasoning` counts: this engine now writes thinking rows, and a
+  // Stop during thinking would otherwise leave them with NO anchor — flushed
+  // under a synthetic id, read as outcome 'none', and retried by the client
+  // for minutes.
+  // `sawText` closes the gap the block-start flush opens: between it and the
+  // assembled assistant frame, text/ranTools/persistedReasoning/resultError can
+  // ALL be falsy, and a Stop there would persist no anchor at all.
+  if (text.trim() || ranTools || resultError || persistedReasoning || sawText) {
+    // A contentless anchor needs a terminal marker or latestTurnOutcome reads
+    // the turn as unfinished. Neither value counts as a failure.
+    const terminal =
+      !text.trim() && !ranTools && !resultError
+        ? { run_status: abort?.signal?.aborted ? 'aborted' : 'completed' }
+        : {};
     store.appendChatMessage(project.id, chatId, {
       id: assistantMessageId,
       role: 'assistant',
       content: text,
       metadata: resultError
-        ? { run_status: 'error', run_error: `Claude stopped before finishing (${resultError}).` }
-        : {},
+        ? { ...editsMeta, run_status: 'error', run_error: `Claude stopped before finishing (${resultError}).` }
+        : { ...editsMeta, ...terminal },
     });
   }
+  // A turn that died mid-edit still edited — stamp before the error frame.
+  writeTurnEditsMetadata(stream, editsMeta);
+  // AFTER the append: the top-up MERGES into the persisted row, so running it
+  // first would be a no-op and reload would read the stale empty count. Bash
+  // writes land through the watcher's debounce, which can be after the count
+  // above (see runner.mjs).
+  await topUpTurnEdits({ store, projectId: project.id, assistantMessageId, editsMeta, stream, settleWatcher, ranTools });
   if (resultError) {
     stream.write({ type: 'error', errorText: `Claude stopped before finishing (${resultError}).` });
     return;

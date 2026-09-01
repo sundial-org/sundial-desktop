@@ -33,10 +33,12 @@ export function rangeDocEditIds(
   const ia = entries.findIndex((e) => e.reviewId === aReviewId);
   const ib = entries.findIndex((e) => e.reviewId === bReviewId);
   if (ia < 0 || ib < 0) return null;
-  // Newest-first ⇒ the larger index is the older entry.
+  // Newest-first ⇒ the larger index is the older entry. `|| null`: a comment
+  // entry whose anchor probe found no doc edit carries docEditId 0 — as a
+  // `from` boundary that means "start of history", not a real row id.
   const olderIdx = Math.max(ia, ib);
   const newerIdx = Math.min(ia, ib);
-  return { to: entries[newerIdx]!.docEditId, from: entries[olderIdx + 1]?.docEditId ?? null };
+  return { to: entries[newerIdx]!.docEditId, from: entries[olderIdx + 1]?.docEditId || null };
 }
 
 const SESSION_GAP_MS = 6 * 60 * 60 * 1000;

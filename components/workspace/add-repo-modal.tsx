@@ -10,6 +10,7 @@ import {
   XIcon,
 } from '@phosphor-icons/react';
 import { ModalShell } from '@/components/modal-shell';
+import { waitForFirstSync } from '@/lib/workspace/wait-first-sync';
 import { useRequireSignIn } from '@/lib/auth/use-require-signin';
 import { IntegrationSignInGate } from '@/components/workspace/integration-signin-gate';
 import { CloneProgress } from '@/components/workspace/clone-progress';
@@ -42,7 +43,7 @@ export function AddRepoModal({
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [urlInput, setUrlInput] = useState('');
-  // Tracks the in-flight link/clone per-target so only the clicked button
+  // Tracks the in-flight link/sync per-target so only the clicked button
   // shows the spinner. `target` is the repo fullName or the URL string.
   const [busy, setBusy] = useState<{ target: string; phase: 'linking' | 'cloning' } | null>(null);
 
@@ -99,6 +100,9 @@ export function AddRepoModal({
     }, 750);
   }, [refresh, requireSignIn]);
 
+  // Root-scoped link: the repo syncs with the ENTIRE workspace (existing
+  // files and the repo merge, then stay in sync both ways). The bridge worker
+  // owns the clone + sync; we show CloneProgress until its first cycle lands.
   const linkRepo = useCallback(
     async (target: string, payload: Record<string, unknown>) => {
       setBusy({ target, phase: 'linking' });
@@ -108,7 +112,7 @@ export function AddRepoModal({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           credentials: 'include',
-          body: JSON.stringify({ projectId, provider: 'github', ...payload }),
+          body: JSON.stringify({ projectId, provider: 'github', importedPath: '/', ...payload }),
         });
         const linkBody = (await link.json().catch(() => null)) as
           | { repositoryId?: string; error?: string; code?: string }
@@ -118,21 +122,20 @@ export function AddRepoModal({
         }
 
         setBusy({ target, phase: 'cloning' });
-        const clone = await fetch(`/api/workspace/linked-repos/${linkBody.repositoryId}/actions`, {
-          method: 'POST',
+        const start = await fetch(`/api/workspace/bridges/${linkBody.repositoryId}`, {
+          method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           credentials: 'include',
-          body: JSON.stringify({ projectId, action: 'clone' }),
+          body: JSON.stringify({ projectId, mode: 'auto' }),
         });
-        const cloneBody = (await clone.json().catch(() => null)) as
-          | { ok?: boolean; error?: string; output?: string }
-          | null;
-        if (!clone.ok || !cloneBody?.ok) {
-          const raw = cloneBody?.error || cloneBody?.output || `HTTP ${clone.status}`;
+        const startBody = (await start.json().catch(() => null)) as { error?: string } | null;
+        if (!start.ok) {
           throw new Error(
-            `Repo linked but initial clone failed: ${humanizeGitError('github', raw)}`,
+            `Repo linked but sync did not start: ${humanizeGitError('github', startBody?.error ?? `HTTP ${start.status}`)}`,
           );
         }
+
+        await waitForFirstSync(projectId, linkBody.repositoryId);
 
         onLinked(linkBody.repositoryId);
         onClose();
@@ -176,7 +179,7 @@ export function AddRepoModal({
           Add a GitHub repo
         </h2>
         <p className="mt-1 text-xs text-stone-500">
-          Cloned into a subfolder of this workspace. Push, pull, and commit from the Commits panel.
+          Synced with this entire workspace, both ways: your files and the repo merge, edits here commit to GitHub, and pushes appear here.
         </p>
       </header>
 

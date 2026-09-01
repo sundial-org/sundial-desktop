@@ -9,7 +9,7 @@
 // in app/globals.css (`ins[data-suggestion]` / `del[data-suggestion]`), so the
 // look is fully ours.
 import { Mark, Node, Extension, type AnyExtension, type CommandProps } from '@tiptap/core';
-import { Plugin, PluginKey, Selection, TextSelection, type EditorState, type Transaction } from '@tiptap/pm/state';
+import { EditorState, Plugin, PluginKey, Selection, TextSelection, type Transaction } from '@tiptap/pm/state';
 import { Decoration, DecorationSet, type EditorView } from '@tiptap/pm/view';
 import { Fragment, type Node as PMNode } from '@tiptap/pm/model';
 import { canJoin } from '@tiptap/pm/transform';
@@ -25,6 +25,8 @@ import {
   applySuggestion,
   revertSuggestion,
 } from '@handlewithcare/prosemirror-suggest-changes';
+import { rejectDependentGroups } from '@/lib/crdt-js/markdown_yjs.mjs';
+import { changedBlockSpan } from '@/lib/tiptap/incremental-decorations';
 
 // The library's SuggestionId type isn't re-exported from its index; it's just
 // `string | number` (a suggestion's stable identity, shared by every mark that
@@ -109,6 +111,9 @@ const BLOCK_CONTAINERS = new Set([
   'table', 'tableRow', 'tableCell', 'tableHeader',
 ]);
 const REMOVABLE_REQUIRED_CONTAINERS = new Set(['listItem', 'bulletList', 'orderedList', 'blockquote']);
+// Table internals are climbed THROUGH when emptied (a fully-emptied table goes
+// as a whole) but never deleted on their own — a lone emptied cell keeps the grid.
+const TABLE_INTERNALS = new Set(['tableRow', 'tableCell', 'tableHeader']);
 
 // The suggestion library can temporarily put marks on block children at every
 // nesting depth, before our dispatch wrapper converts them to durable attrs +
@@ -168,6 +173,31 @@ export type SuggestionChangesOptions = {
   canResolve?: boolean;
   /** Persist each range decision; the CRDT ledger folds conflicting decisions to mixed. */
   onResolved?: (ids: SuggestionId[], action: 'accept' | 'reject') => void;
+  /** Who suggested this range — renders an avatar left of the ✓/✕ that opens the
+   *  originating chat turn. Return null for ranges with no known author. */
+  resolveAuthor?: (ids: SuggestionId[]) => SuggestionAuthor | null;
+  /** Reject-cascade outcome for dependent stacked ids (see rejectDependentGroups
+   *  in markdown_yjs.mjs): fully consumed dependents tombstone as 'mixed',
+   *  partially consumed ones park until their remainder resolves — wire to
+   *  recordRejectCascadeOutcome so the editor matches the headless resolver. */
+  onCascade?: (outcome: CascadeOutcome) => void;
+};
+
+export type CascadeOutcome = { consumed: SuggestionId[]; partial: SuggestionId[] };
+
+export type SuggestionAuthor = {
+  label: string;
+  /** Chip background — one stable color per author. */
+  color?: string;
+  /** Avatar image (Sunny's face, a brand mark); absent → initials chip. */
+  imageUrl?: string | null;
+  /** True for face avatars (clip round, cover); false for brand marks (contain). */
+  imageRound?: boolean;
+  /** Chip text/background overrides for logo-less brands (e.g. Codex "Cx"). */
+  chipLabel?: string;
+  chipColor?: string;
+  /** Absent for suggestions with no chat turn to open (a human's own edits). */
+  onJump?: () => void;
 };
 
 const SUGGESTION_SPACER = '\u200B';
@@ -203,7 +233,14 @@ export function nodeHasPendingSuggestion(node: PMNode): boolean {
   }
   let found = false;
   node.descendants((child) => {
-    if (!found && child.marks.some((m) => SUGGESTION_MARK_NAMES.has(m.type.name))) found = true;
+    // Structural suggestions on descendants carry ATTRS, not marks — a
+    // suggested hardBreak has no mark at all. Both must reveal the source.
+    if (
+      !found &&
+      (hasNodeSuggestion(child) || child.marks.some((m) => SUGGESTION_MARK_NAMES.has(m.type.name)))
+    ) {
+      found = true;
+    }
     return !found;
   });
   return found;
@@ -346,15 +383,39 @@ function resolveNodeModifications(
 // Granular accept/reject review controls, in-editor DOM (no React):
 //   • per change-GROUP — a ✓/✕ pair revealed on hover of a contiguous run of
 //     suggestion marks (a replacement like del "Found" + ins "We" is ONE group)
-//   • per BLOCK — a ✓/✕ pair pinned to a right-hand gutter, aligned across
-//     every block that carries a suggestion
-// Both act through the library's range commands, so they need no finer id
-// grouping — a group/block accepts or reverts exactly the marks in its span.
+//   • per BLOCK — author chip + ✓/✕ pinned to the right-hand gutter, revealed
+//     for the hovered line
+// The per-group overlay is the pre-#1104 control restored faithfully; it
+// coexists with the gutter by explicit call (Florent, 2026-08-08) — both may
+// show on the same hover. Both act through the same range primitive, so they
+// need no finer id grouping — a group/block accepts or reverts exactly the
+// marks in its span (a #590 merged replacement resolves whole, see
+// inlineResolutionRange).
 // ---------------------------------------------------------------------------
 // Cached in plugin state so the decoration set is rebuilt only when it can have
 // changed (doc edit or hover move), never on selection / remote-cursor /
 // awareness / IME ticks — see the cachedDecorations note in collab-editor.tsx.
-type ReviewState = { hover: SuggestRange | null; decorations: DecorationSet; hasSuggestions: boolean };
+type ReviewState = {
+  /** What props.decorations serves: `base` plus, while a run is hovered, the
+   *  word-level floating ✓/✕ pair. A pointer move recomposes from `base`
+   *  without re-walking the doc. */
+  decorations: DecorationSet;
+  /** The doc-derived set (gutter controls + node classes), rebuilt only on
+   *  doc change / author refresh. */
+  base: DecorationSet;
+  hasSuggestions: boolean;
+  /** Bumped when suggestion attribution changes. Folded into the gutter widget
+   *  keys: ProseMirror reuses a keyed widget's DOM across rebuilds, so without
+   *  a new key the control built before the author map arrived would keep its
+   *  chipless DOM forever. */
+  authorsVersion: number;
+  /** Change runs / gutter blocks for the current doc — cached with the
+   *  decorations so per-pixel hover hit-tests never walk the doc. */
+  groups: SuggestRange[];
+  blocks: SuggestionBlock[];
+  /** The run whose word-level pair is showing, or null. */
+  hover: SuggestRange | null;
+};
 const reviewKey = new PluginKey<ReviewState>('suggestionReview');
 
 type SuggestRange = { from: number; to: number };
@@ -387,8 +448,13 @@ export function changeGroups(state: EditorState): SuggestRange[] {
   return groups;
 }
 
+// A gutter control's range: `merged` marks the #590 whole-block replacement
+// pair (del-only block + ins-only block, same single suggestion id) fused into
+// one control — one ATOMIC suggestion that must never be resolved by halves.
+export type SuggestionBlock = SuggestRange & { merged?: true };
+
 // Top-level blocks that contain at least one suggestion, as content ranges.
-export function suggestionBlocks(state: EditorState): SuggestRange[] {
+export function suggestionBlocks(state: EditorState): SuggestionBlock[] {
   const raw: Array<SuggestRange & { delIds: Set<string>; insIds: Set<string>; modIds: Set<string> }> = [];
   // Walk to the innermost textblock (paragraph/heading/list-item paragraph, and
   // each table cell), not just top-level children — so a suggestion inside a
@@ -442,20 +508,120 @@ export function suggestionBlocks(state: EditorState): SuggestRange[] {
   // one reviewer deletes a paragraph, another inserts one right below) must stay
   // separate so each is accepted/rejected on its own.
   const only = (s: Set<string>) => (s.size === 1 ? [...s][0] : null);
-  const blocks: SuggestRange[] = [];
+  const blocks: SuggestionBlock[] = [];
   for (let i = 0; i < raw.length; i += 1) {
     const b = raw[i];
     const next = raw[i + 1];
     const delOnly = b.delIds.size > 0 && b.insIds.size === 0 && b.modIds.size === 0 ? only(b.delIds) : null;
     const insOnly = next && next.insIds.size > 0 && next.delIds.size === 0 && next.modIds.size === 0 ? only(next.insIds) : null;
     if (next && delOnly != null && insOnly != null && delOnly === insOnly && b.to === next.from) {
-      blocks.push({ from: b.from, to: next.to });
+      blocks.push({ from: b.from, to: next.to, merged: true });
       i += 1; // consume the insertion half of the pair
     } else {
       blocks.push({ from: b.from, to: b.to });
     }
   }
   return blocks;
+}
+
+// Blocks the by-id / whole-document resolutions empty. Those paths delegate the
+// inline work to the suggest-changes library (which owns modification-mark
+// semantics the range path does not model), so they can't reuse the range
+// path's own drop set — recover it from the marks instead: accepting removes
+// `deletion`-marked text, rejecting removes `insertion`-marked text. `id` null
+// means every suggestion. `extra` carries the reject cascade's dependent drops.
+function suggestionEmptiedBlocks(
+  doc: PMNode,
+  accept: boolean,
+  id: SuggestionId | null,
+  extra: SuggestRange[] = [],
+): SuggestRange[] {
+  const dropMark = accept ? 'deletion' : 'insertion';
+  const dropRanges: SuggestRange[] = [...extra];
+  doc.descendants((node, pos) => {
+    if (node.isText && node.marks.some((m) => m.type.name === dropMark && (id == null || m.attrs.id === id))) {
+      dropRanges.push({ from: pos, to: pos + node.nodeSize });
+    }
+    return true;
+  });
+  const structDropped = (node: PMNode) => {
+    const nodeId = nodeSuggestionId(node, dropMark);
+    return nodeId != null && (id == null || nodeId === id);
+  };
+  return emptiedBlockDeletes(doc, dropRanges, 0, doc.content.size, structDropped);
+}
+
+// Blocks whose ENTIRE text is removed by `dropRanges` (accepting a whole-line
+// strike, or rejecting a whole-line insert) must be removed outright — leaving
+// the emptied block behind renders as a stray blank line, a bare `# ` heading,
+// or an orphan `- ` bullet (the #767 empty-shell class). Shared by every editor
+// resolution path so they all converge with the headless resolver.
+// Only real text drops count — NOT spacers: accepting a suggested blank line
+// leaves a block whose sole child is the zero-width insertion placeholder, and
+// that block must be KEPT (blank), with just the placeholder removed.
+// `structDropped` names the nodes this resolution removes by node attr (a
+// suggested blank bullet / code fence / rule / image has no text to mark) — they
+// count as dropped content, so a list of only such nodes is deleted whole
+// instead of item by item (ProseMirror refits a required listItem shell when
+// the last one goes).
+function emptiedBlockDeletes(
+  doc: PMNode,
+  dropRanges: SuggestRange[],
+  from: number,
+  to: number,
+  structDropped: (node: PMNode, pos: number) => boolean = () => false,
+): SuggestRange[] {
+  // Every text leaf under `node` (content starting at `start`) sits inside a
+  // drop range, and there IS text. A non-text leaf (image/hr) survives
+  // resolution, so its container must too — except hardBreak, which is
+  // meaningless alone. An EMPTY textblock descendant (a pre-existing blank
+  // bullet/line the suggestion never touched) is user content: it vetoes the
+  // container delete so rejecting a sibling insert can't swallow it.
+  const allTextDropped = (node: PMNode, start: number) => {
+    let all = true;
+    let any = false;
+    node.descendants((child, off) => {
+      if (structDropped(child, start + off)) { any = true; return false; }
+      if (child.isText) {
+        any = true;
+        const a = start + off;
+        if (!dropRanges.some((r) => r.from <= a && r.to >= a + child.nodeSize)) all = false;
+      } else if (child.isLeaf) {
+        if (child.type.name !== 'hardBreak') all = false;
+      } else if (child.isTextblock && child.content.size === 0) all = false;
+      return all;
+    });
+    return any && all;
+  };
+  const blockDeletes: SuggestRange[] = [];
+  doc.nodesBetween(from, to, (node, pos) => {
+    if (!node.isTextblock && !structDropped(node, pos)) return true;
+    const cStart = pos + 1;
+    if (!structDropped(node, pos)) {
+      if (pos + node.nodeSize - 1 <= cStart) return false; // already empty — leave pre-existing blanks
+      if (!allTextDropped(node, cStart)) return false;
+    }
+    // A top-level emptied block is deleted outright. A NESTED one climbs to
+    // the outermost fully-dropped list / blockquote container, so a rejected
+    // list-item insert takes its bullet with it (and an emptied whole list,
+    // the list). A nested textblock that can't climb keeps its container —
+    // the paragraph a list_item / table cell REQUIRES — and falls through to
+    // plain text deletion instead (a valid, possibly-empty block).
+    const $pos = doc.resolve(pos);
+    let del = $pos.depth === 0 ? { from: pos, to: pos + node.nodeSize } : null;
+    for (let d = $pos.depth; d >= 1; d -= 1) {
+      const anc = $pos.node(d);
+      const name = anc.type.name;
+      if (!(REMOVABLE_REQUIRED_CONTAINERS.has(name) || TABLE_INTERNALS.has(name) || name === 'table')) break;
+      if (!allTextDropped(anc, $pos.start(d))) break;
+      if (!TABLE_INTERNALS.has(name)) del = { from: $pos.before(d), to: $pos.after(d) };
+    }
+    // An earlier climb may already cover this range (later items of a fully
+    // dropped list) — a duplicate delete would eat unrelated content.
+    if (del && !blockDeletes.some((bd) => bd.from <= del!.from && bd.to >= del!.to)) blockDeletes.push(del);
+    return false;
+  });
+  return blockDeletes;
 }
 
 // Accept (or reject) every suggestion within [from, to] — the primitive behind
@@ -551,52 +717,12 @@ export function resolveSuggestionRange(from: number, to: number, accept: boolean
     // leaves a block whose sole child is the zero-width insertion placeholder, and
     // that block must be KEPT (blank), with just the placeholder removed.
     const dropRanges = ops.filter((o) => o.kind === 'drop');
-    // Every text leaf under `node` (content starting at `start`) sits inside a
-    // drop range, and there IS text. A non-text leaf (image/hr) survives
-    // resolution, so its container must too — except hardBreak, which is
-    // meaningless alone. An EMPTY textblock descendant (a pre-existing blank
-    // bullet/line the suggestion never touched) is user content: it vetoes the
-    // container delete so rejecting a sibling insert can't swallow it.
-    const allTextDropped = (node: PMNode, start: number) => {
-      let all = true;
-      let any = false;
-      node.descendants((child, off) => {
-        if (child.isText) {
-          any = true;
-          const a = start + off;
-          if (!dropRanges.some((r) => r.from <= a && r.to >= a + child.nodeSize)) all = false;
-        } else if (child.isLeaf) {
-          if (child.type.name !== 'hardBreak') all = false;
-        } else if (child.isTextblock && child.content.size === 0) all = false;
-        return all;
-      });
-      return any && all;
-    };
-    const blockDeletes: SuggestRange[] = [];
-    state.doc.nodesBetween(from, to, (node, pos) => {
-      if (!node.isTextblock) return true;
-      const cStart = pos + 1;
-      if (pos + node.nodeSize - 1 <= cStart) return false; // already empty — leave pre-existing blanks
-      if (!allTextDropped(node, cStart)) return false;
-      // A top-level emptied block is deleted outright. A NESTED one climbs to
-      // the outermost fully-dropped list / blockquote container, so a rejected
-      // list-item insert takes its bullet with it (and an emptied whole list,
-      // the list). A nested textblock that can't climb keeps its container —
-      // the paragraph a list_item / table cell REQUIRES — and falls through to
-      // plain text deletion instead (a valid, possibly-empty block).
-      const $pos = state.doc.resolve(pos);
-      let del = $pos.depth === 0 ? { from: pos, to: pos + node.nodeSize } : null;
-      for (let d = $pos.depth; d >= 1; d -= 1) {
-        const anc = $pos.node(d);
-        if (!REMOVABLE_REQUIRED_CONTAINERS.has(anc.type.name) || !allTextDropped(anc, $pos.start(d))) break;
-        del = { from: $pos.before(d), to: $pos.after(d) };
-      }
-      // An earlier climb may already cover this range (later items of a fully
-      // dropped list) — a duplicate delete would eat unrelated content.
-      if (del && !blockDeletes.some((bd) => bd.from <= del!.from && bd.to >= del!.to)) blockDeletes.push(del);
-      return false;
-    });
-    const inBlockDelete = (o: Op) => blockDeletes.some((bd) => bd.from <= o.from && bd.to >= o.to);
+    const dropAttr = nodeSuggestionAttr(dropType.name)!;
+    // Only nodes THIS range resolves count as dropped — a sibling's pending
+    // structural insertion outside [from, to] must not be swept along.
+    const blockDeletes = emptiedBlockDeletes(state.doc, dropRanges, from, to,
+      (n, pos) => n.attrs[dropAttr] != null && pos >= from && pos + n.nodeSize <= to);
+    const inBlockDelete = (o: SuggestRange) => blockDeletes.some((bd) => bd.from <= o.from && bd.to >= o.to);
 
     const tr = state.tr;
     type Apply = {
@@ -608,7 +734,9 @@ export function resolveSuggestionRange(from: number, to: number, accept: boolean
     };
     const applies: Apply[] = [
       ...blockDeletes.map((bd): Apply => ({ ...bd, kind: 'drop' })),
-      ...nodeOps.map((op): Apply => ({
+      // A structural drop inside a whole-container delete is subsumed by it
+      // (positions are raw, so a nested second delete would eat what follows).
+      ...nodeOps.filter((op) => op.kind !== 'drop-node' || !inBlockDelete(op)).map((op): Apply => ({
         ...op,
         kind: op.kind === 'drop-node'
           ? 'drop'
@@ -668,7 +796,101 @@ export function resolveSuggestionRange(from: number, to: number, accept: boolean
   };
 }
 
-function resolveSuggestionId(id: SuggestionId, accept: boolean) {
+// Editor-path half of the stacked-suggestion reject cascade. The dependency
+// rule itself is rejectDependentGroups in markdown_yjs.mjs — the codec's single
+// source, shared with the headless resolver — so rejecting a stack's base from
+// the editor produces the identical post-state the chat card / API produces
+// (no dangling "beta OMEGA" hybrid). Run sequences mirror the codec's: one
+// textblock's contiguous text children, split at non-text inline nodes (the
+// codec walks each Y.XmlText alone).
+function rejectCascadeOps(doc: PMNode, id: SuggestionId) {
+  const drops: SuggestRange[] = [];
+  const clears: SuggestRange[] = [];
+  const depIds = new Set<SuggestionId>();
+  const markId = (node: PMNode, name: string): SuggestionId | null =>
+    (node.marks.find((m) => m.type.name === name)?.attrs.id as SuggestionId | null | undefined) ?? null;
+  doc.descendants((block, pos) => {
+    if (!block.isTextblock) return true;
+    let seq: Array<{ from: number; to: number; insertionId: SuggestionId | null; deletionId: SuggestionId | null }> = [];
+    const flush = () => {
+      if (!seq.length) return;
+      const { cascaded, reverted, depIds: deps } = rejectDependentGroups(seq, id);
+      for (const j of cascaded) drops.push({ from: seq[j].from, to: seq[j].to });
+      for (const j of reverted) if (!cascaded.has(j)) clears.push({ from: seq[j].from, to: seq[j].to });
+      for (const dep of deps) depIds.add(dep as SuggestionId);
+      seq = [];
+    };
+    block.forEach((child, offset) => {
+      if (!child.isText) { flush(); return; }
+      const from = pos + 1 + offset;
+      seq.push({ from, to: from + child.nodeSize, insertionId: markId(child, 'insertion'), deletionId: markId(child, 'deletion') });
+    });
+    flush();
+    return false;
+  });
+  // Structural twin (mirror of the codec's cascadeStructural): a container's
+  // child sequence, each child ONE run — its own attrs, else its subtree's ids
+  // when uniform (a struck-and-replaced table / list / paragraph pair).
+  const attrClears: number[] = []; // positions of nodes whose deletion attr clears
+  const walkContainer = (container: PMNode, base: number) => {
+    const kids: Array<{ node: PMNode; pos: number }> = [];
+    container.forEach((child, offset) => kids.push({ node: child, pos: base + offset }));
+    const { cascaded, reverted, depIds: deps } = rejectDependentGroups(kids.map((k) => nodeRunIds(k.node)), id);
+    for (const j of cascaded) {
+      const { node, pos } = kids[j];
+      drops.push(removableStructuralRange(doc, pos, node) ?? { from: pos, to: pos + node.nodeSize });
+    }
+    for (const j of reverted) {
+      if (cascaded.has(j)) continue;
+      const { node, pos } = kids[j];
+      const dep = nodeRunIds(node).deletionId;
+      clears.push({ from: pos, to: pos + node.nodeSize });
+      if (nodeSuggestionId(node, 'deletion') === dep) attrClears.push(pos);
+      node.descendants((d, off) => { if (nodeSuggestionId(d, 'deletion') === dep) attrClears.push(pos + 1 + off); return true; });
+    }
+    for (const dep of deps) depIds.add(dep as SuggestionId);
+    kids.forEach(({ node, pos }) => { if (!node.isLeaf && !node.isTextblock) walkContainer(node, pos + 1); });
+  };
+  walkContainer(doc, 0);
+  return { drops, clears, attrClears, depIds };
+}
+
+function nodeRunIds(node: PMNode): { insertionId: SuggestionId | null; deletionId: SuggestionId | null } {
+  if (nodeSuggestionId(node, 'insertion') != null || nodeSuggestionId(node, 'deletion') != null) {
+    return { insertionId: nodeSuggestionId(node, 'insertion'), deletionId: nodeSuggestionId(node, 'deletion') };
+  }
+  const ins = new Set<SuggestionId | null>();
+  const del = new Set<SuggestionId | null>();
+  const markId = (n: PMNode, name: string) => (n.marks.find((m) => m.type.name === name)?.attrs.id as SuggestionId | undefined) ?? null;
+  const visit = (n: PMNode): boolean => {
+    if (n.isText) { ins.add(markId(n, 'insertion')); del.add(markId(n, 'deletion')); return true; }
+    if (nodeSuggestionId(n, 'insertion') != null || nodeSuggestionId(n, 'deletion') != null) {
+      ins.add(nodeSuggestionId(n, 'insertion')); del.add(nodeSuggestionId(n, 'deletion')); return false;
+    }
+    if ((n.isLeaf && n.type.name !== 'hardBreak') || (n.isTextblock && n.content.size === 0)) { ins.add(null); del.add(null); }
+    return true;
+  };
+  if (visit(node)) node.descendants(visit);
+  const one = (set: Set<SuggestionId | null>) => (set.size === 1 ? [...set][0] : null);
+  return ins.size === 0 ? { insertionId: null, deletionId: null } : { insertionId: one(ins), deletionId: one(del) };
+}
+
+// Mirror of the codec's suggestionStillLive: inline marks + structural attrs.
+function suggestionLiveInDoc(doc: PMNode, id: SuggestionId): boolean {
+  let live = false;
+  doc.descendants((node) => {
+    if (!live) {
+      live = node.isText
+        ? node.marks.some((m) => SUGGESTION_MARK_NAMES.has(m.type.name) && m.attrs.id === id)
+        : nodeSuggestionId(node, 'insertion') === id || nodeSuggestionId(node, 'deletion') === id
+          || nodeModifications(node).some((mod) => mod.id === id);
+    }
+    return !live;
+  });
+  return live;
+}
+
+function resolveSuggestionId(id: SuggestionId, accept: boolean, onCascade?: (outcome: CascadeOutcome) => void) {
   return (state: EditorState, dispatch?: EditorView['dispatch']): boolean => {
     const structural: Array<{
       from: number;
@@ -697,13 +919,19 @@ function resolveSuggestionId(id: SuggestionId, accept: boolean) {
       if (mods.length) structural.push({ from: pos, to: pos + node.nodeSize, nodeFrom: pos, kind: 'modification', mods });
       return true;
     });
+    const cascade = accept ? null : rejectCascadeOps(state.doc, id);
     const resolveInline = accept ? applySuggestion(id) : revertSuggestion(id);
-    if (structural.length === 0) return resolveInline(state, dispatch);
+    // Blocks this id empties must go with it, exactly as on the range path —
+    // otherwise accepting a suggestion that removed a heading leaves `# `.
+    const blockDeletes = suggestionEmptiedBlocks(state.doc, accept, id, cascade?.drops ?? [])
+      .filter((r) => !structural.some((s) => (s.remove || s.replace) && s.from <= r.from && s.to >= r.to));
+    if (structural.length === 0 && !cascade?.depIds.size && blockDeletes.length === 0) {
+      return resolveInline(state, dispatch);
+    }
     if (!dispatch) return true;
 
-    let tr: Transaction | null = null;
-    resolveInline(state, (next) => { tr = next; });
-    const out = tr ?? state.tr;
+    // Block work first, library last — see resolveAllSuggestions.
+    const out = state.tr;
     for (const item of structural.sort((a, b) => b.from - a.from)) {
       if (item.kind === 'modification') {
         resolveNodeModifications(out, item.from, item.mods ?? [], accept);
@@ -719,8 +947,34 @@ function resolveSuggestionId(id: SuggestionId, accept: boolean) {
         if (out.doc.nodeAt(pos)) out.setNodeAttribute(pos, nodeSuggestionAttr(item.kind)!, null);
       }
     }
+    for (const r of [...blockDeletes].sort((a, b) => b.from - a.from)) {
+      deleteOrKeepRequiredDocumentBlock(out, out.mapping.map(r.from, 1), out.mapping.map(r.to, -1));
+    }
+    resolveInline(EditorState.create({ doc: out.doc }), (inline) => { for (const step of inline.steps) out.step(step); });
+    if (cascade) {
+      // All positions pre-computed on `state.doc`; the mapping accounts for the
+      // library's own deletions of `id`'s runs (dependent runs never overlap
+      // them — an earlier id can't mark later-inserted text). One transaction,
+      // so undo/observers see one step and the hybrid never renders.
+      for (const r of [...cascade.drops].sort((a, b) => b.from - a.from)) {
+        out.delete(out.mapping.map(r.from, 1), out.mapping.map(r.to, -1));
+      }
+      const deletionType = state.schema.marks.deletion;
+      for (const r of cascade.clears) {
+        out.removeMark(out.mapping.map(r.from, 1), out.mapping.map(r.to, -1), deletionType);
+      }
+      for (const p of cascade.attrClears) {
+        const pos = out.mapping.map(p, 1);
+        if (out.doc.nodeAt(pos)) out.setNodeAttribute(pos, NODE_DELETION_ID, null);
+      }
+    }
     out.setMeta(suggestChangesKey, { skip: true });
     dispatch(out);
+    if (onCascade && cascade?.depIds.size) {
+      const deps = [...cascade.depIds].filter((dep) => dep !== id);
+      const consumed = deps.filter((dep) => !suggestionLiveInDoc(out.doc, dep));
+      if (deps.length) onCascade({ consumed, partial: deps.filter((dep) => !consumed.includes(dep)) });
+    }
     return true;
   };
 }
@@ -754,17 +1008,21 @@ function resolveAllSuggestions(accept: boolean) {
       if (mods.length) structural.push({ from: pos, to: pos + node.nodeSize, nodeFrom: pos, kind: 'modification', mods });
       return true;
     });
+    // Blocks emptied by this resolution must go with it — see the range path.
+    const blockDeletes = suggestionEmptiedBlocks(state.doc, accept, null)
+      .filter((r) => !structural.some((s) => (s.remove || s.replace) && s.from <= r.from && s.to >= r.to));
     const resolveInline = accept ? applySuggestions : revertSuggestions;
-    if (!dispatch) return structural.length > 0 || resolveInline(state);
+    if (!dispatch) return structural.length > 0 || blockDeletes.length > 0 || resolveInline(state);
 
-    let tr: Transaction | null = null;
-    const inlineChanged = resolveInline(state, (next) => { tr = next; });
-    if (structural.length === 0) {
-      if (tr) dispatch(tr);
-      return inlineChanged;
-    }
+    if (structural.length === 0 && blockDeletes.length === 0) return resolveInline(state, dispatch);
 
-    const out = tr ?? state.tr;
+    // Block work FIRST, on positions computed against `state.doc`. The library's
+    // inline pass can merge an emptied block into its neighbour (deleteRange
+    // over a mark run spanning blocks becomes one open-ended replace), after
+    // which a pre-computed container range no longer maps to the container —
+    // so it runs LAST, on the resulting doc, its steps folded into this one
+    // transaction (single undo step, one Yjs update).
+    const out = state.tr;
     for (const item of structural.sort((a, b) => b.from - a.from)) {
       if (item.kind === 'modification') {
         resolveNodeModifications(out, item.from, item.mods ?? [], accept);
@@ -780,10 +1038,58 @@ function resolveAllSuggestions(accept: boolean) {
         if (out.doc.nodeAt(pos)) out.setNodeAttribute(pos, nodeSuggestionAttr(item.kind)!, null);
       }
     }
+    for (const r of [...blockDeletes].sort((a, b) => b.from - a.from)) {
+      deleteOrKeepRequiredDocumentBlock(out, out.mapping.map(r.from, 1), out.mapping.map(r.to, -1));
+    }
+    resolveInline(EditorState.create({ doc: out.doc }), (inline) => { for (const step of inline.steps) out.step(step); });
     out.setMeta(suggestChangesKey, { skip: true });
     dispatch(out);
     return true;
   };
+}
+
+/** Two letters from a display label ("Agent #7" → A7, "Ada Lovelace" → AL).
+ *  Splits on `#` too, so agent numbers survive instead of collapsing to "A#". */
+export function authorInitials(label: string): string {
+  const letters = label.trim().split(/[\s#]+/).filter(Boolean).map((part) => part[0]).join('');
+  return (letters.slice(0, 2) || '?').toUpperCase();
+}
+
+export function authorButton(author: SuggestionAuthor) {
+  // No jump target → a plain chip, not a dead <button>: a disabled button
+  // styled like the ✓/✕ controls beside it reads as a broken action
+  // ("the icon isn't clickable" — user interviews), while a span with
+  // `is-static` styling reads as the byline it is.
+  const b = author.onJump ? document.createElement('button') : document.createElement('span');
+  if (b instanceof HTMLButtonElement) b.type = 'button';
+  b.className = author.onJump ? 'suggestion-author' : 'suggestion-author is-static';
+  b.title = author.onJump ? `${author.label} · open the chat turn` : author.label;
+  b.setAttribute('aria-label', b.title);
+  if (author.imageUrl) {
+    const img = document.createElement('img');
+    img.src = author.imageUrl;
+    img.alt = '';
+    img.draggable = false;
+    b.append(img);
+    // Face avatars fill the round chip; brand marks sit on a transparent chip
+    // uncropped — the same two treatments the chat list uses.
+    if (author.imageRound === false) {
+      b.classList.add('is-mark');
+      img.classList.add('is-mark');
+    }
+  } else {
+    b.textContent = author.chipLabel ?? authorInitials(author.label);
+    const bg = author.chipColor ?? author.color;
+    if (bg) b.style.background = bg;
+  }
+  if (author.onJump) {
+    b.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      author.onJump!();
+    });
+  }
+  return b;
 }
 
 function reviewButtons(
@@ -791,10 +1097,12 @@ function reviewButtons(
   className: string,
   accept: () => void,
   reject: () => void,
+  author?: SuggestionAuthor | null,
 ) {
   const wrap = document.createElement('span');
   wrap.className = className;
   wrap.contentEditable = 'false';
+  if (author) wrap.append(authorButton(author));
   const mk = (label: string, kind: 'accept' | 'reject', run: () => void) => {
     const b = document.createElement('button');
     b.type = 'button';
@@ -813,22 +1121,39 @@ function reviewButtons(
   return wrap;
 }
 
-// One doc walk → the gutter widgets, the hover widget, and whether any
-// suggestion exists. Called only on init / doc-change / hover-change.
+// One doc walk → the gutter widgets, the cached run/block ranges, and whether
+// any suggestion exists. Called only on init / doc-change / author-refresh;
+// the per-run hover pair rides on top via composeReview (a pointer move never
+// re-walks the doc — the ranges are cached here).
+type BuiltReview = {
+  decorations: DecorationSet;
+  hasSuggestions: boolean;
+  groups: SuggestRange[];
+  blocks: SuggestionBlock[];
+};
 function buildReviewState(
   state: EditorState,
-  hover: SuggestRange | null,
   onResolved?: SuggestionChangesOptions['onResolved'],
-): { decorations: DecorationSet; hasSuggestions: boolean } {
+  resolveAuthor?: SuggestionChangesOptions['resolveAuthor'],
+  authorsVersion = 0,
+): BuiltReview {
+  const authorOf = (view: EditorView, range: SuggestRange) =>
+    resolveAuthor?.(suggestionIdsInRange(view.state, range.from, range.to)) ?? null;
   const blocks = suggestionBlocks(state);
   const decos: Decoration[] = [];
   state.doc.descendants((node, pos) => {
-    if (!node.isLeaf && node.content.size > 0) return true;
+    // Containers holding text are coloured by their inline marks; leaves,
+    // blanks, textless containers and raw-text blocks only have the attr.
+    if (!node.isLeaf && node.textContent && !node.type.spec.code) return true;
     const kind = nodeSuggestionId(node, 'insertion') != null
       ? 'insertion'
       : nodeSuggestionId(node, 'deletion') != null
         ? 'deletion'
         : nodeModifications(node).length ? 'modification' : null;
+    // A struck EMPTY paragraph (the blank line a paste landed in) has nothing
+    // to strike: it is invisible in the projection, so no red box. (Other
+    // empty textblocks, e.g. a fence, still render chrome worth striking.)
+    if (kind === 'deletion' && node.type.name === 'paragraph') return true;
     if (kind) decos.push(Decoration.node(pos, pos + node.nodeSize, { class: `suggestion-node-${kind}` }));
     return true;
   });
@@ -854,29 +1179,94 @@ function buildReviewState(
             'suggestion-gutter',
             () => { const r = liveRange(); if (r) resolveRangeAndRecord(view, r, true, onResolved); },
             () => { const r = liveRange(); if (r) resolveRangeAndRecord(view, r, false, onResolved); },
+            authorOf(view, b),
           );
         },
-        { side: -1, key: `block-${b.from}` },
+        { side: -1, key: `block-${b.from}-a${authorsVersion}` },
       ),
     );
   }
-  // Inline ✓/✕ for the hovered change-group only (revealed on hover).
-  if (hover) {
-    decos.push(
-      Decoration.widget(
-        hover.to,
-        (view) =>
-          reviewButtons(
-            view,
-            'suggestion-inline-review',
-            () => resolveRangeAndRecord(view, hover, true, onResolved),
-            () => resolveRangeAndRecord(view, hover, false, onResolved),
-          ),
-        { side: 1, key: 'group-hover' },
-      ),
-    );
+  return {
+    decorations: DecorationSet.create(state.doc, decos),
+    hasSuggestions: blocks.length > 0,
+    groups: changeGroups(state),
+    blocks,
+  };
+}
+
+/** A per-run resolve must never split the #590 merged whole-block replacement
+ *  — a del-only block + ins-only block sharing ONE suggestion id is one atomic
+ *  suggestion, and resolving a half would strand the other while recording a
+ *  partial decision for that id (Codex, PR #1180). Expand the run to its
+ *  containing merged block so both halves resolve together, exactly like the
+ *  block's own gutter control. */
+export function inlineResolutionRange(blocks: SuggestionBlock[], run: SuggestRange): SuggestRange {
+  return blocks.find((b) => b.merged && b.from <= run.from && run.to <= b.to) ?? run;
+}
+
+// Inline ✓/✕ for the hovered change-group only (revealed on hover) — the
+// pre-#1104 per-run overlay, restored. An OVERLAY anchored at the run's end
+// with NO inset offsets, so `position: absolute` keeps its static inline
+// position: a positioned ancestor (`.sd-foldable`'s chevron anchor) cannot
+// displace it the way it hijacks the gutter's lane (see globals.css).
+function inlineReviewWidget(run: SuggestRange, onResolved?: SuggestionChangesOptions['onResolved']) {
+  return Decoration.widget(
+    run.to,
+    (view, getPos) => {
+      // Resolve at CLICK time under the widget's live position (the gutter's
+      // liveRange rationale — the DOM and this closure outlive doc edits), and
+      // widen to the whole #590 merged replacement so it resolves atomically.
+      const liveRun = (): SuggestRange | null => {
+        const at = getPos();
+        if (at == null) return null;
+        const cached = reviewKey.getState(view.state);
+        const group = cached?.groups.find((g) => at >= g.from && at <= g.to) ?? null;
+        return group ? inlineResolutionRange(cached?.blocks ?? [], group) : null;
+      };
+      return reviewButtons(
+        view,
+        'suggestion-inline-review',
+        () => { const r = liveRun(); if (r) resolveRangeAndRecord(view, r, true, onResolved); },
+        () => { const r = liveRun(); if (r) resolveRangeAndRecord(view, r, false, onResolved); },
+      );
+    },
+    { side: 1, key: `run-${run.from}-${run.to}` },
+  );
+}
+
+// Base decorations + (while a run is hovered) the per-run pair. The hover range
+// arrives either fresh from the pointer or mapped through a doc change; snapping
+// it back onto the group it overlaps drops it when its run was resolved away.
+function composeReview(
+  state: EditorState,
+  built: BuiltReview,
+  hover: SuggestRange | null,
+  onResolved?: SuggestionChangesOptions['onResolved'],
+): Omit<ReviewState, 'authorsVersion'> {
+  const run = hover ? built.groups.find((g) => g.from <= hover.to && hover.from <= g.to) ?? null : null;
+  return {
+    decorations: run ? built.decorations.add(state.doc, [inlineReviewWidget(run, onResolved)]) : built.decorations,
+    base: built.decorations,
+    hasSuggestions: built.hasSuggestions,
+    groups: built.groups,
+    blocks: built.blocks,
+    hover: run,
+  };
+}
+
+/** Show (pos) or hide (null) the per-run pair for the change group at `pos` —
+ *  ANY hovered run reveals its pair (pre-#1104 behavior; it may show beside
+ *  the block's gutter control, which is intentional). The pointer plumbing
+ *  lives in the plugin view; exported so tests can drive hover without
+ *  coordinates (jsdom has no layout). Returns the run shown. */
+export function setSuggestionRunHover(view: EditorView, pos: number | null): SuggestRange | null {
+  const s = reviewKey.getState(view.state);
+  if (!s) return null;
+  const run = pos == null ? null : s.groups.find((g) => pos >= g.from && pos <= g.to) ?? null;
+  if (run?.from !== s.hover?.from || run?.to !== s.hover?.to) {
+    view.dispatch(view.state.tr.setMeta(reviewKey, { hover: run }));
   }
-  return { decorations: DecorationSet.create(state.doc, decos), hasSuggestions: blocks.length > 0 };
+  return run;
 }
 
 function suggestionIdsInRange(state: EditorState, from = 0, to = state.doc.content.size): SuggestionId[] {
@@ -913,25 +1303,80 @@ export function resolveRangeAndRecord(
   onResolved(candidates, accept ? 'accept' : 'reject');
 }
 
-function suggestionReviewPlugin(onResolved?: SuggestionChangesOptions['onResolved']) {
+/** Rebuild the review decorations in place. The controls are built once per
+ *  block and reused across keystrokes, so attribution that arrives AFTER the
+ *  marks were painted (the turn fetch resolves later) needs this nudge to
+ *  appear — nothing else in the plugin reacts to a change outside the doc. */
+export function refreshSuggestionReview(view: EditorView) {
+  view.dispatch(view.state.tr.setMeta(reviewKey, { bumpAuthors: true }));
+}
+
+function suggestionReviewPlugin(
+  onResolved?: SuggestionChangesOptions['onResolved'],
+  resolveAuthor?: SuggestionChangesOptions['resolveAuthor'],
+) {
   return new Plugin<ReviewState>({
     key: reviewKey,
     state: {
-      init: (_config, instance) => ({ hover: null, ...buildReviewState(instance, null, onResolved) }),
+      init: (_config, instance) => ({
+        authorsVersion: 0,
+        ...composeReview(instance, buildReviewState(instance, onResolved, resolveAuthor), null, onResolved),
+      }),
       apply: (tr, value, _oldState, newState) => {
-        const meta = tr.getMeta(reviewKey) as { hover: SuggestRange | null } | undefined;
-        if (meta) return { hover: meta.hover, ...buildReviewState(newState, meta.hover, onResolved) };
-        // Keep the hovered range valid across doc changes (a collaborator's edit
-        // before it shifts positions) — map it, dropping it if it collapses — then
-        // rebuild (suggestion blocks may have appeared / vanished).
+        const meta = tr.getMeta(reviewKey) as
+          | { bumpAuthors?: boolean; hover?: SuggestRange | null }
+          | undefined;
+        if (meta?.bumpAuthors) {
+          const authorsVersion = value.authorsVersion + 1;
+          return {
+            authorsVersion,
+            ...composeReview(
+              newState,
+              buildReviewState(newState, onResolved, resolveAuthor, authorsVersion),
+              value.hover,
+              onResolved,
+            ),
+          };
+        }
+        if (meta && 'hover' in meta) {
+          // Pointer move: recompose over the cached base — no doc walk.
+          return {
+            authorsVersion: value.authorsVersion,
+            ...composeReview(newState, { ...value, decorations: value.base }, meta.hover ?? null, onResolved),
+          };
+        }
         if (tr.docChanged) {
-          let hover = value.hover;
-          if (hover) {
-            const from = tr.mapping.map(hover.from);
-            const to = tr.mapping.map(hover.to);
-            hover = from < to ? { from, to } : null;
+          // Plain typing in a suggestion-free doc: the rebuild below walks the
+          // WHOLE doc, O(doc) per keystroke. A suggestion can only APPEAR
+          // inside the edit, so with a provably empty state (nothing that
+          // could go position-stale), probe just the changed blocks
+          // (O(change)) and keep that empty state as-is.
+          if (
+            !value.hasSuggestions
+            && value.base === DecorationSet.empty
+            && value.groups.length === 0
+            && value.blocks.length === 0
+          ) {
+            const span = changedBlockSpan(tr);
+            if (span && suggestionIdsInRange(newState, span.from, span.to).length === 0) {
+              return value;
+            }
           }
-          return { hover, ...buildReviewState(newState, hover, onResolved) };
+          // Keep the hovered run valid across doc changes (a collaborator's
+          // edit before it shifts positions): map it, then let composeReview
+          // snap it onto a surviving run or drop it.
+          const mapped = value.hover
+            ? { from: tr.mapping.map(value.hover.from), to: tr.mapping.map(value.hover.to) }
+            : null;
+          return {
+            authorsVersion: value.authorsVersion,
+            ...composeReview(
+              newState,
+              buildReviewState(newState, onResolved, resolveAuthor, value.authorsVersion),
+              mapped && mapped.from < mapped.to ? mapped : null,
+              onResolved,
+            ),
+          };
         }
         // Selection / remote-cursor / awareness / IME tick: reuse the cached set
         // for free — this is what keeps a long single-file session from freezing.
@@ -939,48 +1384,116 @@ function suggestionReviewPlugin(onResolved?: SuggestionChangesOptions['onResolve
       },
     },
     view(editorView) {
-      // Reveal the inline ✓/✕ for the change-group under the pointer. Owned as a
-      // real DOM listener (not handleDOMEvents) so a HIDE can be DELAYED: the
-      // control is an overlay dropped below the run, so moving the pointer onto
-      // it crosses a gap that's over neither the run nor the button — without a
-      // grace period the control would vanish before the click lands. Re-entering
-      // a mark or the control cancels the pending hide. Doc only scanned when
-      // actually over a mark, so the per-pixel cost stays near zero.
+      // The gutter control belongs to the LINE under the pointer, not to every
+      // suggestion-bearing line at once (a fully-suggested document was a wall
+      // of ✓/✕). Toggled as a plain class on the widget's DOM instead of through
+      // plugin state: a rebuild per pointer move would re-walk the doc on every
+      // pixel, and the class survives until the next move anyway.
+      //
+      // Resolved from posAtCoords, not from event.target: the controls live in
+      // the editor's right padding lane, which is outside every block's box —
+      // a target-based hit test would drop the hover the moment the pointer
+      // left the text and the control would vanish before it could be clicked.
+      let hoveredGutter: HTMLElement | null = null;
+      const setGutterHover = (next: HTMLElement | null) => {
+        if (hoveredGutter === next) return;
+        hoveredGutter?.classList.remove('is-hovered');
+        next?.classList.add('is-hovered');
+        hoveredGutter = next;
+      };
+      // Where the content column ends, i.e. where the reserved gutter lane
+      // starts. Cached: measuring it needs getBoundingClientRect +
+      // getComputedStyle, and doing that per pointer pixel forces a style/layout
+      // recalc on exactly the documents this plugin is careful not to stall.
+      // Refreshed on view updates (typing, resize, file switch) — far rarer than
+      // mousemove, and the lane only moves when the layout does.
+      let contentRight = 0;
+      const measureContentRight = () => {
+        const box = editorView.dom.getBoundingClientRect();
+        const padRight = parseFloat(getComputedStyle(editorView.dom).paddingRight) || 0;
+        contentRight = box.right - padRight - 1;
+      };
+      const gutterOfPos = (pos: number): HTMLElement | null => {
+        const dom = editorView.domAtPos(pos).node;
+        let el: HTMLElement | null = dom.nodeType === 1 ? (dom as HTMLElement) : dom.parentElement;
+        // Climb to the nearest ancestor that OWNS a control (the widget is a
+        // direct child of its textblock) — never a query from the top, which
+        // would hand every list item the first item's control. A children scan,
+        // not querySelector: this runs per pointer move.
+        for (; el && el !== editorView.dom; el = el.parentElement) {
+          for (const child of el.children) {
+            if (child.classList.contains('suggestion-gutter')) return child as HTMLElement;
+          }
+        }
+        return null;
+      };
+      // Word-level pair: HIDE is delayed. The pair is an overlay dropped below
+      // the hovered run, so travelling to it crosses ground that is over
+      // neither the run nor the pair — without a grace period the buttons
+      // would vanish before the click lands. Re-entering a mark or the pair
+      // cancels the pending hide.
       let hideTimer: ReturnType<typeof setTimeout> | null = null;
       const clearHide = () => { if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; } };
-      const setHover = (group: SuggestRange | null) => {
-        const cur = reviewKey.getState(editorView.state)?.hover ?? null;
-        if (group?.from !== cur?.from || group?.to !== cur?.to) {
-          editorView.dispatch(editorView.state.tr.setMeta(reviewKey, { hover: group }));
-        }
-      };
       const onMove = (event: MouseEvent) => {
-        const el = event.target as HTMLElement | null;
-        if (el?.closest?.('.suggestion-inline-review')) { clearHide(); return; } // on the control → hold
-        const onMark = el?.closest?.('[data-suggestion]');
-        if (onMark) {
-          clearHide();
-          const at = editorView.posAtCoords({ left: event.clientX, top: event.clientY });
-          setHover(at ? changeGroups(editorView.state).find((g) => at.pos >= g.from && at.pos <= g.to) ?? null : null);
+        // Cached flag, no doc walk: nothing to reveal on a clean document.
+        if (!reviewKey.getState(editorView.state)?.hasSuggestions) {
+          setGutterHover(null);
           return;
         }
-        if (!hideTimer && reviewKey.getState(editorView.state)?.hover) {
-          hideTimer = setTimeout(() => { hideTimer = null; setHover(null); }, 320);
+        const el = event.target as HTMLElement | null;
+        // Hit test clamped into the content column: the gutter sits in the
+        // editor's reserved right padding, outside every block's box, so the
+        // raw position there resolves to nothing and the control would vanish
+        // exactly as the pointer travelled to it.
+        // Self-heal a measure taken before layout (or missed between updates):
+        // an unmeasured lane would clamp every probe to the left edge.
+        if (contentRight <= 0) measureContentRight();
+        const at = editorView.posAtCoords({
+          left: Math.min(event.clientX, contentRight),
+          top: event.clientY,
+        });
+        setGutterHover(
+          (el?.closest?.('.suggestion-gutter') as HTMLElement | null) ?? (at ? gutterOfPos(at.pos) : null),
+        );
+        // Word-level pair: over the pair itself → hold; over a suggestion mark
+        // (the changed text, not just its line) → reveal that run's pair;
+        // anywhere else → delayed hide.
+        if (el?.closest?.('.suggestion-inline-review')) { clearHide(); return; }
+        if (el?.closest?.('[data-suggestion]') && at) {
+          clearHide();
+          setSuggestionRunHover(editorView, at.pos);
+        } else if (!hideTimer && reviewKey.getState(editorView.state)?.hover) {
+          hideTimer = setTimeout(() => { hideTimer = null; setSuggestionRunHover(editorView, null); }, 320);
         }
       };
+      const onLeave = () => {
+        setGutterHover(null);
+        clearHide();
+        setSuggestionRunHover(editorView, null);
+      };
       editorView.dom.addEventListener('mousemove', onMove);
-      // Flag live suggestions so CSS can drop the content-visibility scroll
-      // optimization while they're under review, and reserve the review gutter on
-      // read-only editors. The live editor reserves that gutter permanently
+      editorView.dom.addEventListener('mouseleave', onLeave);
+      // A resize moves the lane without producing a transaction, so `sync`
+      // never runs — re-measure here or the clamp lands mid-text afterwards.
+      window.addEventListener('resize', measureContentRight);
+      // Flag live suggestions so CSS reserves the review gutter on read-only
+      // editors. The live editor reserves that gutter permanently
       // regardless of this class (see globals.css), so toggling it never reflows
       // the doc mid-typing. Reads the cached flag (no doc walk) so it's free on
       // every view update.
-      const sync = () =>
+      const sync = () => {
         editorView.dom.classList.toggle('has-suggestions', reviewKey.getState(editorView.state)?.hasSuggestions ?? false);
+        measureContentRight();
+      };
       sync();
       return {
         update: sync,
-        destroy() { editorView.dom.removeEventListener('mousemove', onMove); clearHide(); },
+        destroy() {
+          editorView.dom.removeEventListener('mousemove', onMove);
+          editorView.dom.removeEventListener('mouseleave', onLeave);
+          window.removeEventListener('resize', measureContentRight);
+          clearHide();
+        },
       };
     },
     props: {
@@ -1229,15 +1742,30 @@ function deletionGuardPlugin() {
       // instead. The dispatch is wrapped by withSuggestChanges, so in suggest
       // mode it still becomes a green insertion; in edit mode it's plain text.
       // The `allow` meta exempts this relocated insert from the filter below.
-      handleTextInput(view, from, _to, text) {
+      handleTextInput(view, from, to, text) {
         const id = insideDeletion(view.state, from);
-        if (id == null) return false;
-        const end = deletionRunEnd(view.state, from, id);
-        const tr = view.state.tr.insertText(text, end);
-        tr.setSelection(TextSelection.create(tr.doc, end + text.length));
-        tr.setMeta(deletionGuardKey, { allow: true });
-        view.dispatch(tr);
-        return true;
+        if (id != null) {
+          const end = deletionRunEnd(view.state, from, id);
+          const tr = view.state.tr.insertText(text, end);
+          tr.setSelection(TextSelection.create(tr.doc, end + text.length));
+          tr.setMeta(deletionGuardKey, { allow: true });
+          view.dispatch(tr);
+          return true;
+        }
+        // Caret at a struck run's boundary — its START is right where delete
+        // leaves the caret: claim the keystroke and insert at the caret
+        // ourselves. Left to the browser, Chrome's native insertion at the
+        // boundary can get re-read as a change spanning into the strike and
+        // ProseMirror reverts it — typed text silently vanished ("can't type
+        // right after deleting").
+        if (from === to && (deletionAt(view.state, from, 1) != null || deletionAt(view.state, from, -1) != null)) {
+          const tr = view.state.tr.insertText(text, from);
+          tr.setSelection(TextSelection.create(tr.doc, from + text.length));
+          tr.setMeta(deletionGuardKey, { allow: true });
+          view.dispatch(tr);
+          return true;
+        }
+        return false;
       },
       // Selection endpoints never rest STRICTLY inside a struck run — each is
       // snapped to the nearer run boundary. For a click (empty selection) the
@@ -1311,7 +1839,16 @@ export const SuggestionChanges = Extension.create<SuggestionChangesOptions>({
   addProseMirrorPlugins() {
     return this.options.canResolve === false
       ? [suggestChanges(), deletionGuardPlugin()]
-      : [suggestChanges(), suggestionReviewPlugin(this.options.onResolved), deletionGuardPlugin()];
+      : [
+          suggestChanges(),
+          // Read through `this.options` at call time, not captured: the editor
+          // updates the option when attribution arrives (see refreshSuggestionReview).
+          suggestionReviewPlugin(
+            (ids, action) => this.options.onResolved?.(ids, action),
+            (ids) => this.options.resolveAuthor?.(ids) ?? null,
+          ),
+          deletionGuardPlugin(),
+        ];
   },
 
   addKeyboardShortcuts() {
@@ -1381,7 +1918,7 @@ export const SuggestionChanges = Extension.create<SuggestionChangesOptions>({
       rejectSuggestion:
         (id: SuggestionId) =>
         ({ state, dispatch }: CommandProps) => {
-          const changed = resolveSuggestionId(id, false)(state, dispatch);
+          const changed = resolveSuggestionId(id, false, (outcome) => this.options.onCascade?.(outcome))(state, dispatch);
           if (changed && dispatch) this.options.onResolved?.([id], 'reject');
           return changed;
         },

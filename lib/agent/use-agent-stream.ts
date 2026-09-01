@@ -30,9 +30,23 @@ import type { UIMessageChunk } from 'ai';
  */
 export function repairResumedPartBoundaries(
   source: ReadableStream<UIMessageChunk>,
+  opts?: {
+    /** Cold mid-stream attaches only (evicted replay prefix): drop tool
+     *  outputs whose input frames are gone — the client has no invocation to
+     *  attach them to and the SDK rejects them. An HONORED resume must keep
+     *  them: the client already holds the tool part from before the drop. */
+    dropOrphanToolOutputs?: boolean;
+    /** The run's persisted assistant message id, for a cold mid-stream attach
+     *  whose evicted prefix carried the stream's `start` chunk. Without it
+     *  useChat mints its own id for the tail, and the history reconcile —
+     *  which merges by id — can't replace that bubble with the canonical row,
+     *  leaving a duplicate/truncated assistant message. */
+    startMessageId?: string;
+  },
 ): ReadableStream<UIMessageChunk> {
   const started = { text: new Set<string>(), reasoning: new Set<string>() };
   const startedTools = new Set<string>();
+  let sentStart = false;
   const ensureStarted = (
     kind: 'text' | 'reasoning',
     id: string,
@@ -46,6 +60,15 @@ export function repairResumedPartBoundaries(
     new TransformStream<UIMessageChunk, UIMessageChunk>({
       transform(chunk, controller) {
         const c = chunk as { type?: string; id?: unknown; toolCallId?: unknown };
+        // Re-open the message under its PERSISTED id. The tail's own `start`
+        // was evicted, so this is the stream's first chunk either way; if one
+        // did survive, it wins (`sentStart` blocks a second).
+        if (!sentStart) {
+          sentStart = true;
+          if (opts?.startMessageId && c.type !== 'start') {
+            controller.enqueue({ type: 'start', messageId: opts.startMessageId } as UIMessageChunk);
+          }
+        }
         const id = typeof c.id === 'string' ? c.id : null;
         if (id) {
           if (c.type === 'text-start') started.text.add(id);
@@ -57,11 +80,34 @@ export function repairResumedPartBoundaries(
         if (toolCallId) {
           if (c.type === 'tool-input-start' || c.type === 'tool-input-available') startedTools.add(toolCallId);
           else if (c.type === 'tool-input-delta' && !startedTools.has(toolCallId)) return; // drop orphan
+          else if (
+            opts?.dropOrphanToolOutputs &&
+            (c.type === 'tool-output-available' || c.type === 'tool-output-error') &&
+            !startedTools.has(toolCallId)
+          ) {
+            // A cold mid-stream attach (evicted replay prefix) can open on a
+            // tool OUTPUT whose input frames are gone — the SDK rejects it
+            // with "No tool invocation found". Drop it; persisted rows carry
+            // the full tool trace for the reconcile.
+            return;
+          }
         }
         controller.enqueue(chunk);
       },
     }),
   );
+}
+
+/** A deploy checkpointed this turn: the brain flags the finish chunk because a
+ *  healthy machine is already resuming it under a FRESH stream id. The turn is
+ *  therefore not over, and the resume cursor must survive — a dropped cursor
+ *  makes the next `reconnectToStream` read the chat as idle and return null in
+ *  silence, so nothing would ever signal gone-recovery and the client would sit
+ *  on the truncated bubble until a manual reload. Keeping it routes the client
+ *  onto the resumed leg through the same recovery path a severed stream uses. */
+export function isResumePending(chunk: unknown): boolean {
+  const meta = (chunk as { messageMetadata?: { resume_pending?: unknown } } | null)?.messageMetadata;
+  return meta?.resume_pending === true;
 }
 
 /**
@@ -84,8 +130,14 @@ export function sseBodyToChunks(
   // drop the resume cursor for THIS stream's chat (keyed correctly, unlike a
   // useChat onFinish closure whose chat id can drift after a switch), so a
   // completed chat doesn't keep an offset that a later idle reconnect would
-  // read as a severed tail.
+  // read as a severed tail. A `resume_pending` finish is deliberately NOT
+  // terminal — see isResumePending.
   onTerminalFinish?: () => void,
+  // Fires exactly once when this reader is done for ANY reason — clean end of
+  // body, error, abort, or consumer cancel. The transport uses it to release the
+  // chat's "a reader is attached" mark that keeps a resume from opening a
+  // second, concurrent reader on the same stream.
+  onClosed?: () => void,
 ): ReadableStream<UIMessageChunk> {
   const decoder = new TextDecoder();
   const reader = body.getReader();
@@ -118,7 +170,9 @@ export function sseBodyToChunks(
               try {
                 const chunk = JSON.parse(payload) as UIMessageChunk;
                 controller.enqueue(chunk);
-                if ((chunk as { type?: unknown }).type === 'finish') onTerminalFinish?.();
+                if ((chunk as { type?: unknown }).type === 'finish' && !isResumePending(chunk)) {
+                  onTerminalFinish?.();
+                }
               } catch {
                 // malformed frame — skip and keep going
               }
@@ -127,6 +181,8 @@ export function sseBodyToChunks(
           controller.close();
         } catch (err) {
           controller.error(err);
+        } finally {
+          onClosed?.();
         }
       })();
     },

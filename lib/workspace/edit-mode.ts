@@ -38,16 +38,16 @@ export function coerceEditMode(
 }
 
 export const EDIT_MODE_LABEL: Record<WorkspaceEditMode, string> = {
-  edit: 'Editing',
-  suggest: 'Suggesting',
-  view: 'Viewing',
+  edit: 'Edit',
+  suggest: 'Suggest',
+  view: 'View',
 };
 
-/** Tooltip / menu copy, e.g. "Editing mode" — matches the Google Docs control. */
+/** Tooltip / menu copy, e.g. "Edit mode". */
 export const EDIT_MODE_TOOLTIP: Record<WorkspaceEditMode, string> = {
-  edit: 'Editing mode',
-  suggest: 'Suggesting mode',
-  view: 'Viewing mode',
+  edit: 'Edit mode',
+  suggest: 'Suggest mode',
+  view: 'View mode',
 };
 
 const STORAGE_PREFIX = 'sundial:edit-mode';

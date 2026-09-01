@@ -1,8 +1,9 @@
 'use client';
 
-import { useMemo, useState, useEffect, useRef } from 'react';
+import { useMemo, useState, useEffect, useRef, useSyncExternalStore } from 'react';
 import dynamic from 'next/dynamic';
 import { EditorSkeleton } from './editor-skeleton';
+import { THEME_CHANGE_EVENT } from '@/lib/theme';
 
 /* ── Lazy-load Monaco (prevents SSR, code-splits ~1 MB bundle) ──── */
 
@@ -10,6 +11,52 @@ export const MonacoEditor = dynamic(() => import('@monaco-editor/react'), {
   ssr: false,
   loading: () => <EditorSkeleton variant="code" className="h-full min-h-[360px]" />,
 });
+
+/** Warm Monaco (the lazy React chunk + the CDN AMD bundle) before the first
+ *  mount, so a code/LaTeX doc's editor download overlaps the Y.Doc sync
+ *  instead of queueing behind it (the mount is gated on `synced`). Idempotent:
+ *  the loader caches its init promise and MonacoEditor reuses it. */
+export function preloadMonaco() {
+  void import('@monaco-editor/react')
+    .then(({ loader }) => loader.init())
+    .catch(() => {});
+}
+
+/* ── App-theme-following Monaco theme ──────────────────────────── */
+
+export const MONACO_DARK_THEME = 'sundial-dark';
+
+// Register via `beforeMount` on every MonacoEditor. vs-dark syntax colors on
+// the app's dark panel surface (globals.css `.dark` --color-white/stone remap)
+// so the editor doesn't float as a lighter slab on the dark chrome.
+export function defineMonacoThemes(monaco: typeof import('monaco-editor')) {
+  monaco.editor.defineTheme(MONACO_DARK_THEME, {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [],
+    colors: {
+      'editor.background': '#23201d',
+      'editorGutter.background': '#23201d',
+      'editorLineNumber.foreground': '#8a8175',
+      'editorLineNumber.activeForeground': '#bcb3a4',
+      'editorWidget.background': '#2a2723',
+      'editorWidget.border': '#3d3831',
+      'editorIndentGuide.background1': '#38342e',
+    },
+  });
+}
+
+const subscribeToTheme = (onChange: () => void) => {
+  window.addEventListener(THEME_CHANGE_EVENT, onChange);
+  return () => window.removeEventListener(THEME_CHANGE_EVENT, onChange);
+};
+const getMonacoTheme = () =>
+  document.documentElement.classList.contains('dark') ? MONACO_DARK_THEME : 'vs';
+
+/** Monaco theme name tracking the app's resolved light/dark mode, live. */
+export function useMonacoTheme(): string {
+  return useSyncExternalStore(subscribeToTheme, getMonacoTheme, () => 'vs');
+}
 
 export const CODE_EDITOR_SURFACE_CLASS =
   'overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_1px_2px_rgba(28,25,23,0.05)]';
@@ -157,7 +204,7 @@ export function getLanguageLabel(path: string): string {
   return LANGUAGE_LABELS[lang] ?? lang;
 }
 
-export function getCodeEditorOptions(readOnly: boolean, lineCount: number) {
+export function getCodeEditorOptions(readOnly: boolean) {
   return {
     readOnly,
     domReadOnly: readOnly,
@@ -188,6 +235,10 @@ export function getCodeEditorOptions(readOnly: boolean, lineCount: number) {
     renderWhitespace: 'none' as const,
     quickSuggestions: !readOnly,
     suggestOnTriggerCharacters: !readOnly,
+    // Ghost-text AI completions ride Monaco's inline-suggest channel, which is
+    // separate from the suggest widget above; never offer them in a read-only
+    // surface, where there is nothing to accept into.
+    inlineSuggest: { enabled: !readOnly },
     acceptSuggestionOnEnter: readOnly ? ('off' as const) : ('on' as const),
     tabCompletion: readOnly ? ('off' as const) : ('on' as const),
     parameterHints: { enabled: !readOnly },
@@ -220,6 +271,7 @@ interface CodeViewerProps {
 export function CodeViewer({ filePath, value, workspaceId, className, height }: CodeViewerProps) {
   const [fetchedContent, setFetchedContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const monacoTheme = useMonacoTheme();
   const language = useMemo(() => getCodeLanguage(filePath), [filePath]);
   const containerRef = useRef<HTMLDivElement>(null);
   const [editorHeight, setEditorHeight] = useState<number>(500);
@@ -314,8 +366,9 @@ export function CodeViewer({ filePath, value, workspaceId, className, height }: 
         height={height ?? editorHeight}
         language={language}
         value={content}
-        theme="vs"
-        options={getCodeEditorOptions(true, content.split('\n').length)}
+        theme={monacoTheme}
+        beforeMount={defineMonacoThemes}
+        options={getCodeEditorOptions(true)}
       />
     </div>
   );

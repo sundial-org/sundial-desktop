@@ -5,7 +5,12 @@ import { buildWorkspacePath } from '@/lib/workspace/paths';
 import type { ConnectedAppSummary } from '@/lib/composio/types';
 import type { ChatStatus } from './workspace-chat-model';
 
-type WorkspaceRouteId = string | { id: string; public_id: string | null };
+import type { WorkspaceRouteInput } from '@/lib/workspace/public-ids';
+
+// The page's own route id, `local` flag included — these hooks forward it
+// straight to buildWorkspacePath, which is what keeps a local project's
+// links and redirects off the cloud `/w/` route.
+type WorkspaceRouteId = WorkspaceRouteInput;
 type SearchParamsLike = {
   get(name: string): string | null;
   toString(): string;

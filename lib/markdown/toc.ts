@@ -4,6 +4,8 @@
 // each entry matches the Nth heading element in the rendered `.tiptap` doc, so
 // the sidebar can scroll to it without anchors/ids.
 
+import { frontmatterCloseIndex } from "./normalize.mjs";
+
 export type TocHeading = {
   /** 1–6 */
   level: number;
@@ -32,7 +34,13 @@ function stripInline(text: string): string {
 export function extractMarkdownHeadings(markdown: string): TocHeading[] {
   const out: TocHeading[] = [];
   let inFence = false;
-  for (const rawLine of (markdown ?? "").split("\n")) {
+  // CRLF-normalize before splitting (matching normalizeMarkdownForRendering):
+  // a trailing `\r` would defeat frontmatterCloseIndex's exact `---` match.
+  const lines = (markdown ?? "").replace(/\r\n?/g, "\n").split("\n");
+  // Skip YAML frontmatter: its lines are data (a `# comment` is a YAML
+  // comment, not a heading), and the editor renders the block as a single
+  // non-heading node — counting it would misalign index ↔ Nth heading.
+  for (const rawLine of lines.slice(frontmatterCloseIndex(lines) + 1)) {
     if (FENCE.test(rawLine)) {
       inFence = !inFence;
       continue;

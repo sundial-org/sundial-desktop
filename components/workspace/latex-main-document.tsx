@@ -2,6 +2,11 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import type { LatexRootReason } from '@/lib/workspace/latex-root';
+import { fetchWithDeadline, READ_DEADLINE_MS } from '@/lib/workspace/fetch-deadline';
+
+/** Retries for a resolver call that failed or never answered — a single bad
+ *  answer must not leave `resolved` false forever. */
+const RESOLVE_ATTEMPTS = 3;
 
 export interface LatexMainDocumentState {
   /** Resolved compile target, or null when ambiguous/none. */
@@ -9,10 +14,12 @@ export interface LatexMainDocumentState {
   reason: LatexRootReason;
   /** `.tex` files containing `\documentclass` — useful for diagnostics. */
   candidates: string[];
-  loading: boolean;
   /** True once the server resolver has answered at least once — the initial
    *  `none` state is "not resolved yet", not "the project has no root". */
   resolved: boolean;
+  /** True when every resolve attempt failed — the toolbar must say so rather
+   *  than sit silent with a dead Compile button. */
+  unreachable: boolean;
 }
 
 /**
@@ -26,10 +33,24 @@ export interface LatexMainDocumentState {
  * `ambiguous` stays blocked (spec §3.2).
  */
 export function latexCompileTarget(
-  state: Pick<LatexMainDocumentState, 'root' | 'reason' | 'resolved'>,
+  state: Pick<LatexMainDocumentState, 'root' | 'reason' | 'resolved'> & Partial<Pick<LatexMainDocumentState, 'candidates'>>,
   activeTexPath: string | null,
+  /** A root the user is navigating diagnostics of — keeps winning while it is
+   *  still a candidate (opening an included child must not re-target to an
+   *  `ambiguous`/`nearest`-resolved other root mid-navigation). An explicit
+   *  `% !TEX root` magic comment still outranks it. */
+  pinnedRoot: string | null = null,
 ): string | null {
-  return state.root ?? (state.resolved && state.reason === 'none' ? activeTexPath : null);
+  // `none` names no candidates at all, and it is the very state whose
+  // active-file fallback made `pinnedRoot` the compile root — without this the
+  // click that opens a child would silently re-target the compile to that
+  // child and compile the fragment standalone ("Missing \begin{document}").
+  if (pinnedRoot && state.reason !== 'magic') {
+    if (state.reason === 'none' || state.candidates?.includes(pinnedRoot)) return pinnedRoot;
+  }
+  if (state.root) return state.root;
+  if (state.resolved && state.reason === 'none') return activeTexPath;
+  return null;
 }
 
 /**
@@ -50,17 +71,20 @@ export function useLatexMainDocument(args: {
   fetchImpl?: typeof fetch;
 }): LatexMainDocumentState {
   const { projectId, activeFile, texFileSignature, enabled, fetchImpl = fetch } = args;
-  const [state, setState] = useState<Omit<LatexMainDocumentState, 'loading'>>({
+  const [state, setState] = useState<LatexMainDocumentState>({
     root: null,
     reason: 'none',
     candidates: [],
     resolved: false,
+    unreachable: false,
   });
-  const [loading, setLoading] = useState(false);
 
-  const refetch = useCallback(async () => {
-    if (!enabled || !projectId) return;
-    setLoading(true);
+  /** Resolves true when the state now holds a completed resolution — false
+   *  means "ask again", never "this project has no root". `live` gates the
+   *  post-await write: a slow answer for a previous activeFile must not
+   *  clobber the current file's resolution. */
+  const refetch = useCallback(async (live: () => boolean): Promise<boolean> => {
+    if (!enabled || !projectId) return true;
     // A previous no-root answer is stale for the new file set / active file:
     // clear `resolved` so the compile-target fallback waits for this fetch
     // instead of pointing at whatever .tex just opened. The last-known `root`
@@ -69,23 +93,46 @@ export function useLatexMainDocument(args: {
     try {
       const params = new URLSearchParams({ projectId });
       if (activeFile) params.set('activeFile', activeFile);
-      const res = await fetchImpl(`/api/workspace/latex-root?${params}`, { credentials: 'include' });
-      if (!res.ok) return;
+      const res = await fetchWithDeadline(
+        fetchImpl,
+        `/api/workspace/latex-root?${params}`,
+        { credentials: 'include' },
+        READ_DEADLINE_MS,
+      );
+      if (!res.ok) return false;
       const data = (await res.json()) as { root: string | null; reason: LatexRootReason; candidates: string[] };
-      setState({ root: data.root ?? null, reason: data.reason, candidates: data.candidates ?? [], resolved: true });
+      if (!live()) return true;
+      setState({ root: data.root ?? null, reason: data.reason, candidates: data.candidates ?? [], resolved: true, unreachable: false });
+      return true;
     } catch {
       // Leave the last good resolution in place; compile can continue using it.
-    } finally {
-      setLoading(false);
+      return false;
     }
   }, [enabled, projectId, activeFile, fetchImpl]);
 
-  // Refetch when the project's .tex set or the active file changes.
+  // Refetch when the project's .tex set or the active file changes, retrying a
+  // failed/timed-out resolver call with backoff — a cold open is exactly when
+  // the sidecar is slowest, and that must not be a permanent "no root".
   useEffect(() => {
-    void refetch();
-    // texFileSignature/activeFile drive refetch; refetch closes over both.
+    let cancelled = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const attempt = async (n: number) => {
+      const resolved = await refetch(() => !cancelled);
+      if (resolved || cancelled) return;
+      if (n + 1 >= RESOLVE_ATTEMPTS) {
+        setState((s) => ({ ...s, unreachable: true }));
+        return;
+      }
+      retry = setTimeout(() => void attempt(n + 1), 1_000 * 2 ** n);
+    };
+    void attempt(0);
+    return () => {
+      cancelled = true;
+      clearTimeout(retry);
+    };
+    // texFileSignature drives refetch indirectly; the rest are refetch's deps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, projectId, activeFile, texFileSignature]);
+  }, [enabled, projectId, activeFile, texFileSignature, fetchImpl]);
 
-  return { ...state, loading };
+  return state;
 }

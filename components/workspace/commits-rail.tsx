@@ -49,6 +49,15 @@ function dirtyLabel(code: string) {
 // files doesn't render thousands of checkboxes and jank the rail.
 const DIRTY_RENDER_CAP = 100;
 
+function relativeTime(iso: string | null): string {
+  if (!iso) return 'not yet';
+  const seconds = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+  if (seconds < 60) return 'just now';
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
+
 type Commit = {
   sha: string;
   author_name: string;
@@ -108,6 +117,13 @@ export function CommitsRail({
     () => repos.find((r) => r.id === selectedRepoId) ?? null,
     [repos, selectedRepoId],
   );
+  // Auto-sync: the bridge worker owns pull/commit/push; the rail shows sync
+  // state instead of manual git controls.
+  const isAuto = selectedRepo?.mode === 'auto';
+  // Live socket-level Overleaf sync: no git rail at all — no commits, no
+  // tokens, no manual sync. Fetching commits here would resolve legacy git
+  // auth and error with "No Overleaf token available".
+  const isLive = selectedRepo?.bridgeState?.transport === 'live';
 
   useEffect(() => {
     // Select the first repo when nothing is selected, and recover when the
@@ -119,8 +135,9 @@ export function CommitsRail({
   }, [repos, selectedRepoId]);
 
   const fetchCommits = useCallback(async () => {
-    if (!selectedRepo) {
+    if (!selectedRepo || selectedRepo.bridgeState?.transport === 'live') {
       setCommits([]);
+      setError(null);
       return;
     }
     setLoading(true);
@@ -151,7 +168,9 @@ export function CommitsRail({
 
   const statusInFlight = useRef(false);
   const fetchStatus = useCallback(async () => {
-    if (!selectedRepo) {
+    if (!selectedRepo || selectedRepo.mode === 'auto') {
+      // Auto repos don't show the dirty/commit surface, and polling `status`
+      // would boot the sandbox for a tree the bridge worker owns anyway.
       setDirty([]);
       return;
     }
@@ -206,6 +225,88 @@ export function CommitsRail({
     }, 30_000);
     return () => clearInterval(timer);
   }, [fetchStatus, collapsed]);
+
+  // Auto repos: refresh commits + bridge state (via the host's refetch) on the
+  // same cadence, so the chip and log track the background loop.
+  useEffect(() => {
+    if (collapsed || !isAuto) return;
+    const timer = setInterval(() => {
+      void fetchCommits();
+      onActionComplete();
+    }, 30_000);
+    return () => clearInterval(timer);
+  }, [collapsed, isAuto, fetchCommits, onActionComplete]);
+
+  const setMode = useCallback(
+    async (mode: 'manual' | 'auto') => {
+      if (!selectedRepo) return;
+      setActionInFlight('mode');
+      setError(null);
+      try {
+        const response = await fetch(`/api/workspace/bridges/${selectedRepo.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ projectId, mode }),
+        });
+        const body = (await response.json().catch(() => null)) as { error?: string } | null;
+        if (!response.ok) throw new Error(body?.error ?? `Failed (${response.status})`);
+        onActionComplete();
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : 'Failed to change sync mode');
+      } finally {
+        setActionInFlight(null);
+      }
+    },
+    [projectId, selectedRepo, onActionComplete],
+  );
+
+  const syncNow = useCallback(async () => {
+    if (!selectedRepo) return;
+    setActionInFlight('sync_now');
+    setError(null);
+    try {
+      const response = await fetch(`/api/workspace/bridges/${selectedRepo.id}/poke`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ projectId }),
+      });
+      const body = (await response.json().catch(() => null)) as { error?: string } | null;
+      if (!response.ok) throw new Error(body?.error ?? `Failed (${response.status})`);
+      await fetchCommits();
+      onActionComplete();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Sync failed');
+    } finally {
+      setActionInFlight(null);
+    }
+  }, [projectId, selectedRepo, fetchCommits, onActionComplete]);
+
+  const resolveConflict = useCallback(
+    async (resolution: 'keep_local' | 'keep_remote') => {
+      if (!selectedRepo) return;
+      setActionInFlight(`resolve_${resolution}`);
+      setError(null);
+      try {
+        const response = await fetch(`/api/workspace/bridges/${selectedRepo.id}/resolve`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ projectId, resolution }),
+        });
+        const body = (await response.json().catch(() => null)) as { error?: string } | null;
+        if (!response.ok) throw new Error(body?.error ?? `Failed (${response.status})`);
+        await fetchCommits();
+        onActionComplete();
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : 'Failed to resolve conflict');
+      } finally {
+        setActionInFlight(null);
+      }
+    },
+    [projectId, selectedRepo, fetchCommits, onActionComplete],
+  );
 
   const runAction = useCallback(
     async (action: string, extras?: { message?: string; paths?: string[] }) => {
@@ -292,6 +393,7 @@ export function CommitsRail({
         collapsed={collapsed}
         onToggleCollapsed={onToggleCollapsed}
         actions={
+          isLive ? null : (
           <button
             type="button"
             onClick={() => void runAction('fetch')}
@@ -301,6 +403,7 @@ export function CommitsRail({
           >
             <ArrowClockwiseIcon className="h-4 w-4" weight="regular" aria-hidden />
           </button>
+          )
         }
       />
 
@@ -382,7 +485,95 @@ export function CommitsRail({
               </div>
             </div>
           ) : null}
-          {selectedRepo.syncStatus ? (
+          {selectedRepo.provider === 'github' && selectedRepo.importedPath !== '' ? (
+            <label className="flex items-center justify-between rounded-md border border-stone-200 bg-white px-2.5 py-2">
+              <span className="text-[11px] font-medium text-stone-700">Auto-sync</span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={isAuto}
+                aria-label="Auto-sync"
+                disabled={actionInFlight !== null}
+                onClick={() => void setMode(isAuto ? 'manual' : 'auto')}
+                className={`relative h-4.5 w-8 rounded-full transition-colors disabled:opacity-40 ${
+                  isAuto ? 'bg-stone-900' : 'bg-stone-300'
+                }`}
+              >
+                <span
+                  className={`absolute top-0.5 h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                    isAuto ? 'translate-x-4' : 'translate-x-0.5'
+                  }`}
+                />
+              </button>
+            </label>
+          ) : null}
+          {isAuto ? (
+            <>
+              {selectedRepo.bridgeState?.conflict ? (
+                <div className="rounded-md border border-amber-300 bg-amber-50 px-2 py-2 text-[11px] text-amber-800">
+                  <p className="font-medium">Auto-sync paused: changed in both places</p>
+                  <ul className="mt-1 font-mono text-[10px]">
+                    {selectedRepo.bridgeState.conflict.paths.slice(0, 3).map((p) => (
+                      <li key={p} className="truncate">{p}</li>
+                    ))}
+                    {selectedRepo.bridgeState.conflict.paths.length > 3 ? (
+                      <li>…and {selectedRepo.bridgeState.conflict.paths.length - 3} more</li>
+                    ) : null}
+                  </ul>
+                  <div className="mt-1.5 flex gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => void resolveConflict('keep_local')}
+                      disabled={actionInFlight !== null}
+                      className="rounded-md bg-stone-900 px-2 py-1 font-medium text-white hover:bg-stone-800 disabled:opacity-50"
+                    >
+                      {actionInFlight === 'resolve_keep_local' ? 'Keeping…' : 'Keep Sundial version'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void resolveConflict('keep_remote')}
+                      disabled={actionInFlight !== null}
+                      className="rounded-md border border-stone-300 bg-white px-2 py-1 text-stone-700 hover:bg-stone-50 disabled:opacity-50"
+                    >
+                      {actionInFlight === 'resolve_keep_remote' ? 'Keeping…' : 'Keep GitHub version'}
+                    </button>
+                  </div>
+                </div>
+              ) : selectedRepo.bridgeState?.lastError ? (
+                <div className="rounded-md border border-amber-300 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-800">
+                  Sync failing: {selectedRepo.bridgeState.lastError}
+                </div>
+              ) : isLive ? (
+                <div
+                  className="flex items-center gap-1.5 rounded-md border border-stone-200 bg-white px-2.5 py-2 text-[11px] text-stone-500"
+                  data-testid="live-sync-status"
+                >
+                  <span className="relative flex h-2 w-2 shrink-0">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                    <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+                  </span>
+                  Live two-way sync with Overleaf: edits flow both ways within seconds.
+                </div>
+              ) : (
+                <div className="flex items-center gap-1.5 rounded-md border border-stone-200 bg-white px-2.5 py-2 text-[11px] text-stone-500">
+                  <CheckCircleIcon className="h-3.5 w-3.5 text-emerald-600" weight="fill" aria-hidden />
+                  Synced with {selectedRepo.provider === 'github' ? 'GitHub' : 'remote'} · {relativeTime(selectedRepo.bridgeState?.updatedAt ?? null)}
+                </div>
+              )}
+              {isLive ? null : (
+              <button
+                type="button"
+                onClick={() => void syncNow()}
+                disabled={actionInFlight !== null}
+                className="inline-flex w-full items-center justify-center gap-1 rounded-md border border-stone-200 bg-white px-2 py-1.5 text-[11px] text-stone-700 hover:bg-stone-50 disabled:opacity-50"
+              >
+                <ArrowClockwiseIcon className="h-3 w-3" weight="bold" aria-hidden />
+                {actionInFlight === 'sync_now' ? 'Syncing…' : 'Sync now'}
+              </button>
+              )}
+            </>
+          ) : null}
+          {!isAuto && selectedRepo.syncStatus ? (
             <div className="flex items-center gap-1.5 text-[10px]">
               <span
                 className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 ${
@@ -400,15 +591,17 @@ export function CommitsRail({
               </span>
             </div>
           ) : null}
-          {via && !via.isRequester ? (
+          {!isAuto && via && !via.isRequester ? (
             <p className="rounded-md border border-stone-200 bg-white px-2 py-1.5 text-[10px] text-stone-500">
               Showing via{' '}
               <span className="font-medium text-stone-700">
                 {via.login ? `@${via.login}` : 'the linker'}
-              </span>{' '}
-              — the user who linked this repo.
+              </span>
+              , the user who linked this repo.
             </p>
           ) : null}
+          {!isAuto ? (
+          <>
           <div className="grid grid-cols-2 gap-1.5">
             <button
               type="button"
@@ -501,7 +694,7 @@ export function CommitsRail({
           ) : (
             <div className="flex items-center gap-1.5 rounded-md border border-stone-200 bg-white px-2.5 py-2 text-[11px] text-stone-500">
               <CheckCircleIcon className="h-3.5 w-3.5 text-emerald-600" weight="fill" aria-hidden />
-              No local changes — up to date.
+              No local changes. Up to date.
             </div>
           )}
           <div className="flex flex-col gap-1.5">
@@ -533,11 +726,13 @@ export function CommitsRail({
                 : `Commit & push (${dirty.length - excluded.size})`}
             </button>
           </div>
+          </>
+          ) : null}
         </div>
       ) : null}
 
       <div className="px-2 py-2">
-        {loading ? (
+        {isLive ? null : loading ? (
           <Spinner label="Loading commits…" size={13} className="px-2 text-xs" />
         ) : commits.length === 0 ? (
           <p className="px-2 text-xs text-stone-400">No commits yet.</p>

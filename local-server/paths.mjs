@@ -26,11 +26,53 @@ export function resolveInRoot(root, rel) {
   return abs;
 }
 
-/** Policy matcher, with unsafe/empty paths treated as ignored. */
+/** Env-secret files stay local: `.env` and `.env.*` hold credentials, and a
+ *  folder share must never quietly ship them to the cloud (nor clobber the
+ *  local copy with a cloud one). The template shapes people DO want synced
+ *  (`.env.example` and friends) stay eligible. Sidecar-only judgment — the
+ *  shared policy is untouched, so workspace-side .env files (HTTP rail,
+ *  sandbox hydration) keep working exactly as before. */
+export function isEnvSecretPath(rel) {
+  const normalized = normalizeRelPath(rel);
+  if (!normalized) return false;
+  const base = normalized.split('/').pop() ?? '';
+  if (base === '.env') return true;
+  return base.startsWith('.env.') && !/\.(example|sample|template|test)$/.test(base);
+}
+
+/** Why a cloud path cannot be written on a Windows filesystem, or null when
+ *  it can. Used to SKIP such downloads loudly instead of erroring on every
+ *  poll (reserved device names, forbidden characters, trailing dot/space). */
+const WINDOWS_RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+export function windowsUnwritableReason(rel) {
+  const normalized = normalizeRelPath(rel);
+  if (!normalized) return 'unsafe path';
+  for (const segment of normalized.split('/')) {
+    // eslint-disable-next-line no-control-regex
+    if (/[<>:"|?*\u0000-\u001f]/.test(segment)) return `"${segment}" contains characters Windows forbids`;
+    if (WINDOWS_RESERVED_NAMES.test(segment.split('.')[0] ?? '')) return `"${segment}" is a reserved Windows device name`;
+    if (/[. ]$/.test(segment)) return `"${segment}" ends with a dot or space`;
+  }
+  return null;
+}
+
+/** Policy matcher, with unsafe/empty paths treated as ignored. Env-secret
+ *  files are ignored HERE (both sync directions pass through this) on top
+ *  of the shared policy list. */
 export function isIgnoredPath(rel) {
   const normalized = normalizeRelPath(rel);
   if (!normalized) return true;
+  if (isEnvSecretPath(normalized)) return true;
   return policyIsIgnoredPath(normalized);
+}
+
+/** Does one grants-model share scope cover this path? ('chat' scopes never
+ *  cover files; a 'project' scope covers everything.) */
+export function scopeCoversPath(scope, rel) {
+  if (scope.scope_kind === 'chat') return false;
+  if (scope.scope_kind === 'project' || !scope.scope_path) return true;
+  if (scope.scope_kind === 'file') return rel === scope.scope_path;
+  return rel === scope.scope_path || rel.startsWith(`${scope.scope_path}/`);
 }
 
 export function fileKind(rel) {

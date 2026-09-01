@@ -4,7 +4,12 @@ import { createContext, useContext, useEffect, useMemo, useRef, useState } from 
 import { HocuspocusProvider, HocuspocusProviderWebsocket } from '@hocuspocus/provider';
 import * as Y from 'yjs';
 import { fetchWorkspaceHost } from '@/lib/workspace/collab-url';
+import { readAnonCookie, setAnonCookie } from '@/lib/auth/anon-identity-client';
+import { currentPathShareToken } from '@/lib/workspace/path-share-token-client';
 import { useDocumentEditMode } from '@/lib/workspace/document-edit-mode-context';
+import { useAuth } from '@/lib/auth/optional-auth';
+import { documentEditModeStorageKey, readStoredEditMode } from '@/lib/workspace/edit-mode';
+import type { WorkspaceInitialSnapshot } from '@/lib/workspace/route-context';
 
 type HocuspocusWebsocketInternal = HocuspocusProviderWebsocket & {
   configuration: { providerMap: Map<string, HocuspocusProvider> };
@@ -72,7 +77,7 @@ function reauthenticateSocket(socket: HocuspocusProviderWebsocket) {
  *  fileId mismatch we tear the stale room down synchronously and mint a clean
  *  one; same-fileId remounts still reuse, so the StrictMode / tab-switch
  *  optimization is preserved. */
-type CachedProvider = {
+export type CachedProvider = {
   provider: HocuspocusProvider;
   ydoc: Y.Doc;
   refCount: number;
@@ -83,7 +88,22 @@ type CachedProvider = {
   /** Set once torn down so a synchronous replace + a later grace fire (or a
    *  double release) can't destroy the same provider/Y.Doc twice. */
   destroyed: boolean;
+  /** LRU clock for inactive entries. Active providers are never evicted. */
+  lastUsedAt: number;
+  /** True when the Y.Doc can paint before network sync because it was seeded
+   * from a file-id-matched canonical snapshot. Edits stay gated until synced. */
+  bootstrapped: boolean;
 };
+
+export type ProviderBootstrap = {
+  update: Uint8Array;
+};
+
+/** Recently visited tabs stay live long enough for normal document hopping.
+ * Bound both time and count: Y.Docs retain their complete CRDT struct stores,
+ * so an unbounded workspace walk would otherwise grow the tab indefinitely. */
+export const PROVIDER_CACHE_GRACE_MS = 5 * 60_000;
+export const PROVIDER_CACHE_MAX_INACTIVE = 12;
 
 const providerCaches = new WeakMap<
   HocuspocusProviderWebsocket,
@@ -121,11 +141,22 @@ function destroyCachedProvider(
   entry.ydoc.destroy();
 }
 
+function trimInactiveProviders(cache: Map<string, CachedProvider>) {
+  const inactive = [...cache.entries()]
+    .filter(([, entry]) => !entry.destroyed && entry.refCount <= 0)
+    .sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt);
+  while (inactive.length > PROVIDER_CACHE_MAX_INACTIVE) {
+    const [docName, entry] = inactive.shift()!;
+    destroyCachedProvider(cache, docName, entry);
+  }
+}
+
 export function acquireProvider(
   socket: HocuspocusProviderWebsocket,
   docName: string,
   fileId: string,
   token: string | (() => Promise<string>) | undefined,
+  bootstrap?: ProviderBootstrap,
 ): CachedProvider {
   const cache = cacheFor(socket);
   const existing = cache.get(docName);
@@ -134,9 +165,14 @@ export function acquireProvider(
       // Same file remounting (StrictMode, tab switch, conditional render) —
       // reuse the live provider and cancel any pending teardown.
       existing.refCount += 1;
+      existing.lastUsedAt = Date.now();
       if (existing.graceTimer) {
         clearTimeout(existing.graceTimer);
         existing.graceTimer = null;
+      }
+      if (bootstrap && !existing.bootstrapped) {
+        Y.applyUpdate(existing.ydoc, bootstrap.update, 'canonical-bootstrap');
+        existing.bootstrapped = true;
       }
       return existing;
     }
@@ -147,6 +183,7 @@ export function acquireProvider(
     destroyCachedProvider(cache, docName, existing);
   }
   const ydoc = new Y.Doc();
+  if (bootstrap) Y.applyUpdate(ydoc, bootstrap.update, 'canonical-bootstrap');
   const provider = new HocuspocusProvider({
     name: docName,
     document: ydoc,
@@ -161,6 +198,8 @@ export function acquireProvider(
     fileId,
     graceTimer: null,
     destroyed: false,
+    lastUsedAt: Date.now(),
+    bootstrapped: Boolean(bootstrap),
   };
   cache.set(docName, entry);
   return entry;
@@ -178,6 +217,7 @@ export function releaseProvider(
   if (!entry || entry.fileId !== fileId) return;
   entry.refCount -= 1;
   if (entry.refCount > 0) return;
+  entry.lastUsedAt = Date.now();
   // Hold for a short grace period so the common pattern (unmount →
   // remount within the same render tick, or tab switch away + back) just
   // reuses the provider instead of tearing down and re-syncing.
@@ -185,21 +225,67 @@ export function releaseProvider(
     entry.graceTimer = null;
     if (entry.refCount > 0) return;
     destroyCachedProvider(cache, docName, entry);
-  }, 5_000);
+  }, PROVIDER_CACHE_GRACE_MS);
+  trimInactiveProviders(cache);
 }
 
-export type AwarenessPeer = { key: string; name: string; color: string | null };
+/** Intent prefetch used by the file rail. Attaching the real provider starts
+ * the canonical Hocuspocus sync; releasing immediately parks it in the same
+ * bounded LRU the editor uses, so the later click reuses the synced Y.Doc. */
+export function prefetchProvider(
+  socket: HocuspocusProviderWebsocket,
+  docName: string,
+  fileId: string,
+  token: string | (() => Promise<string>) | undefined,
+) {
+  const entry = acquireProvider(socket, docName, fileId, token);
+  releaseProvider(socket, docName, fileId);
+  return entry.provider;
+}
+
+/** Seed and attach the arrival document as soon as the shared socket exists.
+ * The immediate release parks it in the bounded provider cache for the editor
+ * mount, while attach begins live verification in parallel with hydration. */
+export function primeProvider(
+  socket: HocuspocusProviderWebsocket,
+  docName: string,
+  snapshot: WorkspaceInitialSnapshot,
+  token: string | (() => Promise<string>) | undefined,
+) {
+  let update: Uint8Array;
+  try {
+    const binary = atob(snapshot.updateBase64);
+    update = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  } catch {
+    return;
+  }
+  acquireProvider(socket, docName, snapshot.fileId, token, { update });
+  releaseProvider(socket, docName, snapshot.fileId);
+}
+
+export type AwarenessPeer = {
+  key: string;
+  name: string;
+  color: string | null;
+  /** Doc (cache key: `<prefix><path>`) where this peer was seen — the one
+   *  holding their live caret when they have one anywhere. Bubble clicks use
+   *  it to jump to the peer's actual document, not the viewer's. */
+  docName: string | null;
+  /** True when `docName` holds a live caret (`cursor`/`selection` state). */
+  hasCaret: boolean;
+};
 
 /** Remote awareness peers across every live provider on a socket. For local
  *  projects this is the presence source: the sidecar bridge relays cloud
  *  peers' awareness into the local docs, so anyone editing a shared file
  *  shows up here. Deduped by name+color — the same person holds a different
- *  awareness clientID in every doc they have open. */
+ *  awareness clientID in every doc they have open, so the doc that carries
+ *  their caret (over mere membership) names where they actually are. */
 export function collectAwarenessPeers(socket: HocuspocusProviderWebsocket): AwarenessPeer[] {
   const cache = providerCaches.get(socket);
   if (!cache) return [];
   const peers = new Map<string, AwarenessPeer>();
-  for (const entry of cache.values()) {
+  for (const [docName, entry] of cache.entries()) {
     const awareness = entry.destroyed ? null : entry.provider.awareness;
     if (!awareness) continue;
     awareness.getStates().forEach((state, clientId) => {
@@ -209,7 +295,16 @@ export function collectAwarenessPeers(socket: HocuspocusProviderWebsocket): Awar
       if (!name) return;
       const color = typeof user?.color === 'string' ? user.color : null;
       const key = `${name}|${color ?? ''}`;
-      if (!peers.has(key)) peers.set(key, { key, name, color });
+      const hasCaret = Boolean(
+        (state as { cursor?: unknown }).cursor ?? (state as { selection?: unknown }).selection,
+      );
+      const existing = peers.get(key);
+      if (!existing) {
+        peers.set(key, { key, name, color, docName, hasCaret });
+      } else if (hasCaret && !existing.hasCaret) {
+        existing.docName = docName;
+        existing.hasCaret = true;
+      }
     });
   }
   return [...peers.values()];
@@ -240,6 +335,10 @@ export type WorkspaceCollabSocket = {
 };
 
 const Ctx = createContext<WorkspaceCollabSocket | null>(null);
+/** True while a WorkspaceCollabSocketProvider above is still opening its first
+ *  socket — editors hold their own host-fetch fallback instead of firing a
+ *  request the shared socket makes redundant a frame later. */
+const PendingCtx = createContext(false);
 
 const RECONNECT_POLL_INTERVAL_MS = 5_000;
 
@@ -340,9 +439,22 @@ export function createCollabTokenGetter(opts: {
  */
 export function WorkspaceCollabSocketProvider({
   workspaceId,
+  initialHost,
+  initialSnapshot,
   children,
 }: {
   workspaceId: string | null;
+  /** SSR-minted socket credentials (see the workspace layout): the socket
+   *  opens with these immediately, and the host poll takes over refreshing. */
+  initialHost?: {
+    collabUrl: string;
+    token: string;
+    docNamePrefix: string;
+    clerkUserId?: string | null;
+    anonId?: string | null;
+    anonMinted?: boolean;
+  } | null;
+  initialSnapshot?: WorkspaceInitialSnapshot | null;
   children: React.ReactNode;
 }) {
   const [value, setValue] = useState<WorkspaceCollabSocket | null>(null);
@@ -355,6 +467,10 @@ export function WorkspaceCollabSocketProvider({
   editModeRef.current = editMode;
   const socketRef = useRef<HocuspocusProviderWebsocket | null>(null);
   const clearTokenRef = useRef<(() => void) | null>(null);
+  // Clerk uid the ADOPTED SSR token was minted for (undefined = nothing to
+  // verify). Clerk loads asynchronously, so the identity check below runs
+  // once it resolves and re-authenticates in place on mismatch.
+  const ssrClerkUidRef = useRef<string | null | undefined>(undefined);
 
   useEffect(() => {
     if (!workspaceId) {
@@ -383,33 +499,7 @@ export function WorkspaceCollabSocketProvider({
       }, RECONNECT_POLL_INTERVAL_MS);
     };
 
-    const connectOrRefresh = async () => {
-      if (cancelled) return;
-      // Always ensure: the backend short-circuits when the stored URL still
-      // probes healthy, so this only costs a Modal ensure-sandbox call when the host is
-      // actually gone. Previously we only ensured on first connect, which
-      // meant a transient probe failure that wiped host_url left the client
-      // stuck with a dead socket forever.
-      const fetchedMode = hostEditMode();
-      const host = await fetchWorkspaceHost(workspaceId, {
-        ensure: true,
-        editMode: fetchedMode,
-      }).catch(() => null);
-      if (cancelled) return;
-      if (!host) {
-        schedulePoll();
-        return;
-      }
-      // The mode changed while the request was in flight — e.g. a reload that
-      // restores a stored Suggest session (the provider renders `edit` first,
-      // then loads `suggest`), or a quick toggle during a poll. The token was
-      // minted for the old mode; discard and refetch so we never create or
-      // authenticate the socket with a stale mode (the toggle effect's re-auth
-      // can't help here when the socket doesn't exist yet).
-      if (fetchedMode !== hostEditMode()) {
-        void connectOrRefresh();
-        return;
-      }
+    const adoptHost = (host: { collabUrl: string; token: string; docNamePrefix?: string | null }) => {
       setToken(host.token);
       if (host.collabUrl === currentUrl && currentSocket) {
         // URL unchanged — keep existing socket. HocuspocusProviderWebsocket has
@@ -440,9 +530,22 @@ export function WorkspaceCollabSocketProvider({
       currentSocket = nextSocket;
       socketRef.current = nextSocket;
       currentUrl = host.collabUrl;
+      if (initialSnapshot && host.docNamePrefix) {
+        primeProvider(
+          nextSocket,
+          `${host.docNamePrefix}${initialSnapshot.path}`,
+          initialSnapshot,
+          getToken,
+        );
+      }
       versionRef.current += 1;
       setValue({
-        workspaceId,
+        // Publish the RESOLVED id (docNamePrefix carries the UUID): on anon
+        // ?pshare= links the layout only knows the public_id slug, while the
+        // page adopts the UUID from /files — the hook must keep matching the
+        // shared socket after that adoption (a one-off fallback provider
+        // would freeze a 15-min grants token with no refresh).
+        workspaceId: host.docNamePrefix ? host.docNamePrefix.replace(/\/$/, '') : workspaceId,
         socket: nextSocket,
         getToken,
         collabUrl: host.collabUrl,
@@ -454,7 +557,69 @@ export function WorkspaceCollabSocketProvider({
       schedulePoll();
     };
 
-    void connectOrRefresh();
+    const connectOrRefresh = async () => {
+      if (cancelled) return;
+      // Always ensure: the backend short-circuits when the stored URL still
+      // probes healthy, so this only costs a Modal ensure-sandbox call when the host is
+      // actually gone. Previously we only ensured on first connect, which
+      // meant a transient probe failure that wiped host_url left the client
+      // stuck with a dead socket forever.
+      const fetchedMode = hostEditMode();
+      const host = await fetchWorkspaceHost(workspaceId, {
+        ensure: true,
+        editMode: fetchedMode,
+      }).catch(() => null);
+      if (cancelled) return;
+      if (!host) {
+        schedulePoll();
+        return;
+      }
+      // The mode changed while the request was in flight — e.g. a reload that
+      // restores a stored Suggest session (the provider renders `edit` first,
+      // then loads `suggest`), or a quick toggle during a poll. The token was
+      // minted for the old mode; discard and refetch so we never create or
+      // authenticate the socket with a stale mode (the toggle effect's re-auth
+      // can't help here when the socket doesn't exist yet).
+      if (fetchedMode !== hostEditMode()) {
+        void connectOrRefresh();
+        return;
+      }
+      adoptHost(host);
+    };
+
+    // SSR-minted credentials: open the socket NOW (TLS + WS handshake + doc
+    // sync start on hydration) and let the regular poll refresh the token.
+    // Adopt them only when they match what a client fetch would mint —
+    // client-only credentials the layout could not see must win, because the
+    // poll only refreshes the cached token and never re-authenticates the
+    // already-open socket:
+    //  - stored Suggest mode: the SSR token is EDIT-mode, and the mode
+    //    provider above still holds the default here (its localStorage load
+    //    runs in a later effect) — edits typed before the toggle re-auth
+    //    would persist as direct edits. Stored `view` maps to an edit-mode
+    //    socket (hostEditMode), so only `suggest` opts out.
+    //  - a sticky ?pshare= token: it can elevate a workspace-readable
+    //    visitor's role, and the layout never sees it.
+    //  - an sd_anon cookie that no longer matches the id the token's uid
+    //    derives from (another tab minted, replaced, or claim-cleared it):
+    //    socket edits would attribute to the wrong anon identity. A minted
+    //    id tolerates an absent cookie (we set it below); a cookie-read id
+    //    requires the same cookie to still be there.
+    const storedMode = readStoredEditMode(documentEditModeStorageKey(workspaceId));
+    const existingAnon = readAnonCookie();
+    const anonMatches = !initialHost?.anonId
+      ? true
+      : initialHost.anonMinted
+        ? !existingAnon || existingAnon === initialHost.anonId
+        : existingAnon === initialHost.anonId;
+    if (initialHost && storedMode !== 'suggest' && !currentPathShareToken() && anonMatches) {
+      if (initialHost.anonMinted && initialHost.anonId && !existingAnon) setAnonCookie(initialHost.anonId);
+      ssrClerkUidRef.current = initialHost.clerkUserId ?? null;
+      adoptHost(initialHost);
+    } else {
+      ssrClerkUidRef.current = undefined;
+      void connectOrRefresh();
+    }
 
     return () => {
       cancelled = true;
@@ -467,7 +632,29 @@ export function WorkspaceCollabSocketProvider({
     // editMode is intentionally NOT a dep — recreating the socket would destroy
     // every cached Y.Doc and force a full re-sync ("reload the whole file" on
     // every Edit/Suggest toggle). The toggle effect below re-auths in place.
+    // initialHost is a one-shot SSR value for this workspace; re-running for it
+    // would rebuild the socket and drop every cached Y.Doc.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId]);
+
+  // Clerk resolves AFTER the SSR credentials open the socket. If the live
+  // identity differs from the uid the token was minted for — signed out,
+  // switched accounts, or signed IN over an anonymous SSR render, all in
+  // another tab before hydration — the open socket must not keep the stale
+  // account's capabilities/attribution for the token's lifetime (the poll
+  // only refreshes the CACHED token). Drop the cache and re-open the live WS:
+  // every provider re-authenticates via getToken → fetchWorkspaceHost, which
+  // reads the live cookies. One-shot per adoption.
+  const { isLoaded: clerkLoaded, userId: liveClerkUserId } = useAuth();
+  useEffect(() => {
+    if (ssrClerkUidRef.current === undefined || !clerkLoaded) return;
+    const expected = ssrClerkUidRef.current;
+    ssrClerkUidRef.current = undefined;
+    if ((liveClerkUserId ?? null) === expected) return;
+    clearTokenRef.current?.();
+    const socket = socketRef.current;
+    if (socket) reauthenticateSocket(socket);
+  }, [clerkLoaded, liveClerkUserId]);
 
   // Flipping Edit↔Suggest must re-tag future persists (the server reads
   // `editMode` from the connection token). Instead of rebuilding the socket,
@@ -494,7 +681,11 @@ export function WorkspaceCollabSocketProvider({
     if (socket) reauthenticateSocket(socket);
   }, [editMode]);
 
-  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
+  return (
+    <PendingCtx.Provider value={value === null && Boolean(workspaceId)}>
+      <Ctx.Provider value={value}>{children}</Ctx.Provider>
+    </PendingCtx.Provider>
+  );
 }
 
 /**
@@ -547,6 +738,10 @@ export function LocalCollabSocketProvider({
   // makes their no-sharedSocket fallback query the CLOUD host with a
   // local-only project id — a privacy leak and a bogus lookup.
   return <Ctx.Provider value={value}>{value ? children : null}</Ctx.Provider>;
+}
+
+export function useWorkspaceCollabSocketPending() {
+  return useContext(PendingCtx);
 }
 
 /** Returns the shared socket only when it matches the caller's workspaceId. */

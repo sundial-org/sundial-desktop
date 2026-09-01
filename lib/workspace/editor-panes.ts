@@ -9,7 +9,7 @@
  * These helpers are pure so every tab/split transition is unit-testable —
  * the same pattern as lib/workspace/layout.ts.
  */
-import { isChatTab, isSpecialTab } from '@/lib/workspace/editor-tabs';
+import { isChatTab, isDiffTab, isLauncherTab, isReviewTab, isSpecialTab } from '@/lib/workspace/editor-tabs';
 
 export type EditorPane = {
   id: string;
@@ -32,13 +32,47 @@ export const MAX_EDITOR_PANES = 3;
 /** Custom DnD mime so tab drags never collide with file-tree / upload drags. */
 export const EDITOR_TAB_MIME = 'application/x-sundial-editor-tab';
 
+/**
+ * Embedded panel (?view=panel): ONE pane ever renders. Any transition that
+ * minted a side pane (chat-aside docking on a deep link, the chat reveal, a
+ * restored split) collapses back: secondary tabs merge into the primary as
+ * background tabs and the primary's active tab stands (an empty primary
+ * adopts the first visible secondary). Identity-stable when already single,
+ * so the enforcing effect never loops.
+ */
+export function collapseToPrimaryPane(panes: EditorPane[]): EditorPane[] {
+  if (panes.length <= 1) return panes;
+  const [first, ...rest] = panes;
+  const tabs = [...first.tabs];
+  for (const pane of rest) {
+    for (const tab of pane.tabs) if (!tabs.includes(tab)) tabs.push(tab);
+  }
+  const active = first.active || rest.find((pane) => pane.active)?.active || '';
+  return [{ ...first, tabs, active }];
+}
+
 export function createInitialPanes(): EditorPane[] {
   return [{ id: PRIMARY_PANE_ID, tabs: [], active: '' }];
 }
 
-let paneSeq = 0;
-// Ids are session-local (persistence strips them), so monotonic is unique.
-const nextPaneId = () => `pane-${++paneSeq}`;
+/**
+ * Pane ids are a PURE function of the panes in hand, never a module counter.
+ * React re-invokes state updaters (StrictMode double-invoke, or any re-render
+ * before the update commits), and a counter handed every re-run a DIFFERENT
+ * id — the next state never compared equal, so React re-rendered, re-ran the
+ * updater, and the workspace spun in an infinite render loop the moment a
+ * surface opened beside a chat (2026-08-06). max+1 keeps re-runs idempotent;
+ * ids stay unique within a list and are session-local anyway (`panesSnapshot`
+ * never persists them).
+ */
+const nextPaneId = (panes: readonly { id: string }[]) => {
+  let max = 0;
+  for (const pane of panes) {
+    const seq = /^pane-(\d+)$/.exec(pane.id)?.[1];
+    if (seq) max = Math.max(max, Number(seq));
+  }
+  return `pane-${max + 1}`;
+};
 
 const primary = (panes: EditorPane[]): EditorPane => panes[0];
 
@@ -79,6 +113,11 @@ export function syncPrimaryActive(panes: EditorPane[], path: string): EditorPane
     if (!path || panes.some((p) => p.tabs.includes(path))) return panes;
     return replacePane(panes, 0, { ...pane, tabs: [...pane.tabs, path] });
   }
+  // Already ON SCREEN in another pane: the selection mirror must not pull a
+  // second copy into the primary. A rail click that lands in a side pane sets
+  // the selection too, and without this the primary swapped to the same file —
+  // one click, two panes changed (the onboarding report).
+  if (path && panes.some((p, i) => i > 0 && p.active === path)) return panes;
   if (!path) return replacePane(panes, 0, { ...pane, active: '' });
   if (pane.tabs.includes(path)) return replacePane(panes, 0, { ...pane, active: path });
   const activeIndex = pane.tabs.indexOf(pane.active);
@@ -99,18 +138,24 @@ export function replaceActiveTab(panes: EditorPane[], paneId: string, tab: strin
   if (index === -1 || !tab) return panes;
   const pane = panes[index];
   if (pane.active === tab) return panes;
-  if (pane.tabs.includes(tab)) return replacePane(panes, index, { ...pane, active: tab });
+  // Activating an already-open tab still consumes an active launcher — the
+  // "New tab" chooser never survives a pick, even one that lands on a tab
+  // this pane already holds.
+  if (pane.tabs.includes(tab)) {
+    const tabs = isLauncherTab(pane.active) ? pane.tabs.filter((t) => t !== pane.active) : pane.tabs;
+    return replacePane(panes, index, { ...pane, tabs, active: tab });
+  }
   const activeIndex = pane.tabs.indexOf(pane.active);
-  const keepActive = pane.active !== '' && isDiffTabSafe(pane.active);
+  // Diff AND review tabs are view-only KEEP tabs: opening a file FROM one (the
+  // timeline's whole job) must land beside it, not consume the view you opened
+  // the file from.
+  const keepActive = pane.active !== '' && (isDiffTab(pane.active) || isReviewTab(pane.active));
   const tabs =
     activeIndex === -1 || keepActive
       ? [...pane.tabs, tab]
       : pane.tabs.map((t, i) => (i === activeIndex ? tab : t));
   return replacePane(panes, index, { ...pane, tabs, active: tab });
 }
-
-// Local alias so replaceActiveTab reads clearly without importing twice.
-const isDiffTabSafe = (tab: string) => isSpecialTab(tab) && !isChatTab(tab);
 
 /**
  * Deep-link/arrival claim: the doc takes the primary pane, and an active chat
@@ -156,13 +201,23 @@ function replacePane(panes: EditorPane[], index: number, pane: EditorPane): Edit
   return panes.map((p, i) => (i === index ? pane : p));
 }
 
-/** Append (or activate) a tab in a pane. */
+/** Append (or activate) a tab in a pane. An active LAUNCHER tab is consumed
+ *  in place — ⌘T's "New tab" IS the slot the next open fills (Obsidian). */
 export function openTab(panes: EditorPane[], paneId: string, path: string): EditorPane[] {
   const index = panes.findIndex((p) => p.id === paneId);
   if (index === -1 || !path) return panes;
   const pane = panes[index];
-  if (pane.tabs.includes(path)) return replacePane(panes, index, { ...pane, active: path });
-  return replacePane(panes, index, { ...pane, tabs: [...pane.tabs, path], active: path });
+  if (pane.tabs.includes(path)) {
+    // Same consumption rule as replaceActiveTab's already-open path — but a
+    // repeat ⌘T re-activates the launcher ITSELF, which must not self-consume.
+    const consume = isLauncherTab(pane.active) && path !== pane.active;
+    const tabs = consume ? pane.tabs.filter((t) => t !== pane.active) : pane.tabs;
+    return replacePane(panes, index, { ...pane, tabs, active: path });
+  }
+  const tabs = isLauncherTab(pane.active)
+    ? pane.tabs.map((t) => (t === pane.active ? path : t))
+    : [...pane.tabs, path];
+  return replacePane(panes, index, { ...pane, tabs, active: path });
 }
 
 /**
@@ -174,7 +229,59 @@ export function openToSide(panes: EditorPane[], path: string): EditorPane[] {
   if (!path) return panes;
   if (panes.length > 1) return openTab(panes, panes[1].id, path);
   if (panes.length >= MAX_EDITOR_PANES) return panes;
-  return [...panes, { id: nextPaneId(), tabs: [path], active: path }];
+  return [...panes, { id: nextPaneId(panes), tabs: [path], active: path }];
+}
+
+/**
+ * Which pane an explicit RAIL open (file-tree row, chat card, command palette)
+ * should land in — the ONE pane such a click may change. Rules, in order:
+ *
+ *  1. the pane already SHOWING that exact tab (the click is a focus no-op),
+ *  2. the FOCUSED pane when it shows the same KIND of surface (files-left /
+ *     chats-right: a doc click claims a doc pane, a chat click a chat pane),
+ *  3. the first pane showing that kind,
+ *  4. null — nothing of that kind is on screen; the caller decides (split
+ *     aside / primary).
+ *
+ * Focus-first is the fix for the onboarding report: with two document panes
+ * open, "the first pane showing a file" always meant the LEFT one, so clicking
+ * files in the rail kept swapping a pane the user wasn't working in. A
+ * background copy of the tab never wins — replacing a pane that merely HOLDS
+ * the tab behind its active one is what made a rail chat click swap the
+ * document in one pane and the chat in another at the same time.
+ */
+export function resolveOpenTargetPaneId(
+  panes: EditorPane[],
+  kind: 'file' | 'chat',
+  focusedPaneId: string | null | undefined,
+  tab?: string,
+): string | null {
+  const showsKind = (pane: EditorPane) =>
+    kind === 'chat' ? isChatTab(pane.active) : pane.active !== '' && !isSpecialTab(pane.active);
+  if (tab) {
+    const shown = panes.find((pane) => pane.active === tab);
+    if (shown) return shown.id;
+  }
+  const focused = panes.find((pane) => pane.id === focusedPaneId);
+  if (focused && showsKind(focused)) return focused.id;
+  return panes.find(showsKind)?.id ?? null;
+}
+
+/** Drop `tab` from every pane except `keepPaneId` (omit it to drop everywhere,
+ *  e.g. just before the tab lands in a pane that doesn't exist yet) — a tab
+ *  lives in exactly one pane, so moving it must not leave a background copy
+ *  behind. A stale copy is what a later rail click would hijack. */
+export function dropTabElsewhere(panes: EditorPane[], tab: string, keepPaneId?: string): EditorPane[] {
+  if (!tab) return panes;
+  let changed = false;
+  const next = panes.map((pane) => {
+    if (pane.id === keepPaneId || !pane.tabs.includes(tab)) return pane;
+    changed = true;
+    const tabs = pane.tabs.filter((t) => t !== tab);
+    const active = pane.active === tab ? neighborOf(tabs, pane.tabs.indexOf(tab)) : pane.active;
+    return { ...pane, tabs, active };
+  });
+  return changed ? pruneEmptyPanes(next) : panes;
 }
 
 export type CloseTabResult = {
@@ -299,7 +406,7 @@ export function splitWithTab(
     if (srcPaneIndex === 0 && srcPane.active === src.path) primaryActive = srcActive;
     next = replacePane(panes, srcPaneIndex, { ...srcPane, tabs: srcTabs, active: srcActive });
   }
-  const newPane: EditorPane = { id: nextPaneId(), tabs: [src.path], active: src.path };
+  const newPane: EditorPane = { id: nextPaneId(next), tabs: [src.path], active: src.path };
   const insertAt = next.findIndex((p) => p.id === targetPaneId) + (side === 'right' ? 1 : 0);
   // The primary pane must stay panes[0] — it carries the full editor chrome —
   // so a left split of the LEFTMOST pane swaps contents instead of inserting:
@@ -390,7 +497,7 @@ export function flattenPanesForWeb(panes: EditorPane[]): EditorPane[] {
   const out: EditorPane[] = [];
   if (filePane) out.push({ id: PRIMARY_PANE_ID, tabs: [filePane.active], active: filePane.active });
   if (chatPane) {
-    const id = out.length === 0 ? PRIMARY_PANE_ID : nextPaneId();
+    const id = out.length === 0 ? PRIMARY_PANE_ID : nextPaneId(out);
     out.push({ id, tabs: [chatPane.active], active: chatPane.active });
   }
   return out.length > 0 ? out : createInitialPanes();
@@ -428,7 +535,7 @@ export function normalizePanes(value: unknown, existingPaths: Set<string>): Edit
       typeof rawActive === 'string' && tabs.includes(rawActive)
         ? rawActive
         : tabs[tabs.length - 1] ?? '';
-    out.push({ id: out.length === 0 ? PRIMARY_PANE_ID : nextPaneId(), tabs, active });
+    out.push({ id: out.length === 0 ? PRIMARY_PANE_ID : nextPaneId(out), tabs, active });
   }
   // A primary restored empty beside surviving secondaries (its only tab was a
   // dropped diff/dead path) promotes the next pane — never an empty pane.

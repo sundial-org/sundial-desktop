@@ -5,7 +5,7 @@ import { CheckIcon, CaretDownIcon, GlobeSimpleIcon, LightningIcon, LinkIcon, Loc
 import { IconTooltip, getInitials, pickColor } from '@/components/collab-bubbles';
 import { AnchoredDropdown } from '@/components/workspace/anchored-dropdown';
 import { ModalShell } from '@/components/modal-shell';
-import type { ShareInfo, ShareInvite } from './workspace-share';
+import { hasCopyableShareLink, isLinkSharedInfo, type ShareInfo, type ShareInvite } from './workspace-share';
 
 type InviteRole = 'editor' | 'commenter' | 'viewer';
 type PublicAccess = 'view' | 'suggest' | 'edit' | 'none';
@@ -24,7 +24,7 @@ export type ShareSubject = 'workspace' | 'file' | 'folder' | 'chat';
  *  to the workspace. */
 const peopleCaption = (subject: ShareSubject) =>
   subject === 'chat'
-    ? 'Inherited from the workspace — everyone below can open this chat. Inviting someone adds them to the workspace.'
+    ? 'Inherited from the workspace: everyone below can open this chat. Inviting someone adds them to the workspace.'
     : 'Members of this project can see project files, chats, comments, diffs, and scheduled-chat runs.';
 
 function formatMemberRole(role: 'owner' | InviteRole) {
@@ -71,7 +71,7 @@ export function WorkspaceShareModal({
   accessCaption?: string;
   /** Extra rows in the scrollable body (e.g. local share-conflict rows). */
   bodyExtra?: ReactNode;
-  /** Footer "Stop syncing" action (local shares). */
+  /** Footer "Stop sharing" action (local shares). */
   onStopSharing?: () => void | Promise<void>;
   projectTitle: string;
   userId?: string | null;
@@ -101,9 +101,9 @@ export function WorkspaceShareModal({
   onOpenLocalAgent?: () => void | Promise<void>;
   formatRelativeTime: (value?: string | null) => string;
 }) {
-  // visibility=public with publicAccess=none grants anons nothing (see
-  // lib/workspace/access.ts), so present that legacy combo as Restricted.
-  const isLinkShared = shareInfo?.visibility === 'public' && shareInfo.publicAccess !== 'none';
+  // Link-shared = the workspace-root grant exists (tokened or tokenless).
+  const isLinkShared = isLinkSharedInfo(shareInfo);
+  const linkRole = shareInfo?.linkShare?.role;
   // Never render a void: each section only mounts when it has content, so a
   // subject without people/invites collapses to title + general access.
   const hasPeople = Boolean(shareInfo && (shareInfo.members.length > 0 || pendingEmailInvites.length > 0));
@@ -358,6 +358,17 @@ export function WorkspaceShareModal({
 
       <div className="px-5 pt-3 pb-4 border-t border-stone-100 mt-1">
         <div className="text-xs font-medium text-stone-500 mb-2">General access</div>
+        {shareInfo === null ? (
+          // Sharing state not loaded yet: a placeholder, never the default
+          // "Restricted" flashing into "Anyone with the link" a beat later.
+          <div className="flex items-center gap-3" data-testid="share-audience-loading">
+            <div className="h-8 w-8 shrink-0 animate-pulse rounded-full bg-stone-100" />
+            <div className="min-w-0 flex-1">
+              <div className="h-4 w-40 animate-pulse rounded bg-stone-100" />
+              <div className="mt-1.5 h-3 w-56 animate-pulse rounded bg-stone-100" />
+            </div>
+          </div>
+        ) : (
         <div className="flex items-center gap-3">
           <div className="h-8 w-8 rounded-full bg-stone-100 flex items-center justify-center shrink-0">
             {isLinkShared ? <GlobeSimpleIcon className="h-4 w-4 text-stone-500" weight="regular" aria-hidden /> : <LockSimpleIcon className="h-4 w-4 text-stone-400" weight="regular" aria-hidden />}
@@ -411,7 +422,7 @@ export function WorkspaceShareModal({
             )}
             <div className="text-xs text-stone-400">
               {isLinkShared
-                ? `Anyone on the internet with the link can ${shareInfo?.publicAccess === 'edit' ? 'edit' : shareInfo?.publicAccess === 'suggest' ? 'comment' : 'view'}`
+                ? `Anyone on the internet with the link can ${linkRole === 'edit' ? 'edit' : linkRole === 'suggest' ? 'comment' : 'view'}`
                 : 'Only people with access can open with the link'}
             </div>
           </div>
@@ -427,7 +438,7 @@ export function WorkspaceShareModal({
                   disabled={shareBusyAction?.startsWith('public-access-')}
                   className="inline-flex items-center gap-1 text-xs text-stone-600 hover:text-stone-900 disabled:opacity-50 transition-colors"
                 >
-                  {formatLinkRole(shareInfo.publicAccess)}
+                  {formatLinkRole(linkRole)}
                   <CaretDownIcon className="h-3 w-3 text-stone-400" weight="regular" aria-hidden />
                 </button>
                 {shareDropdown === 'public-access' && (
@@ -440,7 +451,7 @@ export function WorkspaceShareModal({
                           void onPublicAccessChange(value);
                           setShareDropdown(null);
                         }}
-                        className={`w-full text-left px-3 py-1.5 text-xs hover:bg-stone-50 transition-colors ${shareInfo.publicAccess === value ? 'text-stone-900 font-medium' : 'text-stone-600'}`}
+                        className={`w-full text-left px-3 py-1.5 text-xs hover:bg-stone-50 transition-colors ${linkRole === value ? 'text-stone-900 font-medium' : 'text-stone-600'}`}
                       >
                         {formatLinkRole(value)}
                       </button>
@@ -449,10 +460,11 @@ export function WorkspaceShareModal({
                 )}
               </div>
             ) : (
-              <span className="shrink-0 text-xs text-stone-400">{formatLinkRole(shareInfo?.publicAccess)}</span>
+              <span className="shrink-0 text-xs text-stone-400">{formatLinkRole(linkRole)}</span>
             )
           )}
         </div>
+        )}
         {accessCaption && <p className="mt-2 text-[11px] leading-snug text-stone-400">{accessCaption}</p>}
       </div>
 
@@ -462,8 +474,10 @@ export function WorkspaceShareModal({
             type="button"
             onClick={onCreateLinkInvite}
             // A chat link is always copyable — restricted workspaces just copy
-            // the plain chat URL for members who can't mint invites.
-            disabled={(subject !== 'chat' && !isLinkShared && !canInviteShare) || shareBusyAction === 'link'}
+            // the plain chat URL for members who can't mint invites. Root-link
+            // shares hide the tokened URL from non-owners, so a caller with
+            // neither a copyable URL nor invite rights gets no dead button.
+            disabled={(subject !== 'chat' && !hasCopyableShareLink(shareInfo) && !canInviteShare) || shareBusyAction === 'link'}
             className={`inline-flex items-center justify-center gap-2 rounded-lg border px-3 py-2 text-sm min-w-[120px] transition-colors ${shareBusyAction === 'link-copied' ? 'border-stone-300 bg-stone-100 text-stone-800' : 'border-stone-200 text-stone-700 hover:bg-stone-50'} disabled:opacity-50`}
           >
             {shareBusyAction === 'link-copied' ? (
@@ -487,10 +501,15 @@ export function WorkspaceShareModal({
             <button
               type="button"
               onClick={() => void onStopSharing()}
+              // Tearing down the cloud twins takes seconds: say so and lock the
+              // button, or it reads as broken and gets clicked again. Quiet on
+              // purpose (local-only): it stops the SYNC, which the audience
+              // controls above can't — but it is not destructive, so no red.
+              disabled={shareBusyAction === 'stop'}
               data-testid="share-stop-syncing"
-              className="inline-flex items-center justify-center rounded-lg border border-stone-200 px-3 py-2 text-sm text-rose-600 transition-colors hover:bg-rose-50"
+              className="text-[12px] font-medium text-stone-500 transition-colors hover:text-stone-700 disabled:opacity-50"
             >
-              Stop syncing
+              {shareBusyAction === 'stop' ? 'Stopping…' : 'Stop syncing'}
             </button>
           ) : null}
         </div>

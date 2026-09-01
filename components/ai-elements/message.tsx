@@ -59,7 +59,11 @@ export const MessageContent = ({
   // `text-foreground` (which falls back washed-out without shadcn vars).
   <div
     className={cn(
-      "flex w-fit max-w-full min-w-0 flex-col gap-2 overflow-hidden text-[15px] leading-relaxed",
+      // overflow-x-CLIP, not hidden: horizontal blowouts (wide KaTeX etc.) stay
+      // clipped, but vertical overflow stays visible — `hidden` on one axis
+      // forces the other to auto, which clipped the table copy/download menus
+      // when a short table ended the message (Codex on #1022).
+      "flex w-fit max-w-full min-w-0 flex-col gap-2 overflow-x-clip text-[15px] leading-relaxed",
       "group-[.is-user]:ml-auto group-[.is-user]:rounded-2xl group-[.is-user]:rounded-br-sm group-[.is-user]:bg-stone-800 group-[.is-user]:px-4 group-[.is-user]:py-3 group-[.is-user]:text-white",
       "group-[.is-assistant]:text-stone-800",
       className
@@ -414,7 +418,81 @@ const MARKDOWN_CHROME =
   "[&_[data-streamdown=mermaid-block-actions]]:!border-0 " +
   "[&_[data-streamdown=mermaid-block-actions]]:!bg-transparent " +
   "[&_[data-streamdown=mermaid-block-actions]]:!opacity-0 " +
-  "[&_[data-streamdown=mermaid-block]:hover_[data-streamdown=mermaid-block-actions]]:!opacity-100";
+  "[&_[data-streamdown=mermaid-block]:hover_[data-streamdown=mermaid-block-actions]]:!opacity-100 " +
+  // Thematic break — Streamdown's default `border-border` token is unwired
+  // and renders near-black; soften to the app's hairline stone.
+  "[&_[data-streamdown=horizontal-rule]]:!border-stone-200 " +
+  // Markdown tables — restyled to the rendered-CSV grid (rounded-xl white
+  // card, stone-50 uppercase header band, hairline row dividers) so a table in
+  // a Sunny reply reads like a .csv file in the editor. Streamdown's default
+  // is a bg-sidebar card with an always-visible controls row above the table;
+  // repaint the card and tuck the copy/download/fullscreen controls into the
+  // header band itself, hover-revealed (2026-07-30 table feedback).
+  // No overflow-hidden on the wrapper — the copy/download dropdown menus
+  // render inside it and must extend past a short table's bottom edge; the
+  // inner scroll container carries the matching radius and does the clipping.
+  "[&_[data-streamdown=table-wrapper]]:!relative " +
+  "[&_[data-streamdown=table-wrapper]]:!my-3 " +
+  "[&_[data-streamdown=table-wrapper]]:!gap-0 " +
+  "[&_[data-streamdown=table-wrapper]]:!rounded-xl " +
+  "[&_[data-streamdown=table-wrapper]]:!border-stone-200 " +
+  "[&_[data-streamdown=table-wrapper]]:!bg-white " +
+  "[&_[data-streamdown=table-wrapper]]:!p-0 " +
+  // Controls row (the wrapper child without the table) → overlay the right end
+  // of the header band: same height, same background, no chrome of its own.
+  "[&_[data-streamdown=table-wrapper]>div:not(:has(table))]:!absolute " +
+  "[&_[data-streamdown=table-wrapper]>div:not(:has(table))]:!top-px " +
+  "[&_[data-streamdown=table-wrapper]>div:not(:has(table))]:!right-px " +
+  "[&_[data-streamdown=table-wrapper]>div:not(:has(table))]:!z-10 " +
+  "[&_[data-streamdown=table-wrapper]>div:not(:has(table))]:!h-8 " +
+  "[&_[data-streamdown=table-wrapper]>div:not(:has(table))]:!gap-0 " +
+  "[&_[data-streamdown=table-wrapper]>div:not(:has(table))]:!rounded-tr-[11px] " +
+  "[&_[data-streamdown=table-wrapper]>div:not(:has(table))]:!bg-stone-50 " +
+  "[&_[data-streamdown=table-wrapper]>div:not(:has(table))]:!pl-2 " +
+  "[&_[data-streamdown=table-wrapper]>div:not(:has(table))]:!pr-1.5 " +
+  // Hidden only on hover-capable devices — touch users have no hover, so the
+  // band stays visible for them (Codex round 4).
+  "[@media(hover:hover)]:[&_[data-streamdown=table-wrapper]>div:not(:has(table))]:!opacity-0 " +
+  // Revealed by hovering the HEADER BAND (or the controls themselves), not the
+  // whole table (2026-08-01 feedback) — plus keyboard focus below.
+  "[&_[data-streamdown=table-wrapper]:has([data-streamdown=table-header]:hover)>div:not(:has(table))]:!opacity-100 " +
+  "[&_[data-streamdown=table-wrapper]>div:not(:has(table)):hover]:!opacity-100 " +
+  // Keyboard focus must reveal the controls too — hover-only would leave a
+  // tabbed-to button invisible.
+  "[&_[data-streamdown=table-wrapper]:focus-within>div:not(:has(table))]:!opacity-100 " +
+  "[&_[data-streamdown=table-wrapper]>div:not(:has(table))_button]:!text-stone-400 " +
+  "[&_[data-streamdown=table-wrapper]>div:not(:has(table))_button:hover]:!text-stone-600 " +
+  // De-position the per-button `.relative` containers so the copy/download
+  // dropdowns anchor to the band itself (its right edge ≈ the table's right
+  // edge) — anchored to a button near a narrow table's left edge, a
+  // right-aligned 120px menu pokes past the message's left clip.
+  "[&_[data-streamdown=table-wrapper]>div:not(:has(table))>div]:!static " +
+  // Scroll container — the wrapper card carries the border; the scroll div
+  // (overflow ≠ visible) clips the header band to the matching inner radius.
+  "[&_[data-streamdown=table-wrapper]>div:has(table)]:!rounded-[11px] " +
+  "[&_[data-streamdown=table-wrapper]>div:has(table)]:!border-0 " +
+  "[&_[data-streamdown=table-wrapper]>div:has(table)]:!bg-transparent " +
+  "[&_[data-streamdown=table]]:!text-[12px] " +
+  "[&_[data-streamdown=table]]:!divide-stone-200 " +
+  "[&_[data-streamdown=table-header]]:!bg-stone-50 " +
+  "[&_[data-streamdown=table-header]_tr]:!border-b " +
+  "[&_[data-streamdown=table-header]_tr]:!border-stone-200 " +
+  "[&_[data-streamdown=table-header-cell]]:!px-3 " +
+  "[&_[data-streamdown=table-header-cell]]:!py-2 " +
+  "[&_[data-streamdown=table-header-cell]]:!text-[10px] " +
+  "[&_[data-streamdown=table-header-cell]]:!leading-4 " +
+  "[&_[data-streamdown=table-header-cell]]:!font-medium " +
+  "[&_[data-streamdown=table-header-cell]]:!uppercase " +
+  "[&_[data-streamdown=table-header-cell]]:!tracking-wider " +
+  "[&_[data-streamdown=table-header-cell]]:!text-stone-400 " +
+  "[&_[data-streamdown=table-body]]:!divide-stone-100 " +
+  "[&_[data-streamdown=table-body]_tr:hover]:!bg-stone-50/40 " +
+  "[&_[data-streamdown=table-cell]]:!whitespace-nowrap " +
+  "[&_[data-streamdown=table-cell]]:!px-3 " +
+  "[&_[data-streamdown=table-cell]]:!py-1.5 " +
+  // td carries its own `text-sm`, so the size must land on the cell itself.
+  "[&_[data-streamdown=table-cell]]:!text-[12px] " +
+  "[&_[data-streamdown=table-cell]]:!text-stone-700";
 
 // Hoisted so memoized `MessageResponse` keeps stable prop references.
 const MARKDOWN_CONTROLS = { code: { copy: true, download: false } } as const;
@@ -433,7 +511,32 @@ const MARKDOWN_PLUGINS = { code: CODE_PLUGIN, mermaid: MERMAID_CHAT_PLUGIN };
 // renderer (lib/markdown/html.mjs emits <br> for every soft break) and the
 // chat conventions of Slack/Discord/ChatGPT. Without it, CommonMark collapses
 // single newlines to spaces, so a 30-line poem renders as run-on stanzas.
-const REMARK_PLUGINS = [remarkGfm, remarkMath, remarkBreaks];
+// Em-dashes render as plain dashes in chat (2026-08-01 feedback) — applied to
+// PARSED TEXT NODES, so code (fenced, indented, inline), math, and link
+// destinations are protected structurally rather than by source regexes
+// (which kept sprouting edge cases: Codex rounds 9/11/13/14/16 on #1022).
+// Display-only: copy-message and persistence keep the model's original text.
+type MdastNode = { type?: string; value?: string; url?: string; children?: MdastNode[] };
+function remarkEmDashToDash() {
+  const walk = (node: MdastNode) => {
+    if (node.type === "text" && typeof node.value === "string" && node.value.includes("—")) {
+      node.value = node.value.replace(/ ?— ?/g, " - ");
+    }
+    // A GFM autolink's label IS its address — rewriting it would display a
+    // different URL than the one linked. Literal autolinks normalize the url
+    // (`www.x` → `http://www.x`, emails → `mailto:`), so compare the label
+    // against the prefixed forms too.
+    if (node.type === "link" && node.children?.length === 1 && node.children[0]?.type === "text") {
+      const label = node.children[0].value;
+      if (node.url === label || node.url === `http://${label}` || node.url === `mailto:${label}`) {
+        return;
+      }
+    }
+    node.children?.forEach(walk);
+  };
+  return walk;
+}
+const REMARK_PLUGINS = [remarkGfm, remarkMath, remarkBreaks, remarkEmDashToDash];
 const REHYPE_PLUGINS = [rehypeKatex];
 // The smooth typewriter is driven by useSmoothStreamedText (word-by-word display
 // pacing). `isAnimating` (passed only for the live reply) tells Streamdown the

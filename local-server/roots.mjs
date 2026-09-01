@@ -136,6 +136,11 @@ export class RootWatchers {
     return watcher && rel ? watcher.seenBefore(rel) : true;
   }
 
+  knownBefore(virtualRel) {
+    const [watcher, rel] = this.#route(virtualRel);
+    return watcher && rel ? watcher.knownBefore(rel) : null;
+  }
+
   takeFirstSight(virtualRel) {
     const [watcher, rel] = this.#route(virtualRel);
     return watcher && rel ? watcher.takeFirstSight(rel) : undefined;
@@ -154,6 +159,11 @@ export class RootWatchers {
   suppress(virtualRel, ms) {
     const [watcher, rel] = this.#route(virtualRel);
     if (watcher && rel) watcher.suppress(rel, ...(ms === undefined ? [] : [ms]));
+  }
+
+  /** Every root's debounced events drained (see ProjectWatcher.settle). */
+  async settle(timeoutMs) {
+    await Promise.all([...this.children.values()].map((child) => child.settle(timeoutMs)));
   }
 
   close() {

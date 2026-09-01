@@ -1,6 +1,6 @@
-import { Extension, getChangedRanges, type Editor } from '@tiptap/core';
+import { Extension, getChangedRanges, InputRule, type Editor } from '@tiptap/core';
 import type { Node } from '@tiptap/pm/model';
-import { Plugin, PluginKey, type EditorState, type Transaction } from '@tiptap/pm/state';
+import { Plugin, PluginKey, TextSelection, type EditorState, type Transaction } from '@tiptap/pm/state';
 import { Decoration, DecorationSet } from '@tiptap/pm/view';
 import katex, { type KatexOptions } from 'katex';
 
@@ -18,7 +18,15 @@ import katex, { type KatexOptions } from 'katex';
 export type MathematicsOptions = {
   regex: RegExp;
   katexOptions?: KatexOptions;
-  shouldRender: (state: EditorState, pos: number, node: Node) => boolean;
+  /** Per text node. `parent` is the containing block (nodesBetween provides
+   *  it) — use it instead of `state.doc.resolve(pos)`: a resolve is O(doc)
+   *  and this runs for EVERY text node in the scanned range, which turned
+   *  initial load of long documents O(n²) (multi-second freeze). */
+  shouldRender: (state: EditorState, pos: number, node: Node, parent: Node | null) => boolean;
+  // Optional per-MATCH veto (shouldRender is per text node, too coarse when a
+  // node mixes render-worthy and veto-worthy spans). Used to keep KaTeX out of
+  // `%%…%%` source comments, whose content must stay dimmed literal source.
+  shouldRenderMatch?: (state: EditorState, from: number, to: number) => boolean;
 };
 
 /**
@@ -54,6 +62,17 @@ function getAffectedRange(
       minFrom = Math.min(minFrom, range.newRange.from - 1, range.oldRange.from - 1);
       maxTo = Math.max(maxTo, range.newRange.to + 1, range.oldRange.to + 1);
     });
+    // Widen to the containing textblocks. A match's render decision can depend
+    // on text OUTSIDE its own node — `shouldRenderMatch` vetoes math inside a
+    // `%%…%%` source comment — so completing or deleting a delimiter in
+    // another text node (or across a hard break) has to re-evaluate this
+    // block's math, or a stale KaTeX widget survives inside the new comment.
+    // Rescanning a whole block can only recompute the same decorations.
+    const clamp = (pos: number) => Math.max(0, Math.min(pos, docSize));
+    const $min = newState.doc.resolve(clamp(minFrom));
+    const $max = newState.doc.resolve(clamp(maxTo));
+    minFrom = Math.min(minFrom, $min.depth === 0 ? 0 : $min.before());
+    maxTo = Math.max(maxTo, $max.depth === 0 ? docSize : $max.after());
   } else if (tr.selectionSet) {
     const { $from, $to } = state.selection;
     const { $from: $newFrom, $to: $newTo } = newState.selection;
@@ -70,7 +89,7 @@ function getAffectedRange(
 }
 
 const MathematicsPlugin = (options: MathematicsOptions & { editor: Editor }) => {
-  const { regex, katexOptions, editor, shouldRender } = options;
+  const { regex, katexOptions, editor, shouldRender, shouldRenderMatch } = options;
   return new Plugin<PluginState>({
     key: new PluginKey('mathematics'),
     state: {
@@ -105,14 +124,15 @@ const MathematicsPlugin = (options: MathematicsOptions & { editor: Editor }) => 
           maxTo = Math.max(maxTo, deco.to);
         });
 
-        newState.doc.nodesBetween(minFrom, maxTo, (node, pos) => {
-          if (!node.isText || !node.text || !shouldRender(newState, pos, node)) return;
+        newState.doc.nodesBetween(minFrom, maxTo, (node, pos, parent) => {
+          if (!node.isText || !node.text || !shouldRender(newState, pos, node, parent)) return;
           let match: RegExpExecArray | null;
           while ((match = regex.exec(node.text))) {
             const from = pos + match.index;
             const to = from + match[0].length;
             const content = match.slice(1).find(Boolean);
             if (!content) continue;
+            if (shouldRenderMatch && !shouldRenderMatch(newState, from, to)) continue;
 
             // "Editing" — the caret sits inside this span (or a range selects
             // within it), so show the raw `$…$` source instead of the preview.
@@ -197,8 +217,59 @@ const MathematicsPlugin = (options: MathematicsOptions & { editor: Editor }) => 
   });
 };
 
-const defaultShouldRender = (state: EditorState, pos: number) =>
-  state.doc.resolve(pos).parent.type.name !== 'codeBlock';
+const defaultShouldRender = (state: EditorState, pos: number, node: Node, parent: Node | null) =>
+  parent?.type.name !== 'codeBlock';
+
+/** How far back the close-of-block rule searches for its opener — keeps the
+ *  rule O(1) per keystroke (typed display math is short). */
+const BLOCK_MATH_OPENER_SCAN = 40;
+
+/**
+ * Typing the closing `$$` of a multi-line display block collapses the block to
+ * its single-line `$$…$$` form — the same normalization the markdown importer
+ * applies (lib/markdown/parser.mjs: the newlines between `$$` delimiters are
+ * insignificant, so they join as spaces). Text nodes can't span paragraphs, so
+ * without this a block typed as `$$` ⏎ latex ⏎ `$$` never matches the
+ * decoration regex and stays raw source — the importer-collapsed form renders.
+ */
+const blockMathCollapseRule = () =>
+  new InputRule({
+    find: /^\$\$$/,
+    handler: ({ state, range }) => {
+      const $close = state.doc.resolve(range.from);
+      if ($close.depth === 0 || $close.parent.type.name !== 'paragraph') return null;
+      const container = $close.node(-1);
+      const closeIndex = $close.index(-1);
+      // Walk up the siblings for the opener: a paragraph starting with `$$`
+      // and not closed on its own line (the importer's opening condition).
+      // Anything that isn't plain math-body text — a non-paragraph block, or a
+      // line with its own `$$` — ends the search: there is no open block here.
+      let openerIndex = -1;
+      const innerLines: string[] = [];
+      for (let i = closeIndex - 1; i >= 0 && closeIndex - i <= BLOCK_MATH_OPENER_SCAN; i -= 1) {
+        const sibling = container.child(i);
+        if (sibling.type.name !== 'paragraph') break;
+        const text = sibling.textContent;
+        if (text.startsWith('$$') && text.indexOf('$$', 2) === -1) {
+          openerIndex = i;
+          innerLines.unshift(text.slice(2));
+          break;
+        }
+        if (text.includes('$$')) break;
+        innerLines.unshift(text);
+      }
+      if (openerIndex === -1) return null; // no open block — leave the `$$` as typed
+      const inner = innerLines.map((line) => line.trim()).filter(Boolean).join(' ');
+      if (!inner) return null; // an empty block has nothing to render
+      const openerFrom = $close.posAtIndex(openerIndex, -1);
+      const closeEnd = $close.after();
+      const collapsed = `$$${inner}$$`;
+      const paragraph = state.schema.nodes.paragraph.create(null, state.schema.text(collapsed));
+      state.tr
+        .replaceWith(openerFrom, closeEnd, paragraph)
+        .setSelection(TextSelection.create(state.tr.doc, openerFrom + 1 + collapsed.length));
+    },
+  });
 
 export const Mathematics = Extension.create<MathematicsOptions>({
   name: 'Mathematics',
@@ -207,7 +278,11 @@ export const Mathematics = Extension.create<MathematicsOptions>({
       regex: /\$([^$]*)\$/gi,
       katexOptions: undefined,
       shouldRender: defaultShouldRender,
+      shouldRenderMatch: undefined,
     };
+  },
+  addInputRules() {
+    return [blockMathCollapseRule()];
   },
   addProseMirrorPlugins() {
     return [MathematicsPlugin({ ...this.options, editor: this.editor })];

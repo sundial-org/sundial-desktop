@@ -1,14 +1,14 @@
 export const SUNNY_AVATARS = [
-  '/sunnies/sundial-default.png',
-  '/sunnies/sunny-sunglasses.png',
-  '/sunnies/sunny-wizard.png',
-  '/sunnies/sunny-headphones.png',
-  '/sunnies/sunny-nerd.png',
-  '/sunnies/sunny-crown.png',
-  '/sunnies/sunny-beanie.png',
-  '/sunnies/sunny-tongue.png',
-  '/sunnies/sunny-grad.png',
-  '/sunnies/sunny-party.png',
+  '/sunnies/sundial-default.webp',
+  '/sunnies/sunny-sunglasses.webp',
+  '/sunnies/sunny-wizard.webp',
+  '/sunnies/sunny-headphones.webp',
+  '/sunnies/sunny-nerd.webp',
+  '/sunnies/sunny-crown.webp',
+  '/sunnies/sunny-beanie.webp',
+  '/sunnies/sunny-tongue.webp',
+  '/sunnies/sunny-grad.webp',
+  '/sunnies/sunny-party.webp',
 ] as const;
 
 type ChatLike = { id: string; sunny_number?: number | null };
