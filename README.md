@@ -51,6 +51,8 @@ Claude Code · Codex · Claude, GPT, Gemini and open models through Sundial's ho
 
 **From source.** See [Build](#build).
 
+**In the browser.** The same editor runs at [sundial.md](https://www.sundial.md/new) with a hosted agent, nothing to install. Documents you share from the app open there too.
+
 ## Try it in 60 seconds
 
 1. Open Sundial and point it at any folder of markdown, or start empty.
