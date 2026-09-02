@@ -45,11 +45,11 @@ Claude Code · Codex · Claude, GPT, Gemini and open models through Sundial's ho
 
 ## Install
 
-**macOS.** [download the app](https://www.sundial.md/download), drag it to Applications, open it. Free, no account needed.
+**macOS.** [Download the app](https://www.sundial.md/download), drag it to Applications, open it. Free, no account needed.
 
-**Windows / Linux.** not built yet, tracked in [issues](https://github.com/sundial-org/sundial-desktop/issues); a star helps us prioritize.
+**Windows / Linux.** Not built yet, tracked in [issues](https://github.com/sundial-org/sundial-desktop/issues); a star helps us prioritize.
 
-**From source.** see [Build](#build).
+**From source.** See [Build](#build).
 
 ## Try it in 60 seconds
 
