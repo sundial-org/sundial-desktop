@@ -108,4 +108,4 @@ If Sundial is useful to you, a star helps other people find it.
 
 ## License
 
-[Apache-2.0](LICENSE). "Sundial" and the Sundial logo are trademarks of Long Horizon Research, Inc.; the license does not grant trademark rights.
+[Apache-2.0](LICENSE).
