@@ -8,7 +8,7 @@ A Markdown editor where your team and your agents write in the same document, li
 
 Open source. Local-first. Runs on your own Claude Code and Codex.
 
-[Download for macOS](https://www.sundial.md/download) · [Web app](https://www.sundial.md) · [Docs](https://www.sundial.md/docs) · [X](https://x.com/sundialmd)
+[Download for macOS](https://www.sundial.md/download) · [Web app](https://www.sundial.md) · [Docs](https://www.sundial.md/docs) · [Discord](https://discord.gg/jHG5gDvyEQ) · [X](https://x.com/sundialmd)
 
 ![Two people and an agent in one shared doc: a comment tagged @Agent gets a reply in the thread and an inline suggestion](docs/demo.gif)
 
@@ -104,7 +104,7 @@ If Sundial is useful to you, a star helps other people find it.
 
 ## Community
 
-[X @sundialmd](https://x.com/sundialmd) for what we're building · [Issues](https://github.com/sundial-org/sundial-desktop/issues) for bugs and ideas.
+[Discord](https://discord.gg/jHG5gDvyEQ) to talk to us and other users · [X @sundialmd](https://x.com/sundialmd) for what we're building · [Issues](https://github.com/sundial-org/sundial-desktop/issues) for bugs and ideas.
 
 ## License
 
