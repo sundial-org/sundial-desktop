@@ -33,13 +33,21 @@ Once it is open:
 
 ## Features
 
-- **Multiplayer for agents.** Your teammates' cursors and their agents' edits appear in the doc as they happen, attributed to whoever made them, human or agent.
-- **Your subscription works here.** Claude Code and Codex run on your machine, inside the editor. No API key, no per-token markup, no account until you share. Existing terminal sessions import and resume in place.
-- **Comment to delegate.** Select a paragraph, comment `@Agent shorten this`, and the agent answers in the thread; its fix lands as a suggestion on exactly that selection. Or set a chat to watch comments, and it handles every new thread on the doc. Comments work between people too.
-- **Track changes, built for agents.** Every edit is attributed, with inline accept/reject and history at edit granularity, not commit granularity. Show authorship bands the document by who wrote each line, and every change links back to the chat turn that made it.
-- **Just Markdown on disk.** Callouts, wikilinks, footnotes, frontmatter, tables, Mermaid and code previews. Rename a file and every link to it updates. Point it at an Obsidian vault and it opens as-is.
+- **Multiplayer for agents.** Teammates' cursors and their agents' edits appear live, attributed to whoever made them.
+- **Your subscription works here.** Claude Code and Codex run on your machine, inside the editor. No API key, no account until you share.
+- **Comment to delegate.** Tag `@Agent` on a selection; the fix lands as a suggestion on exactly those lines.
+- **Track changes, built for agents.** Inline accept or reject, history at edit granularity, and every change links to the chat turn that made it.
+- **Just Markdown on disk.** Callouts, wikilinks, footnotes, tables, Mermaid. An Obsidian vault opens as-is.
 - **Any model.** Local engines run on your subscriptions; signed in, swap between frontier and open models mid-conversation.
-- **Local by default.** Plain files on your disk, agents on your machine. Nothing syncs until you share a doc; share and it syncs live through our cloud; stop sharing and you are fully local again. Works offline.
+- **Local by default.** Nothing syncs until you share a doc; stop sharing and you are fully local again.
+
+## What people use it for
+
+- Draft a doc with a teammate and an agent in the same file, live
+- Let an agent rewrite while you are away, then read the authorship bands to see exactly what it changed
+- Open an Obsidian vault as-is, and share one note with a link when it is ready
+- Continue a Claude Code or Codex session from your terminal inside the editor
+- Work on a plane: editing, review, and history are fully offline
 
 ## Works with
 
@@ -60,9 +68,22 @@ Claude Code · Codex · Claude, GPT, Gemini and open models through Sundial's ho
 | Plain Markdown on your disk            | ✓       | ✓                    | ✗                    | ✓        |
 | Local-first, open source               | ✓       | ✗                    | ✗                    | files only |
 
+## How it works
+
+```mermaid
+flowchart LR
+  A[You and your team] <--> D[(The document<br/>a CRDT, Yjs)]
+  E[Claude Code / Codex<br/>on your machine] <--> D
+  D <--> S[Local sidecar]
+  S <--> F[Plain files on disk]
+  D -.->|only when you share| C[Sync server]
+```
+
+Documents are CRDTs (conflict-free replicated data types, via Yjs): people and agents edit the same doc at once without conflicts, and every keystroke carries attribution. A local sidecar watches your folders and drives the agent engines on your own login; their output streams into the doc as tracked changes, not file overwrites. Sharing syncs the same CRDT through a Hocuspocus server; if you want to self-host sync, open an issue and we will help.
+
 ## FAQ
 
-**Does my data leave my machine?** Not until you share. In a local project, files and agent runs stay on disk. Sharing a doc syncs that doc through our cloud; everything else stays local.
+**Does my data leave my machine?** Not until you share a doc; sharing syncs only that doc through our cloud.
 
 **Do I need an API key?** No. Sundial drives the Claude Code and Codex you already have, on your existing plan. Signed in, you can also use hosted models with no key.
 
@@ -73,7 +94,7 @@ Claude Code · Codex · Claude, GPT, Gemini and open models through Sundial's ho
 ## Security model
 
 - Agents propose; you decide. Agent writes land as suggestions with inline review, and full edit history means anything is revertable.
-- Your files are plain markdown on your disk. Nothing leaves your machine until you share a file or folder, and sharing is scoped to exactly what you picked.
+- Your files are plain markdown on your disk, and sharing is scoped to exactly the files you picked.
 
 ## Build
 
@@ -88,8 +109,6 @@ cd tauri && pnpm tauri build
 
 `pnpm exec next build desktop-ui` builds just the UI; `node local-server/server.mjs` runs the sidecar against a checkout.
 
-Under the hood, documents are CRDTs (Yjs), so people and agents edit the same doc concurrently without conflicts and every keystroke carries attribution. A Tauri shell hosts the editor; a local sidecar watches your folders and drives the agent engines on your own login, streaming their output into the doc as tracked changes rather than file overwrites. Sharing syncs the same CRDT through a Hocuspocus server; if you want to self-host sync, open an issue and we will help.
-
 ## Philosophy
 
 Minimal, fast, and intentional about the line between what stays private and what you share. Sundial exists to raise the bits per second between you, your team, and your agents.
@@ -100,7 +119,7 @@ Sundial stands on [Yjs](https://github.com/yjs/yjs), [Tiptap](https://github.com
 
 ## Contributing
 
-Contributions are welcome: bug reports, fixes, features, ideas. Open an issue or send a PR. We review everything here, and merged changes ship in the next release with your authorship preserved. Planning something bigger? Open an issue first and we will help you scope it.
+Contributions are welcome: bug reports, fixes, features, ideas. Open an issue or send a PR. If we take your PR, we carry it into our monorepo with your authorship preserved and it ships in the next export ([docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) explains why). Planning something bigger? Open an issue first and we will help you scope it.
 
 If Sundial is useful to you, a star helps other people find it.
 
