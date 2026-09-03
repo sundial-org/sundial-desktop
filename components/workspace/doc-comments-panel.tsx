@@ -3,6 +3,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { SunnyAnimation } from '@/components/sunny-animation';
+import { extractSelectionActionSummary } from '@/lib/assistants/selection-action-summary';
 
 // Submit a comment textarea on Cmd/Ctrl+Enter. The caller passes the already-
 // gated submit action; it only runs when the shortcut fires and `canSubmit`.
@@ -17,6 +18,7 @@ function submitOnCmdEnter(
   }
 }
 import {
+  CaretDownIcon,
   CaretUpIcon,
   ChatCircleIcon,
   CheckIcon,
@@ -897,6 +899,158 @@ export function ThreadMessageRow({
   );
 }
 
+/** Claim checks are comment threads, not a second inline-result system. This
+ * card only changes how that typed thread is summarized in the lane; anchoring,
+ * realtime, chat navigation, and persistence all remain the comment path. */
+function ClaimVerificationThreadCard({
+  thread,
+  active,
+  mode,
+  chatActivity,
+  onOpen,
+  onOpenThreadChat,
+}: {
+  thread: DocCommentThread;
+  active: boolean;
+  mode: CommentPanelMode;
+  chatActivity?: (chatId: string) => 'working' | 'answering' | 'idle' | null;
+  onOpen: () => void;
+  onOpenThreadChat?: (chatId: string) => void;
+}) {
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const agentMessage = [...thread.messages]
+    .reverse()
+    .find((message) => isAgentCommentAuthor(message.author));
+  const activity = thread.chatId ? chatActivity?.(thread.chatId) ?? null : null;
+  const working =
+    !agentMessage &&
+    (isOptimisticCommentId(thread.id) ||
+      !thread.chatId ||
+      activity === 'working' ||
+      activity === 'answering');
+  const verdict = extractSelectionActionSummary(agentMessage?.body);
+  const detailsId = `claim-verification-details-${thread.id}`;
+  const statusId = `claim-verification-status-${thread.id}`;
+
+  return (
+    <article
+      data-testid="claim-verification-thread-card"
+      data-phase={working ? 'working' : verdict ? 'complete' : 'idle'}
+      className={`${COMMENT_CARD_CLASS} w-full px-4 py-3 text-left ${
+        active && mode === 'document' ? 'border-beige-200 bg-beige-50' : ''
+      } ${thread.status === 'resolved' ? 'opacity-80' : ''} ${
+        working ? 'comment-thread-working border-beige-300' : ''
+      }`}
+    >
+      <div className="flex items-start gap-2.5">
+        <Avatar author={{ name: 'Claim Verifier', imageUrl: null }} />
+        <div className="min-w-0 flex-1">
+          <button
+            type="button"
+            data-testid="claim-verification-select"
+            aria-label="Select Claim Verifier comment"
+            aria-describedby={statusId}
+            onClick={onOpen}
+            className="block w-full rounded text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-beige-300"
+          >
+            <span className="block truncate text-[13px] font-medium leading-5 text-stone-800">
+              Claim Verifier
+            </span>
+          </button>
+
+          <div
+            id={statusId}
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            data-testid="claim-verification-live-region"
+            className="mt-2"
+          >
+            {working ? (
+              <span
+                data-testid="claim-verification-status"
+                className="flex items-center gap-2 text-[12px] leading-5 text-stone-500"
+              >
+                <span
+                  className="comment-agent-dot h-1.5 w-1.5 shrink-0 rounded-full bg-beige-500"
+                  aria-hidden
+                />
+                Claim Verifier Working
+              </span>
+            ) : verdict ? (
+              <span
+                data-testid="claim-verification-verdict"
+                title={verdict}
+                className="block line-clamp-2 break-words text-[13px] leading-5 text-stone-700"
+              >
+                {verdict}
+              </span>
+            ) : (
+              <span
+                data-testid="claim-verification-status"
+                className="block text-[12px] leading-5 text-stone-500"
+              >
+                Verification stopped
+              </span>
+            )}
+          </div>
+
+          <div className="mt-2 flex items-center gap-1">
+            <button
+              type="button"
+              aria-expanded={detailsOpen}
+              aria-controls={detailsId}
+              onClick={(event) => {
+                event.stopPropagation();
+                setDetailsOpen((open) => !open);
+              }}
+              className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-medium text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-600"
+            >
+              Details
+              {detailsOpen ? (
+                <CaretUpIcon className="h-3 w-3" weight="bold" aria-hidden />
+              ) : (
+                <CaretDownIcon className="h-3 w-3" weight="bold" aria-hidden />
+              )}
+            </button>
+            {thread.chatId ? (
+              <button
+                type="button"
+                data-testid="claim-verification-open-thread"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onOpenThreadChat?.(thread.chatId!);
+                }}
+                className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-1 text-[11px] font-medium text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-600"
+              >
+                <ChatCircleIcon className="h-3.5 w-3.5" weight="bold" aria-hidden />
+                Open thread
+              </button>
+            ) : null}
+          </div>
+
+          <div
+            id={detailsId}
+            data-testid="claim-verification-details"
+            hidden={!detailsOpen}
+            className="mt-2 border-t border-stone-100 pt-2"
+          >
+            <div className="text-[10px] font-medium uppercase tracking-wide text-stone-400">
+              Claim
+            </div>
+            <p
+              data-testid="claim-verification-quote"
+              className="mt-1 whitespace-pre-wrap text-[12px] leading-5 text-stone-600"
+            >
+              {thread.quote}
+            </p>
+          </div>
+        </div>
+      </div>
+    </article>
+  );
+}
+
 function ThreadCard({
   mode,
   thread,
@@ -1032,6 +1186,19 @@ function ThreadCard({
     }
     onSelect();
   };
+
+  if (thread.kind === 'claim_verification') {
+    return (
+      <ClaimVerificationThreadCard
+        thread={thread}
+        active={active}
+        mode={mode}
+        chatActivity={chatActivity}
+        onOpen={handleOpen}
+        onOpenThreadChat={onOpenThreadChat}
+      />
+    );
+  }
 
   // An emoji reaction is a comment thread with a single one-emoji message. The
   // emoji lives ONLY here — in the margin, at its anchor's height, Google-Docs

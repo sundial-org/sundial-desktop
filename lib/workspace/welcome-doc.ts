@@ -46,7 +46,7 @@ Drag or copy-paste your own doc, .tex, .docx, .md, .py to try Sundial on real wo
 
 ---
 
-Built with 🌟 by students and researchers.
+Built with 🌟 by a small team that writes with agents every day.
 `;
 
 export const WELCOME_PATH = 'welcome.md';
@@ -97,10 +97,13 @@ Then drag in your own .tex, .md, .docx, or .py to try Sundial on real work,
 and add people to this workspace so they can comment too.
 
 \\vspace{1em}
-\\noindent Built by students and researchers.
+\\noindent Built by a small team that writes with agents every day.
 
 \\end{document}
 `;
+
+export const WELCOME_TEX_ERROR_LINE =
+  WELCOME_TEX.slice(0, WELCOME_TEX.indexOf(WELCOME_TEX_ERROR_TARGET)).split('\n').length;
 
 // NESTED on purpose: a root-level \documentclass file would become a second
 // root candidate and flip real projects (main.tex + sections/) to
@@ -118,5 +121,16 @@ export const WELCOME_TEX_MIME = 'text/x-tex';
  * the compile service before showing the error only adds latency. */
 export const WELCOME_TEX_INITIAL_COMPILE_ERROR = {
   message: 'LaTeX compilation failed',
-  details: "onboarding/welcome.tex:12: File `sundial-intentional-error.tex' not found.",
+  details: `onboarding/welcome.tex:${WELCOME_TEX_ERROR_LINE}: File \`sundial-intentional-error.tex' not found.`,
 } as const;
+
+export function hasWelcomeTexInitialCompileMarker(
+  markers: ReadonlyArray<{ line: number; severity: string; message: string }>,
+): boolean {
+  return markers.some(
+    (marker) =>
+      marker.line === WELCOME_TEX_ERROR_LINE &&
+      marker.severity === 'error' &&
+      marker.message.includes('sundial-intentional-error.tex'),
+  );
+}

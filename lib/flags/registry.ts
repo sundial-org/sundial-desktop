@@ -55,6 +55,18 @@ export const FLAGS: readonly FlagDefinition[] = [
     surface: 'advanced',
   },
   {
+    key: 'assistants_enabled',
+    category: 'preference',
+    // Launched default-on 2026-08-28; the switch remains the opt-out.
+    default: true,
+    label: 'Assistants',
+    description:
+      'Browse assistants from the workspace sidebar: start a new workspace from one, or connect one into the current workspace.',
+    owner: 'm13v',
+    reviewBy: '2026-11-27',
+    surface: 'advanced',
+  },
+  {
     key: 'autocomplete_enabled',
     category: 'preference',
     default: false,
@@ -68,7 +80,9 @@ export const FLAGS: readonly FlagDefinition[] = [
   {
     key: 'pdf_comments_enabled',
     category: 'preference',
-    default: false,
+    // Launched default-on 2026-08-28 after founder verification on dev; the
+    // switch remains the opt-out.
+    default: true,
     label: 'PDF comments',
     description:
       'Select text in the compiled PDF preview to comment on it. Comments anchor to the LaTeX source and show in both views.',

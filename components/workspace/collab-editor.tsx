@@ -117,7 +117,6 @@ import { EditorRewritePopup } from '@/components/workspace/editor-rewrite-popup'
 // anchor/codec internals lazy-loaded on open.
 import { EditorPrismPopup } from '@/components/workspace/editor-prism-popup';
 import { EditorLengthResize } from '@/components/workspace/editor-length-resize';
-import { EditorFactcheckPopup } from '@/components/workspace/editor-factcheck-popup';
 import { EditorPangramPopup } from '@/components/workspace/editor-pangram-popup';
 import { EditorImageGenPopup } from '@/components/workspace/editor-image-gen';
 import {
@@ -247,6 +246,9 @@ interface CollabEditorProps {
   /** Workspace project id. When set the editor connects to the
    *  per-workspace Sunny sandbox instead of the global Hocuspocus. */
   workspaceId?: string;
+  /** Cloud project id authorized for workspace-global assistant actions.
+   *  Omit for local workspaces and members without workspace-wide write. */
+  selectionActionsProjectId?: string;
   /** Path on the workspace volume. Used as the Yjs document name when the
    *  Sunny sandbox connection is active. */
   filePath?: string;
@@ -1883,6 +1885,7 @@ function findScrollableAncestor(node: HTMLElement | null): HTMLElement | null {
 function CollabEditorInner({
   fileId,
   workspaceId,
+  selectionActionsProjectId,
   filePath,
   placeholder = 'Start typing...',
   user,
@@ -3240,6 +3243,7 @@ function CollabEditorInner({
           <EditorBubbleMenu
             editor={editor}
             filePath={filePath ?? null}
+            selectionActionsProjectId={selectionActionsProjectId}
             // Hides the bubble under the link popover via shouldShow. A ref
             // instead of conditional mounting: remounting a BubbleMenu
             // re-registers its plugin, reconfiguring the whole EditorState
@@ -3287,11 +3291,6 @@ function CollabEditorInner({
             filePath={filePath ?? null}
           />
           <EditorLengthResize
-            editor={editor}
-            projectId={workspaceId ?? null}
-            filePath={filePath ?? null}
-          />
-          <EditorFactcheckPopup
             editor={editor}
             projectId={workspaceId ?? null}
             filePath={filePath ?? null}

@@ -161,12 +161,12 @@ export function GetSetUpCard({
           label="Create a project"
           detail="Start a workspace for your docs"
         />
-        <Step done={state.agentEdit} label="Agent edits a file" detail="Ask Sunny to change something" />
+        <Step done={state.agentEdit} label="Agent edits a file" detail="Ask the agent to change something" />
         <Step done={state.commented} label="Make a comment" detail="Highlight text and comment" />
         <Step
           done={state.commentReply}
           label="Agent responds to a comment"
-          detail="Sunny replies in the thread"
+          detail="The agent replies in the thread"
         />
         <Step done={state.shared} label="Share a workspace or file" detail="Invite someone or copy a link" />
       </ul>

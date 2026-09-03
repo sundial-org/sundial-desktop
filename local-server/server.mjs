@@ -3,7 +3,7 @@ import os from 'node:os';
 import fsp from 'node:fs/promises';
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 import { LocalStore, coerceModelForHarness, defaultHome } from './store.mjs';
@@ -13,7 +13,7 @@ import {
   safeResolveInRoot, walkProject, writeBlobAtomic, writeBlobStreamAtomic, writeTextFileAtomic,
 } from './disk.mjs';
 import { RootWatchers, locateRel, pickRootPrefix, projectRoots, walkAllRoots } from './roots.mjs';
-import { MIME, fileKind, isIgnoredPath, normalizeRelPath, resolveInRoot } from './paths.mjs';
+import { MIME, fileKind, fileKindForFile, isIgnoredPath, normalizeRelPath, resolveInRoot } from './paths.mjs';
 import { buildLocalChangeEntries, collectLocalSessions } from './history.mjs';
 import { SyncBridgeManager } from './bridge.mjs';
 import { compileLatexLocally } from './compile.mjs';
@@ -23,12 +23,47 @@ import { isSingleEmoji } from '../lib/workspace/doc-comments.ts';
 import { LocalAgentHost } from './agent/runner.mjs';
 import { SUNNY_AUTHOR, createAgentWriter, engineAuthorId } from './agent/tools.mjs';
 import { cloneGitHubRepo, createProjectDir } from './scaffold.mjs';
+import { parseSidecarArgs, SIDECAR_USAGE, SidecarCliError } from './cli.mjs';
+import { createDiagnosticsSink } from './diagnostics.mjs';
 
 /** Bumped whenever the shell/web app depends on a sidecar endpoint that older
  *  sidecars lack. A leftover instance from before an update reports a lower
  *  number (absent = 1) and gets REPLACED at boot instead of deferred to —
  *  deferring to old code is how "unknown project" reached the create dialog. */
-export const SIDECAR_API_VERSION = 24; // …24: `signedIn` on /health (agent-credentials present) — a headless `serve.sh --share` run reads it to decline injecting an anon share into a signed-in desktop instance (and points the user at the app's Share); an older instance omits it, so the headless defer requires apiVersion ≥ 24 and refuses rather than guessing; …9: grants-model shares (grants:true, scope:* ids) — an older sidecar would silently create a LEGACY share against the hidden backing workspace; 10: /turn-edits (chat diff chip), chat-message paging (beforeSequence), /local/<id> served off the shell; 11: extra_roots on GET /projects (launcher rows label multi-folder workspaces); 12: POST /shares/confirm (mint-confirm — the client treats a 404 as live for older sidecars); 13: scope generations (confirm returns `generation`, scopes carry it, stops revoke ≤ it); 14: afterSequence on /chat-messages selects the EARLIEST rows after the cursor (same response shape, different page) — an older sidecar returns the newest window instead, so the web app's long-turn backfill would silently re-read the tail and leave the middle of the turn missing; 15: /comments reads and writes the CLOUD backing store for share-covered paths — an older sidecar keeps every comment in its local twin, so link guests' comments stay invisible to the owner (and the owner's to them) until the service is restarted by hand; 16: comments trigger agent runs (thread.chatId on GET /comments, comment_watch_path on /chats) — an older sidecar just stores the comment and nothing reacts; 17: `running` on GET /chats rows (live runner state) — the comment panel's "Agent is working" clears from it; absent means unknown and the panel falls back to reply-derived state; 18: POST /chat-messages persists a UUID clientId as the row id (optimistic↔persisted identity) — an older sidecar mints a fresh id, so every history reconcile re-adds the user row beside the optimistic bubble (duplicate message at the transcript bottom); 19: /file, /folder and /rename answer 409 on a case-variant collision — an older sidecar silently truncates the differently-cased original (`recent.md` empties `Recent.md`); 20: /local-engines resolves `defaultHarness` from detection when nobody picked one (and new chats are stamped with it) — an older sidecar answers null, so every new chat silently runs as cloud Sunny while the composer chip says so, ignoring the Claude Code / Codex the machine already has; 21: `answering` on GET /chats rows (a started run still owes this chat's comment thread an answer, spanning the retry gaps where it is not live) — the comment panel holds its "Agent is working" badge on it, so the badge no longer clears seconds before the reply lands; an older sidecar omits it and the badge clears on the first settle, as before; 22: the shares surface is scoped to the deployment this sidecar proxies (one ledger per machine, one row set per cloud) — an older sidecar mixes another deployment's rows into this app's list, where they retry that cloud forever, veto new shares on the same path, hand back their unreachable workspace as this project's backing one, and answer every Stop with "Project not found"; 23: `eventsPort` on /health (a dedicated events-plane listener, so the long-lived /events stream never occupies a data-plane connection slot) — an older sidecar omits it and the app keeps the stream on the primary origin
+export const SIDECAR_API_VERSION = 26; // 26: shares expose per-scope sync progress and the bridge reports cloud heartbeats; 25: hosted MCP folder attach + in-sidecar credential refresh; 24: `signedIn` on /health (agent-credentials present) — a headless `serve.sh --share` run reads it to decline injecting an anon share into a signed-in desktop instance (and points the user at the app's Share); an older instance omits it, so the headless defer requires apiVersion ≥ 24 and refuses rather than guessing; …9: grants-model shares (grants:true, scope:* ids) — an older sidecar would silently create a LEGACY share against the hidden backing workspace; 10: /turn-edits (chat diff chip), chat-message paging (beforeSequence), /local/<id> served off the shell; 11: extra_roots on GET /projects (launcher rows label multi-folder workspaces); 12: POST /shares/confirm (mint-confirm — the client treats a 404 as live for older sidecars); 13: scope generations (confirm returns `generation`, scopes carry it, stops revoke ≤ it); 14: afterSequence on GET /chat-messages selects the EARLIEST rows after the cursor (same response shape, different page) — an older sidecar returns the newest window instead, so the web app's long-turn backfill would silently re-read the tail and leave the middle of the turn missing; 15: /comments reads and writes the CLOUD backing store for share-covered paths — an older sidecar keeps every comment in its local twin, so link guests' comments stay invisible to the owner (and the owner's to them) until the service is restarted by hand; 16: comments trigger agent runs (thread.chatId on GET /comments, comment_watch_path on /chats) — an older sidecar just stores the comment and nothing reacts; 17: `running` on GET /chats rows (live runner state) — the comment panel's "Agent is working" clears from it; absent means unknown and the panel falls back to reply-derived state; 18: POST /chat-messages persists a UUID clientId as the row id (optimistic↔persisted identity) — an older sidecar mints a fresh id, so every history reconcile re-adds the user row beside the optimistic bubble (duplicate message at the transcript bottom); 19: /file, /folder and /rename answer 409 on a case-variant collision — an older sidecar silently truncates the differently-cased original (`recent.md` empties `Recent.md`); 20: /local-engines resolves `defaultHarness` from detection when nobody picked one (and new chats are stamped with it) — an older sidecar answers null, so every new chat silently runs as cloud Sunny while the composer chip says so, ignoring the Claude Code / Codex the machine already has; 21: `answering` on GET /chats rows (a started run still owes this chat's comment thread an answer, spanning the retry gaps where it is not live) — the comment panel holds its "Agent is working" badge on it, so the badge no longer clears seconds before the reply lands; an older sidecar omits it and the badge clears on the first settle, as before; 22: the shares surface is scoped to the deployment this sidecar proxies (one ledger per machine, one row set per cloud) — an older sidecar mixes another deployment's rows into this app's list, where they retry that cloud forever, veto new shares on the same path, hand back their unreachable workspace as this project's backing one, and answer every Stop with "Project not found"; 23: `eventsPort` on /health (a dedicated events-plane listener, so the long-lived /events stream never occupies a data-plane connection slot) — an older sidecar omits it and the app keeps the stream on the primary origin
+
+/**
+ * DNS-rebinding gate. Binding to 127.0.0.1 keeps other machines out, but it is
+ * no defence against a page on any origin resolving its OWN name to 127.0.0.1
+ * and then talking to us as same-origin. The `Host` header is the one part of
+ * that request the page cannot forge, so a request naming anything but a
+ * loopback host is refused outright — including `/health`, which answers ahead
+ * of the bearer gate and would otherwise leak install presence, project count
+ * and the proxied origin to any site.
+ *
+ * Accepts `127.0.0.1`, `localhost` and `[::1]`, each with an optional port. A
+ * missing Host is refused too: HTTP/1.1 requires one, and every client here
+ * (the webview, the CLI, the launcher) sends it.
+ */
+export const isLoopbackHost = (value) => {
+  const host = String(value ?? '').trim().toLowerCase();
+  if (!host) return false;
+  const name = host.startsWith('[') ? host.slice(0, host.indexOf(']') + 1) : host.split(':')[0];
+  const port = host.slice(name.length);
+  if (port && !/^:\d{1,5}$/.test(port)) return false;
+  return name === '127.0.0.1' || name === 'localhost' || name === '[::1]';
+};
+
+/** True for an Origin header naming a loopback host (any scheme/port) — the
+ *  only pages, beyond the deployment this instance proxies, with any business
+ *  reading the sidecar API cross-origin. */
+export const isLoopbackOrigin = (value) => {
+  try {
+    return isLoopbackHost(new URL(value).host);
+  } catch {
+    return false;
+  }
+};
 
 /** @param {{ port?: number, home?: string, log?: (message: string) => void, exitOnShutdown?: boolean }} [options] */
 export async function startLocalServer({
@@ -41,15 +76,67 @@ export async function startLocalServer({
   if (!log) {
     // Default logger also appends to <home>/sidecar.log — the packaged app's
     // stdout goes nowhere, and sync incidents are undebuggable without it.
+    // Rotate keep-one-previous instead of deleting: an incident spanning a
+    // restart must not lose its earlier evidence at exactly that boot.
     const logFile = path.join(home, 'sidecar.log');
     try {
-      if (fs.statSync(logFile).size > 5_000_000) fs.rmSync(logFile);
+      if (fs.statSync(logFile).size > 5_000_000) {
+        fs.rmSync(`${logFile}.prev`, { force: true });
+        fs.renameSync(logFile, `${logFile}.prev`);
+      }
     } catch { /* absent — start fresh */ }
+    // The login unit's stdout file has no rotation of its own; launchd opens
+    // it O_APPEND, so a boot-time copy+truncate caps it safely.
+    const launchdLog = path.join(home, 'serve-launchd.log');
+    try {
+      if (fs.statSync(launchdLog).size > 10_000_000) {
+        fs.rmSync(`${launchdLog}.prev`, { force: true });
+        fs.copyFileSync(launchdLog, `${launchdLog}.prev`);
+        fs.truncateSync(launchdLog, 0);
+      }
+    } catch { /* absent */ }
     const logStream = fs.createWriteStream(logFile, { flags: 'a' });
     log = (message) => {
       const line = `${new Date().toISOString()} ${message}`;
       console.log(`[sundial-local] ${line}`);
       logStream.write(`${line}\n`);
+    };
+  }
+  // Error-level diagnostics ship to the deployment this sidecar proxies (see
+  // diagnostics.mjs; SUNDIAL_NO_DIAGNOSTICS=1 opts out, disclosed in /start).
+  // Wrapped around whatever logger is in effect so the desktop shell's own
+  // logger feeds it too; the sink swallows every failure.
+  const diagnosticsOrigin = (process.env.SUNDIAL_REMOTE_ORIGIN || '').trim().replace(/\/$/, '');
+  let loadedBundleHash = null;
+  const installId = (() => {
+    try {
+      const identity = fs.readFileSync(path.join(home, 'headless-identity'), 'utf8').trim();
+      return identity ? createHash('sha256').update(identity).digest('hex').slice(0, 16) : null;
+    } catch {
+      return null;
+    }
+  })();
+  const diagnostics = createDiagnosticsSink({
+    resolveTarget: () => {
+      if (!diagnosticsOrigin) return null;
+      const share = store.latestShareForOrigin(diagnosticsOrigin);
+      return share ? { origin: diagnosticsOrigin, token: share.token, workspaceId: share.workspace_id } : null;
+    },
+    envelope: () => ({
+      installId,
+      bundleHash: loadedBundleHash,
+      apiVersion: SIDECAR_API_VERSION,
+      remoteOrigin: diagnosticsOrigin || null,
+      platform: `${process.platform}-${process.arch}`,
+      node: process.version,
+      supervised: process.argv.includes('--supervised'),
+    }),
+  });
+  {
+    const baseLog = log;
+    log = (message) => {
+      baseLog(message);
+      diagnostics.observe(message);
     };
   }
   const watchers = new Map(); // projectId -> ProjectWatcher
@@ -497,7 +584,7 @@ export async function startLocalServer({
         '',
         canComment
           ? 'Address this comment: make the requested changes (they land as suggestions for review), then post a brief reply on the thread with reply_comment (thread_id above) — a sentence or two, no recap. Do NOT resolve the thread; the commenter closes it after reviewing.'
-          : 'Address this comment: make the requested changes as suggestions, then state your answer briefly in this chat (this engine cannot post comment replies).',
+          : 'Address this comment: make the requested changes (they land as suggestions for review), then close with your reply to the commenter — a sentence or two, no recap. Your closing message is posted verbatim on the thread, so write it for the commenter, not as a chat summary.',
       );
     }
     return lines.join('\n');
@@ -508,7 +595,9 @@ export async function startLocalServer({
     if (!chat) return;
     const { harness } = runHarness(chat);
     // The Codex engine runs its own native toolset — no Sundial comment tools,
-    // so its instruction asks for an answer in chat instead.
+    // so its closing message is what answerSilentThreads posts on the thread.
+    // The instruction has to say so, or the model writes a chat-shaped recap
+    // and the commenter reads that as the reply.
     const content = commentMessage({ thread, body, authorName: author?.name, isNewThread, isThreadChat, firstThreadDelivery, canComment: harness !== 'openai' });
     const clientId = `comment:${messageId}`;
     // Dedupe is per-chat (the same comment fans out to several chats), and it
@@ -636,7 +725,10 @@ export async function startLocalServer({
   };
 
   docHost.onEditorConnected = (projectId, rel) => bridges.handleLocalDocOpened(projectId, rel);
-  docHost.onRemotePersist = (projectId, rel) => emit(projectId, { type: 'files-changed', path: rel });
+  docHost.onRemotePersist = (projectId, rel, { remoteOnly } = {}) => {
+    if (remoteOnly) bridges.handleRemotePersist(projectId, rel);
+    emit(projectId, { type: 'files-changed', path: rel });
+  };
   // Internal deletes (a rejected suggested creation) happen with the watcher
   // suppressed — propagate them like watcher deletes.
   docHost.onFileRemoved = (projectId, rel) => {
@@ -764,10 +856,17 @@ export async function startLocalServer({
     }
   };
 
+  // Header-less browser contexts are the only places the token may ride the
+  // URL: EventSource and media/file loads can't set Authorization. Everywhere
+  // else it stays out of URLs, where it would land in logs, devtools traces
+  // and copy-pasted links.
+  const QUERY_TOKEN_PATHS = /^\/projects\/[^/]+\/(events|file)$/;
   const authed = (req) => {
     const header = String(req.headers.authorization || '');
     const match = /^Bearer\s+(.+)$/i.exec(header);
-    const query = new URL(req.url || '/', 'http://localhost').searchParams.get('token');
+    const url = new URL(req.url || '/', 'http://localhost');
+    const query =
+      req.method === 'GET' && QUERY_TOKEN_PATHS.test(url.pathname) ? url.searchParams.get('token') : null;
     return verifyToken(match?.[1]?.trim() || query || '');
   };
 
@@ -1012,13 +1111,25 @@ export async function startLocalServer({
     pathname === '/projects' || pathname.startsWith('/projects/');
 
   const handleRequest = (req, res) => {
+    // Before anything else, CORS headers included: a rebound page must learn
+    // nothing at all, not even that a sidecar answered.
+    if (!isLoopbackHost(req.headers.host)) {
+      json(res, 403, { ok: false, error: 'forbidden host' });
+      return;
+    }
     const url = new URL(req.url || '/', 'http://localhost');
     const sidecarPath = !remoteOrigin || isSidecarPath(url.pathname);
     const origin = req.headers.origin;
-    // Permissive CORS applies to the sidecar's OWN API only — proxied web-app
-    // responses keep the remote's headers, so the proxy can't be used to read
-    // the cloud API cross-origin from arbitrary sites.
-    if (origin && sidecarPath) {
+    // CORS applies to the sidecar's OWN API only — proxied web-app responses
+    // keep the remote's headers, so the proxy can't be used to read the cloud
+    // API cross-origin — and only for origins with business here: loopback
+    // pages (repo dev servers, other sidecars) and the one deployment this
+    // instance proxies. Any other origin gets no CORS headers, so its reads
+    // fail in the browser and an arbitrary site can't probe /health for a
+    // "Sundial is installed / signed in" fingerprint.
+    const corsAllowed =
+      Boolean(origin) && (isLoopbackOrigin(origin) || (Boolean(remoteOrigin) && origin === remoteOrigin));
+    if (corsAllowed && sidecarPath) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Vary', 'Origin');
       // Resume headers included: the agent-stream reconnect sends them, and a
@@ -1404,7 +1515,7 @@ export async function startLocalServer({
         if (!stat) return null;
         return describeEntry({
           path: rel,
-          type: stat.isDirectory() ? 'folder' : fileKind(rel) === 'text' ? 'text' : 'blob',
+          type: stat.isDirectory() ? 'folder' : fileKindForFile(rel) === 'text' ? 'text' : 'blob',
           size: stat.isDirectory() ? 0 : stat.size,
           updated_at: stat.mtime.toISOString(),
         });
@@ -1442,7 +1553,7 @@ export async function startLocalServer({
         }
         const ext = path.extname(rel).toLowerCase();
         res.writeHead(200, {
-          'Content-Type': MIME[ext] || (fileKind(rel) === 'text' ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
+          'Content-Type': MIME[ext] || (fileKindForFile(rel) === 'text' ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
           'Content-Length': stat.size,
         });
         // Headers are already sent — an async read error (file vanished mid-
@@ -1455,7 +1566,7 @@ export async function startLocalServer({
         // own file system — no size cap, no base64/JSON inflation (the JSON
         // rail below tops out at the 20 MB body cap).
         const rel = normalizeRelPath(url.searchParams.get('path') || '');
-        if (!rel || isIgnoredPath(rel) || fileKind(rel) !== 'blob') {
+        if (!rel || isIgnoredPath(rel) || fileKindForFile(rel) !== 'blob') {
           json(res, 400, { ok: false, error: 'invalid path' });
           return;
         }
@@ -1474,7 +1585,7 @@ export async function startLocalServer({
       if (req.method === 'PUT' && sub === '/file') {
         const body = await readBody(req);
         const rel = normalizeRelPath(body.path || '');
-        const kind = rel && !isIgnoredPath(rel) ? fileKind(rel) : null;
+        const kind = rel && !isIgnoredPath(rel) ? fileKindForFile(rel) : null;
         // Binary upload: base64 body, no doc host involvement; share bridges
         // pick it up for sha-diffed blob sync.
         if (kind === 'blob' && typeof body.contentBase64 === 'string') {
@@ -1681,14 +1792,18 @@ export async function startLocalServer({
             store.recordEdit({ projectId: project.id, path: file.virtual, actor: auth.actor, contentText: text });
           }
         }
-        await deleteFile(loc.root, loc.rel);
+        // Ignored content (.git, node_modules, …) is preserved by design, and
+        // the folder holding it stays on disk — so it reappears in the very
+        // next listing. Report it instead of claiming a clean delete.
+        const { kept } = await deleteFile(loc.root, loc.rel);
+        const keptVirtual = kept.map((inner) => (loc.entry.prefix ? `${loc.entry.prefix}/${inner}` : inner));
         await docHost.handleDiskChange(project.id, rel, { actor: auth.actor });
         await bridges.handleLocalFileEvent(project.id, rel);
         emit(project.id, { type: 'files-changed', path: rel });
         // The undo cutoff must be STRICTLY after every ledger row this delete
         // wrote (snapshots + tombstones) — a browser-minted timestamp can tie
         // the same millisecond and make `created_at < cutoff` miss them.
-        json(res, 200, { ok: true, deletedAt: new Date(Date.now() + 1).toISOString(), untracked });
+        json(res, 200, { ok: true, deletedAt: new Date(Date.now() + 1).toISOString(), untracked, kept: keptVirtual });
         return;
       }
       if (req.method === 'GET' && sub === '/text-contents') {
@@ -1962,7 +2077,7 @@ export async function startLocalServer({
       if (req.method === 'POST' && sub === '/history-restore') {
         const body = await readBody(req);
         const rel = normalizeRelPath(String(body.path || ''));
-        if (!rel || isIgnoredPath(rel) || fileKind(rel) !== 'text') {
+        if (!rel || isIgnoredPath(rel) || fileKindForFile(rel) !== 'text') {
           json(res, 400, { ok: false, error: 'invalid path' });
           return;
         }
@@ -2765,7 +2880,9 @@ export async function startLocalServer({
         // Cloud sync tokens expire after 7 days; the app re-mints one whenever
         // it opens a shared project and hands it here.
         const body = await readBody(req);
-        bridges.refreshShareToken(project.id, sub.split('/')[2], String(body.token || ''));
+        const shareId = sub.split('/')[2];
+        if (body.refresh === true) await bridges.refreshMcpShare(project.id, shareId);
+        else bridges.refreshShareToken(project.id, shareId, String(body.token || ''));
         json(res, 200, { ok: true });
         return;
       }
@@ -2791,6 +2908,13 @@ export async function startLocalServer({
   let selfUpdateInfo = null;
 
   server.on('upgrade', (request, socket, head) => {
+    // The same rebinding gate as the HTTP path. It matters MORE here: a
+    // WebSocket handshake is not subject to CORS at all, so Host is the only
+    // thing standing between a rebound page and the collab socket.
+    if (!isLoopbackHost(request.headers.host)) {
+      socket.destroy();
+      return;
+    }
     docHost.server.webSocketServer.handleUpgrade(request, socket, head, (ws) => {
       docHost.hocuspocus.handleConnection(ws, request);
     });
@@ -2819,6 +2943,7 @@ export async function startLocalServer({
     .catch((error) => log(`bridge resume failed error=${error?.message}`));
 
   const close = async () => {
+    diagnostics.stop();
     // Bash children run in their OWN process groups so Stop can kill the whole
     // tree — which also means they no longer die alongside the sidecar on
     // Ctrl-C. Signal them explicitly or they outlive the process.
@@ -2841,6 +2966,7 @@ export async function startLocalServer({
 
   const setSelfUpdate = (info) => {
     selfUpdateInfo = info;
+    loadedBundleHash = info?.bundleHash ?? null;
   };
 
   return { server, store, docHost, agentHost, bridges, bridgesResumed, watchers, token, port: actualPort, eventsPort, home, close, setSelfUpdate };
@@ -2857,6 +2983,20 @@ const argvPath = (() => {
 })();
 const isMain = argvPath === fileURLToPath(import.meta.url);
 if (isMain) {
+  // Validate before installing handlers or touching the sidecar home. In
+  // particular, help and malformed invocations must never boot/register/share.
+  let cli;
+  try {
+    cli = parseSidecarArgs(process.argv.slice(2));
+  } catch (error) {
+    const message = error instanceof SidecarCliError ? error.message : String(error);
+    console.error(`sundial serve.mjs: ${message}\n\n${SIDECAR_USAGE}`);
+    process.exit(2);
+  }
+  if (cli.help) {
+    console.log(SIDECAR_USAGE);
+    process.exit(0);
+  }
   // Node's default handling would crash with the stack on stderr only — a
   // Finder-launched app has no stderr, so mirror it into sidecar.log first.
   const fatal = (kind) => (error) => {
@@ -2888,19 +3028,12 @@ if (isMain) {
   // boot, register the folder, wire it into an anon-owned cloud share, and
   // print the workspace link. The cloud origin rides SUNDIAL_REMOTE_ORIGIN —
   // the same env the proxy already uses, exported by serve.sh.
-  const shareIdx = process.argv.indexOf('--share');
-  const shareFolder =
-    shareIdx !== -1 ? path.resolve(process.argv[shareIdx + 1] || process.cwd()) : null;
+  const shareFolder = cli.share ? path.resolve(cli.share) : null;
   // --workspace <url|slug|uuid>: attach the folder to an EXISTING workspace
   // (a URL's anon= key authorizes it) instead of creating one. The bridge's
   // first sync produces the union of both sides; same-path conflicts keep
   // the local version.
-  const workspaceIdx = process.argv.indexOf('--workspace');
-  const attachWorkspace = workspaceIdx !== -1 ? (process.argv[workspaceIdx + 1] || '').trim() : null;
-  if (workspaceIdx !== -1 && !attachWorkspace) {
-    console.error('[sundial-local] --workspace needs a workspace URL, slug, or id');
-    process.exit(1);
-  }
+  const attachWorkspace = cli.workspace;
   // --install: write a login unit (LaunchAgent / systemd user unit) that
   // keeps ONE daemon alive across restarts — boot resumes every shared
   // folder from the ledger, so the unit needs no per-folder arguments.
@@ -2919,9 +3052,9 @@ if (isMain) {
   const wantsInstall =
     shareFolder !== null &&
     persistSupported &&
-    !process.argv.includes('--no-install') &&
-    !process.argv.includes('--supervised');
-  if (process.argv.includes('--uninstall')) {
+    !cli.noInstall &&
+    !cli.supervised;
+  if (cli.uninstall) {
     const { uninstallPersistence } = await import('./persist.mjs');
     console.log(`[sundial-local] ${uninstallPersistence({ log: console.error, home: defaultHome() })}`);
     process.exit(0);
@@ -2944,6 +3077,7 @@ if (isMain) {
         folder: shareFolder,
         home: defaultHome(),
         ...(attachWorkspace ? { workspace: attachWorkspace } : {}),
+        ...(cli.mcpGrant ? { mcpGrant: cli.mcpGrant } : {}),
       });
       console.log(`[sundial-local] sharing ${shareFolder}`);
       console.log(`Workspace: ${result.url}`);
@@ -2956,6 +3090,16 @@ if (isMain) {
       console.log(
         `Side panel: ${result.url}${panelSep}view=panel renders one surface at a time for split views (add &filePath=<file> to pick; a .pdf path shows compiled output).`,
       );
+      // Two credentials, two audiences: the link above is the HUMAN's
+      // ownership handoff; this token is the AGENT's own rail credential
+      // (edit-capable where the key is review-only, e.g. resolving
+      // comments). Exposure adds nothing: the anon key in the link is
+      // strictly stronger. Re-running this command reprints a fresh one.
+      if (!result.mcp && result.token) {
+        console.log(
+          `Agent credential: authenticate /g ops with token=${result.token} (edit-capable, 7 days; re-run to reprint). The anon= link is the human's.`,
+        );
+      }
       return result;
     } catch (error) {
       console.error(`[sundial-local] share failed: ${error?.message}`);
@@ -3087,10 +3231,15 @@ if (isMain) {
             `(different version or deployment). Quit it and re-run, or share this folder from that app.`,
         );
       }
-      if (health.signedIn) {
-        // A signed-in desktop app owns the port. Injecting an anon share into
-        // its store would surface as a workspace the user can't own (owner
-        // actions 403). Point them at the app's Share, which owns it properly.
+      if (health.signedIn && !cli.mcpGrant && !attachWorkspace) {
+        // A signed-in instance owns the port and this run names no workspace,
+        // so it would mint a fresh anon backing workspace and inject it — which
+        // surfaces as a workspace the signed-in user can't own (owner actions
+        // 403). Point them at the app's Share, which owns it properly. An
+        // explicit --workspace attach is exempt: it targets an existing
+        // workspace and wires through shareAndReport below, where the peer's
+        // parked credentials (or the ref's key) attach it under the right
+        // identity — never an un-ownable phantom.
         console.log(
           `[sundial-local] the Sundial app is already running here. Open ${shareFolder} in the app and ` +
             `click Share to sync it under your account.`,
@@ -3193,7 +3342,7 @@ if (isMain) {
     }
     fail(`port ${port} is taken by something else — local projects unavailable`);
   });
-  if (process.argv.includes('--print-token')) console.log(`token: ${handle.token}`);
+  if (cli.printToken) console.log(`token: ${handle.token}`);
   // We are the server daemon. Wire the folder (if any), then arm the
   // daemon-side refresh whenever a headless identity exists — NOT only on
   // --share runs: a login-unit relaunch passes no folder, resumes every
@@ -3204,12 +3353,12 @@ if (isMain) {
     await shareAndReport(`http://127.0.0.1:${handle.port}`, handle.token);
     if (!wantsInstall) {
       const wantedButUnavailable =
-        !persistProbe.ok && !process.argv.includes('--no-install') && !process.argv.includes('--supervised');
+        !persistProbe.ok && !cli.noInstall && !cli.supervised;
       console.log(
         wantedButUnavailable
           ? `PERSISTENCE UNAVAILABLE on this system: ${persistProbe.reason} ` +
             `Sync runs ONLY while this process stays alive; keep it running and re-run this command after fixing the login service.`
-          : persistSupported && !process.argv.includes('--supervised')
+          : persistSupported && !cli.supervised
             ? 'One-off session (--no-install): sync stops when this process exits. Re-run without --no-install to make it survive reboots.'
             : 'Sync runs while this process runs.',
       );
@@ -3265,7 +3414,7 @@ if (isMain) {
   // just announce it, since exiting would stop sync with nobody to relaunch.
   const runningBundle = path.resolve(process.argv[1] ?? '');
   if (remoteApp && path.basename(runningBundle) === 'serve.mjs') {
-    const supervised = process.argv.includes('--supervised');
+    const supervised = cli.supervised;
     const { armSelfUpdate, checkAndApplyUpdate, sha256Hex } = await import('./update.mjs');
     // The hash of the code THIS process runs, captured at boot. Without it,
     // an external serve.sh run that overwrites the file leaves disk == deploy

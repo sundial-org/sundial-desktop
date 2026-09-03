@@ -1,5 +1,3 @@
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
 use std::io::{BufRead, Read, Write};
 use std::process::{Child, Command};
 use std::sync::Mutex;
@@ -140,15 +138,18 @@ fn dirs_home() -> std::path::PathBuf {
         .unwrap_or_else(|| ".".into())
 }
 
-/// System-entropy hex string without extra deps: RandomState seeds from the OS.
+/// Hex string of `words` 8-byte words straight from the OS CSPRNG.
+///
+/// This mints the sidecar token (filesystem access to every open project) and
+/// the first-launch /redeem nonce, so `RandomState` was the wrong tool: it is
+/// documented as non-cryptographic, and successive `new()` calls in one
+/// process share a seed with only an incrementing counter. Panicking beats
+/// degrading — a machine with no entropy source must not get a guessable
+/// token — and `getrandom` was already in the dependency tree.
 fn random_hex(words: usize) -> String {
-    let mut out = String::new();
-    for _ in 0..words {
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u128(std::time::UNIX_EPOCH.elapsed().map(|d| d.as_nanos()).unwrap_or(0));
-        out.push_str(&format!("{:016x}", hasher.finish()));
-    }
-    out
+    let mut bytes = vec![0u8; words * 8];
+    getrandom::fill(&mut bytes).expect("OS random number generator unavailable");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn load_or_mint_token() -> String {
@@ -849,6 +850,7 @@ pub fn run() {
             }
             let app_scheme = parsed.scheme().to_string();
             let app_domain = app_host(&parsed);
+            let dl_handle = app.handle().clone();
             let nav_handle = app.handle().clone();
             let nav_dest = parsed.clone();
             let nav_remote = remote.clone();
@@ -888,6 +890,16 @@ pub fn run() {
                             pick_location_flow(nav_handle.clone());
                             return false;
                         }
+                        // window.print() is a silent no-op in WKWebView, so the
+                        // page's Print actions navigate here instead and the
+                        // shell runs the native print panel (frontend gates on
+                        // desktopVersion >= 0.1.14 so older shells never 404).
+                        if is_marker(url, &app_scheme, &app_domain, "/desktop/print") {
+                            if let Some(window) = nav_handle.get_webview_window("main") {
+                                let _ = window.print();
+                            }
+                            return false;
+                        }
                         if is_marker(url, &app_scheme, &app_domain, "/desktop/relaunch-update") {
                             // A native picker is open (outside the DOM, so
                             // the page couldn't see it): decline — the toast
@@ -920,6 +932,52 @@ pub fn run() {
                     // (deferred when the load carries a picked folder — the
                     // page must take that open over before the launcher's
                     // auto-update may see the announcement.)
+                    // Without a download handler the webview silently drops
+                    // every download — `<a download>` blob saves included, so
+                    // "Download transcript" and the file Download buttons did
+                    // nothing on desktop. Route them to ~/Downloads under a
+                    // collision-free name; revealing the finished file in the
+                    // file manager is the user-visible receipt.
+                    .on_download(move |_webview, event| {
+                        match event {
+                            tauri::webview::DownloadEvent::Requested { destination, .. } => {
+                                let dir = dl_handle
+                                    .path()
+                                    .download_dir()
+                                    .unwrap_or_else(|_| std::env::temp_dir());
+                                let name = destination
+                                    .file_name()
+                                    .map(|n| n.to_os_string())
+                                    .unwrap_or_else(|| "download".into());
+                                let mut path = dir.join(&name);
+                                let mut counter = 1u32;
+                                while path.exists() {
+                                    let stem = std::path::Path::new(&name)
+                                        .file_stem()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| "download".into());
+                                    let ext = std::path::Path::new(&name)
+                                        .extension()
+                                        .map(|e| format!(".{}", e.to_string_lossy()))
+                                        .unwrap_or_default();
+                                    path = dir.join(format!("{stem} ({counter}){ext}"));
+                                    counter += 1;
+                                }
+                                *destination = path;
+                            }
+                            tauri::webview::DownloadEvent::Finished { path, success, .. } => {
+                                if success {
+                                    if let Some(path) = path {
+                                        let _ = tauri_plugin_opener::reveal_item_in_dir(path);
+                                    }
+                                } else {
+                                    eprintln!("[sundial] download failed");
+                                }
+                            }
+                            _ => {}
+                        }
+                        true
+                    })
                     .on_page_load(|window, payload| {
                         if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
                             let handoff = payload.url().fragment().is_some_and(|f| f.contains("openPath="));

@@ -6,10 +6,11 @@ import {
   ALLOWED_GATEWAY_MODELS,
   ALLOWED_GATEWAY_MODEL_SET,
   DEFAULT_MODEL_REF,
+  ANON_RUN_MODEL_ID,
 } from '@/lib/workspace/model-allowlist';
 import type { ModelPickerOption } from '@/lib/workspace/api-shared-types';
 
-export { ALLOWED_GATEWAY_MODELS, ALLOWED_GATEWAY_MODEL_SET, DEFAULT_MODEL_REF };
+export { ALLOWED_GATEWAY_MODELS, ALLOWED_GATEWAY_MODEL_SET, DEFAULT_MODEL_REF, ANON_RUN_MODEL_ID };
 export type { ModelPickerOption };
 
 // Which agent runtime runs a chat, picked via the tabs in the model picker.

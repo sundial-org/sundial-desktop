@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   ArrowClockwiseIcon,
   ArrowDownIcon,
@@ -12,6 +12,7 @@ import {
   FileTextIcon,
   LinkBreakIcon,
   PaperPlaneTiltIcon,
+  WarningCircleIcon,
 } from '@phosphor-icons/react';
 import { JitGitHubConnectModal } from '@/components/workspace/jit-github-connect-modal';
 import { SidebarSectionHeader } from '@/components/workspace/sidebar-section-header';
@@ -85,6 +86,7 @@ export function CommitsRail({
   onActionComplete,
   collapsed,
   onToggleCollapsed,
+  localSync,
 }: {
   projectId: string;
   repos: LinkedRepoSummary[];
@@ -95,6 +97,9 @@ export function CommitsRail({
   /** Accordion state: when collapsed, only the Sync section header renders. */
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
+  /** Sync section covers every connected sync method — a non-repo status card
+      (e.g. local folder mirror) renders above the repo surface. */
+  localSync?: ReactNode;
 }) {
   const [selectedRepoId, setSelectedRepoId] = useState<string | null>(repos[0]?.id ?? null);
   const [commits, setCommits] = useState<Commit[]>([]);
@@ -376,6 +381,16 @@ export function CommitsRail({
   useEffect(() => setConfirmRemove(false), [selectedRepoId]);
 
   if (!repos.length) {
+    // A local-folder-only workspace still gets the Sync section: header + the
+    // local sync card, no repo surface.
+    if (localSync) {
+      return (
+        <>
+          <SidebarSectionHeader label="Sync" collapsed={collapsed} onToggleCollapsed={onToggleCollapsed} />
+          {collapsed ? null : <div className="min-h-0 flex-1 overflow-y-auto">{localSync}</div>}
+        </>
+      );
+    }
     return (
       <div className="px-4 py-6 text-center">
         <GitCommitIcon className="mx-auto h-7 w-7 text-stone-300" weight="regular" aria-hidden />
@@ -414,6 +429,7 @@ export function CommitsRail({
           area, so on short sidebars the Commit & push button clips under the
           profile footer and can't be clicked. */}
       <div className="min-h-0 flex-1 overflow-y-auto">
+      {localSync}
       {repos.length > 1 ? (
         <div className="px-3 pb-2">
           <select
@@ -540,8 +556,9 @@ export function CommitsRail({
                   </div>
                 </div>
               ) : selectedRepo.bridgeState?.lastError ? (
-                <div className="rounded-md border border-amber-300 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-800">
-                  Sync failing: {selectedRepo.bridgeState.lastError}
+                <div className="flex items-start gap-1.5 rounded-md border border-stone-200 bg-white px-2.5 py-2 text-[11px] text-stone-500">
+                  <WarningCircleIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" weight="bold" aria-hidden />
+                  <span className="min-w-0">Sync failing: {selectedRepo.bridgeState.lastError}</span>
                 </div>
               ) : isLive ? (
                 <div
@@ -766,8 +783,9 @@ export function CommitsRail({
           </ol>
         )}
         {error ? (
-          <p className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] text-rose-700">
-            {error}
+          <p className="mt-3 flex items-start gap-1.5 rounded-md border border-stone-200 bg-white px-2.5 py-2 text-[11px] text-stone-500">
+            <WarningCircleIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-500" weight="bold" aria-hidden />
+            <span className="min-w-0">{error}</span>
           </p>
         ) : null}
       </div>

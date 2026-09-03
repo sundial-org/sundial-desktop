@@ -1,6 +1,6 @@
 {
   "name": "sundial-desktop",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "private": true,
   "description": "Tauri desktop wrapper for the Sundial web app",
   "scripts": {

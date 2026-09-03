@@ -5,6 +5,7 @@ import { forwardRef, useCallback, useEffect, useRef, useState } from 'react';
 import { IconTooltip } from '@/components/collab-bubbles';
 import { useDocStyle } from '@/lib/doc-style';
 import { setSpellcheckPreference } from '@/lib/spellcheck';
+import { printPage } from '@/lib/desktop';
 import {
   ArrowClockwiseIcon,
   ArrowCounterClockwiseIcon,
@@ -467,7 +468,7 @@ export function ToolbarOverflowItems({
           </DropdownItem>
           {!hidePrint && (
             <DropdownItem
-              onClick={() => run(() => typeof window !== 'undefined' && window.print())}
+              onClick={() => run(() => printPage())}
             >
               <PrinterIcon className="h-4 w-4" aria-hidden /> Print
             </DropdownItem>
@@ -702,7 +703,7 @@ export function MarkdownToolbar({
   const undo = useCallback(() => editor.chain().focus().undo().run(), [editor]);
   const redo = useCallback(() => editor.chain().focus().redo().run(), [editor]);
   const print = useCallback(() => {
-    if (typeof window !== 'undefined') window.print();
+    printPage();
   }, []);
   const clearFormatting = useCallback(
     () => editor.chain().focus().unsetAllMarks().clearNodes().run(),

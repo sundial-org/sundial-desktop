@@ -72,6 +72,21 @@ function nearestToLine(
 }
 
 /**
+ * 1-based [start, end] line span of a comment's quote inside `text`, or null
+ * when the quote no longer appears. This is how comments on files OTHER than
+ * the open one project onto the PDF: their Yjs anchors need the file's Y.Doc,
+ * but every thread carries the quote, and the file text is one fetch away.
+ */
+export function quoteLineSpan(text: string, quote: string): [number, number] | null {
+  if (!quote) return null;
+  const idx = text.indexOf(quote);
+  if (idx === -1) return null;
+  const start = text.slice(0, idx).split('\n').length;
+  const end = start + quote.split('\n').length - 1;
+  return [start, end];
+}
+
+/**
  * Find the source range for `selectedText` (the rendered text the user selected
  * in the PDF) near 1-based `line` of `sourceText`. Never throws; returns null
  * only when `line` is outside the document.

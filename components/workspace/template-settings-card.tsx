@@ -13,6 +13,10 @@ type Props = {
   defaultAddendum: string;
   // The user-edited text. Non-null means the brain uses this instead.
   initialOverride: string | null;
+  // The assistant's CURRENT instructions from the store. When it differs from
+  // defaultAddendum the assistant was edited after this workspace snapshotted
+  // it; we offer an opt-in "Update" that re-snapshots (server-side).
+  latestAddendum?: string | null;
 };
 
 /**
@@ -33,6 +37,7 @@ export function TemplateSettingsCard({
   templateName,
   defaultAddendum,
   initialOverride,
+  latestAddendum = null,
 }: Props) {
   const [override, setOverride] = useState<string | null>(initialOverride);
   const [draft, setDraft] = useState<string>(initialOverride ?? '');
@@ -41,6 +46,11 @@ export function TemplateSettingsCard({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [removed, setRemoved] = useState(false);
+  // Set once Update succeeds so the banner clears without a reload. State (not
+  // a prop resync) because the server-provided defaultAddendum is stale until
+  // the next navigation.
+  const [appliedDefault, setAppliedDefault] = useState<string | null>(null);
+  const [previewingUpdate, setPreviewingUpdate] = useState(false);
 
   useEffect(() => {
     setOverride(initialOverride);
@@ -50,7 +60,12 @@ export function TemplateSettingsCard({
   if (removed) return null;
 
   const isCustomized = override !== null;
-  const effectiveText = isCustomized ? override ?? '' : defaultAddendum;
+  const currentDefault = appliedDefault ?? defaultAddendum;
+  const effectiveText = isCustomized ? override ?? '' : currentDefault;
+  const updateAvailable =
+    typeof latestAddendum === 'string' &&
+    latestAddendum.trim().length > 0 &&
+    latestAddendum.trim() !== currentDefault.trim();
 
   async function patch(payload: Record<string, unknown>): Promise<boolean> {
     setBusy(true);
@@ -74,7 +89,7 @@ export function TemplateSettingsCard({
   }
 
   async function startCustomize() {
-    setDraft(override ?? defaultAddendum);
+    setDraft(override ?? currentDefault);
     setEditing(true);
     setViewing(false);
   }
@@ -82,7 +97,7 @@ export function TemplateSettingsCard({
   async function saveDraft() {
     const trimmed = draft.trim();
     // Treat editing back to the exact default as a Reset — cleaner state.
-    const next = trimmed === defaultAddendum.trim() ? null : draft;
+    const next = trimmed === currentDefault.trim() ? null : draft;
     const ok = await patch({ template_addendum_override: next });
     if (ok) {
       setOverride(next);
@@ -113,6 +128,16 @@ export function TemplateSettingsCard({
     if (ok) setRemoved(true);
   }
 
+  async function applyInstructionUpdate() {
+    // Server re-reads the assistant and re-snapshots; the client never sends
+    // the text itself.
+    const ok = await patch({ refresh_template_default: true });
+    if (ok) {
+      setAppliedDefault(latestAddendum ?? defaultAddendum);
+      setPreviewingUpdate(false);
+    }
+  }
+
   return (
     <div className="rounded-2xl border border-stone-200 bg-stone-50 p-3.5">
       <div className="flex items-start justify-between gap-3">
@@ -133,6 +158,44 @@ export function TemplateSettingsCard({
         </div>
       </div>
 
+      {updateAvailable ? (
+        <div
+          data-testid="template-update-banner"
+          className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2"
+        >
+          <p className="text-xs text-amber-900">
+            {templateName} has newer instructions than this workspace uses.
+            {isCustomized
+              ? ' Updating changes the default your Reset button restores; your customized text stays in effect.'
+              : ''}
+          </p>
+          <div className="mt-1.5 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setPreviewingUpdate((v) => !v)}
+              className="inline-flex items-center gap-1 text-xs text-amber-800 underline-offset-2 hover:underline"
+            >
+              {previewingUpdate ? 'Hide changes' : 'View changes'}
+            </button>
+            {canWrite ? (
+              <button
+                type="button"
+                onClick={applyInstructionUpdate}
+                disabled={busy}
+                className="rounded-lg bg-orange px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-orange-deep disabled:opacity-50"
+              >
+                {busy ? 'Updating…' : 'Update'}
+              </button>
+            ) : null}
+          </div>
+          {previewingUpdate ? (
+            <pre className="mt-2 max-h-[14rem] overflow-auto rounded-lg border border-amber-200 bg-white px-3 py-2 font-mono text-[11px] leading-relaxed text-stone-700 whitespace-pre-wrap">
+              {latestAddendum}
+            </pre>
+          ) : null}
+        </div>
+      ) : null}
+
       {editing ? (
         <div className="mt-3">
           <textarea
@@ -146,7 +209,7 @@ export function TemplateSettingsCard({
             <button
               type="button"
               onClick={saveDraft}
-              disabled={busy || draft === (override ?? defaultAddendum)}
+              disabled={busy || draft === (override ?? currentDefault)}
               className="rounded-lg bg-orange px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-orange-deep disabled:opacity-50"
             >
               {busy ? 'Saving…' : 'Save'}

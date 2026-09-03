@@ -96,7 +96,6 @@ export type SettingsTab =
   | 'billing'
   | 'github'
   | 'overleaf'
-  | 'chatApps'
   | 'apikeys'
   | 'gettingStarted';
 

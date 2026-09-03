@@ -235,6 +235,24 @@ export async function nameLocalChatFromFirstMessage(
 }
 
 /** `applied-<rowId>` → rowId; null for any other (cloud-shaped) review id. */
+/** Folders that a delete left standing: the target and every directory down
+ *  to a preserved ignored entry (a repo's `.git`, a `node_modules`). They are
+ *  still on disk, so reporting them as deleted makes the tree drop rows that
+ *  the next listing brings straight back. Exported for the delete mapping's
+ *  regression test. */
+export function survivingFolders(target: string, kept: string[]): Set<string> {
+  const survived = new Set<string>();
+  for (const keptPath of kept) {
+    let dir = keptPath;
+    for (let cut = dir.lastIndexOf('/'); cut > 0; cut = dir.lastIndexOf('/')) {
+      dir = dir.slice(0, cut);
+      if (dir !== target && !dir.startsWith(`${target}/`)) break;
+      survived.add(dir);
+    }
+  }
+  return survived;
+}
+
 function parseSessionReviewId(reviewId: string): number | null {
   const rowId = Number(reviewId.startsWith('applied-') ? reviewId.slice('applied-'.length) : 0);
   return Number.isInteger(rowId) && rowId > 0 ? rowId : null;
@@ -498,6 +516,12 @@ export function createLocalWorkspaceFetch(baseConfig: SidecarConfig, projectId: 
             (file) => file.path === path || file.path.startsWith(`${path}/`),
           );
           const result = await sidecar.deletePath(config, projectId, path);
+          // Ignored content (.git, node_modules, …) survives the delete, and so
+          // does every folder on the way down to it — those rows are still on
+          // disk and come back in the next listing, so they are NOT deleted.
+          const kept = Array.isArray(result.kept) ? result.kept : [];
+          const survived = survivingFolders(path, kept);
+          const removed = matching.filter((file) => !survived.has(file.path));
           // Text deletes reconstruct from the local ledger (delete tombstone +
           // /history-restore); a blob in the batch makes it non-undoable, same
           // rule as the cloud route — as does UNTRACKED content the sidecar
@@ -505,17 +529,18 @@ export function createLocalWorkspaceFetch(baseConfig: SidecarConfig, projectId: 
           // showed; restore couldn't bring them back). `deletedAt` is the
           // SIDECAR's cutoff — guaranteed after its ledger writes, unlike a
           // browser timestamp.
-          const restorable = !result.untracked && matching.every((file) => file.type !== 'blob')
+          const restorable = !result.untracked && removed.every((file) => file.type !== 'blob')
             ? {
-                folders: matching.filter((file) => file.type === 'folder').map((file) => file.path),
-                texts: matching.filter((file) => file.type === 'text').map((file) => file.path),
+                folders: removed.filter((file) => file.type === 'folder').map((file) => file.path),
+                texts: removed.filter((file) => file.type === 'text').map((file) => file.path),
               }
             : null;
           return json({
             ok: true,
-            deleted: matching.map((file) => file.path),
+            deleted: removed.map((file) => file.path),
             deletedAt: result.deletedAt ?? new Date().toISOString(),
             restorable,
+            kept,
           });
         }
         case 'PATCH /api/workspace/files': {

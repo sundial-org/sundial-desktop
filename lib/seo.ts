@@ -33,10 +33,10 @@ export const SITE_TAGLINE = 'Foundations for human-AI collaboration';
 
 // Product voice — every other surface (app pages, /editor, /download, /releases).
 // Mirrors the /editor hero; its baked copy lives in the sundial-landing repo.
-export const PRODUCT_TAGLINE = 'The AI-native editor for LaTeX and research';
+export const PRODUCT_TAGLINE = 'The multiplayer editor for people and agents';
 
 export const PRODUCT_DESCRIPTION =
-  'A collaborative LaTeX editor where AI edits arrive as reviewable suggestions, and the agent compiles, fixes its own errors, and checks your citations while you write. No compile timeouts, unlimited collaborators.';
+  'A local-first collaborative editor where Claude Code, Codex, and hosted agents edit alongside you. Every agent edit arrives as a reviewable suggestion, in live multiplayer markdown, LaTeX, and notebooks.';
 
 export const TWITTER_HANDLE = '@sundialhub';
 

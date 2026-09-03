@@ -99,6 +99,9 @@ type ChatComposerProps = {
   showModelPicker: boolean;
   setShowModelPicker: (value: boolean) => void;
   currentChatModel: string;
+  // Signed-out sender with free anonymous runs left: sends execute on the
+  // pinned cheap model regardless of the picker, so the menu says so.
+  anonModelPinned?: boolean;
   onSelectChatRuntime: (option: ChatRuntimePickerOption) => void;
   modelPickerRef: MutableRefObject<HTMLDivElement | null>;
   // Which agent runtime (harness) runs this chat, picked via the tabs at the
@@ -112,6 +115,13 @@ type ChatComposerProps = {
     claude: { available: boolean; loggedIn: boolean };
     codex: { available: boolean; loggedIn: boolean };
   } | null;
+  // Cloud workspaces: the signed-in payer's credential per engine, so the
+  // Claude Code / Codex rows can say whose account a turn runs on and prompt
+  // the connect flow (mirror of the desktop rows' localEngines status).
+  // null = local workspace or signed out (rows keep their generic hints).
+  cloudEngineAuth?: { claude: 'subscription' | 'api-key' | null; openai: 'api-key' | null } | null;
+  /** Opens Settings → API keys (the connect/BYOK panel) from a row's prompt. */
+  onConnectEngine?: () => void;
   // Local chats lock their engine once the conversation has messages —
   // switch engines by starting a new chat.
   harnessLocked?: boolean;
@@ -423,10 +433,13 @@ export const ChatComposer = memo(function ChatComposer({
   showModelPicker,
   setShowModelPicker,
   currentChatModel,
+  anonModelPinned = false,
   onSelectChatRuntime,
   modelPickerRef,
   harness,
   onSelectHarness,
+  cloudEngineAuth,
+  onConnectEngine,
   localEngines = null,
   harnessLocked = false,
   onNewChatWithHarness,
@@ -1415,6 +1428,15 @@ export const ChatComposer = memo(function ChatComposer({
                       data-testid="model-picker-menu"
                       className="absolute bottom-full right-0 z-20 mb-1 w-72 rounded-lg border border-stone-200 bg-white py-1 shadow-lg"
                     >
+                      {anonModelPinned && (
+                        <div
+                          data-testid="anon-model-pin-note"
+                          className="mx-1.5 mb-1 rounded-md bg-stone-50 px-2 py-1.5 text-[11px] leading-snug text-stone-500"
+                        >
+                          Free runs use {getChatModelLabel(currentChatModel, 'this model')}. Sign in
+                          to pick other models.
+                        </div>
+                      )}
                       {/* Compact agent row — the descriptive rows open in a
                           side flyout so switching agents never resizes the
                           menu (the inline rows made the whole thing jump). */}
@@ -1476,9 +1498,33 @@ export const ChatComposer = memo(function ChatComposer({
                               const relocatable = locked && Boolean(onNewChatWithHarness);
                               // One line under each agent naming what running
                               // it means here — connection state included, so
-                              // the presence dot never stands alone.
+                              // the presence dot never stands alone. Cloud rows
+                              // mirror the desktop contract: say whose account
+                              // pays, and prompt the connect flow when it's
+                              // Sundial's.
+                              const cloudAuth = !engine && cloudEngineAuth && h !== 'vercel'
+                                ? (h === 'claude' ? cloudEngineAuth.claude : cloudEngineAuth.openai)
+                                : null;
+                              // When the row's engine has no user credential,
+                              // clicking the row ALSO opens the connect panel
+                              // (Settings → API keys): one button, one action —
+                              // a separate tiny link next to a silent row read
+                              // as the row doing nothing (dev feedback).
+                              const rowOpensConnect = Boolean(
+                                !engine && cloudEngineAuth && onConnectEngine && h !== 'vercel' && !cloudAuth,
+                              );
                               const status = !engine
-                                ? CHAT_HARNESS_HINTS[h]
+                                ? !cloudEngineAuth || h === 'vercel'
+                                  ? CHAT_HARNESS_HINTS[h]
+                                  : cloudAuth === 'subscription'
+                                    ? 'Running on your Claude plan'
+                                    : cloudAuth === 'api-key'
+                                      ? h === 'claude'
+                                        ? 'Running on your Anthropic API key'
+                                        : 'Running on your OpenAI API key'
+                                      : h === 'claude'
+                                        ? 'Connect your Claude subscription to run on your plan'
+                                        : 'Add your OpenAI API key to run on your account'
                                 : h === 'claude'
                                   ? !engine.available
                                     ? 'Install Claude Code to chat on your subscription'
@@ -1509,6 +1555,12 @@ export const ChatComposer = memo(function ChatComposer({
                                     }
                                     onSelectHarness(h);
                                     setShowHarnessFlyout(false);
+                                    if (rowOpensConnect) {
+                                      // The chat still switches to this agent —
+                                      // it runs on credits until they connect.
+                                      setShowModelPicker(false);
+                                      onConnectEngine?.();
+                                    }
                                   }}
                                   className={`relative flex flex-col items-start rounded-md border px-2.5 py-1.5 text-left transition-colors ${
                                     harness === h
@@ -1527,16 +1579,22 @@ export const ChatComposer = memo(function ChatComposer({
                                   ) : null}
                                   <span className="flex w-full items-center gap-1.5 text-[13px] font-medium text-stone-800">
                                     {CHAT_HARNESS_LABELS[h]}
-                                    {engine ? (
+                                    {engine || cloudAuth ? (
                                       // Presence dot, not a checkmark — a ✓
                                       // would read as "selected"; the status
                                       // line spells out what the color means.
                                       <span
-                                        className={`h-1.5 w-1.5 shrink-0 rounded-full ${detected ? 'bg-green-500' : 'bg-stone-300'}`}
+                                        className={`h-1.5 w-1.5 shrink-0 rounded-full ${detected || cloudAuth ? 'bg-green-500' : 'bg-stone-300'}`}
                                         data-testid={`harness-detected-${h}`}
-                                        data-detected={detected}
+                                        data-detected={detected || Boolean(cloudAuth)}
                                         role="img"
-                                        aria-label={detected ? 'Connected on this computer' : 'Not set up on this computer'}
+                                        aria-label={
+                                          engine
+                                            ? detected
+                                              ? 'Connected on this computer'
+                                              : 'Not set up on this computer'
+                                            : 'Connected to your account'
+                                        }
                                       />
                                     ) : null}
                                     {relocatable ? (
@@ -1548,7 +1606,10 @@ export const ChatComposer = memo(function ChatComposer({
                                       </span>
                                     ) : null}
                                   </span>
-                                  <span className="text-[11px] text-stone-400">
+                                  <span
+                                    className="text-[11px] text-stone-400"
+                                    data-testid={rowOpensConnect ? `harness-connect-${h}` : undefined}
+                                  >
                                     {locked
                                       ? relocatable
                                         ? `Create a new chat to use ${CHAT_HARNESS_LABELS[h]}`

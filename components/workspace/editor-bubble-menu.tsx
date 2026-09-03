@@ -13,7 +13,6 @@ import {
   QuotesIcon,
   RowsPlusBottomIcon,
   SmileyIcon,
-  SparkleIcon,
   TextBIcon,
   TrashIcon,
 } from '@phosphor-icons/react';
@@ -27,15 +26,26 @@ import {
   setCalloutType,
   toggleCalloutFoldable,
 } from '@/lib/tiptap/callout-commands';
+import { SelectionActionControls } from '@/components/workspace/selection-action-controls';
+import {
+  INVOKE_SELECTION_ACTION_EVENT,
+  MAX_SELECTION_ACTION_TEXT_CHARS,
+  type WorkspaceSelectionAction,
+} from '@/lib/assistants/selection-actions';
+import { buildDraftDocCommentSelection } from '@/lib/workspace/doc-comments-client';
+import {
+  BUBBLE_LABEL_ACCENT,
+  BUBBLE_SURFACE,
+} from '@/components/workspace/selection-bubble-styles';
 
 /* ── Selection bubble menu ────────────────────────────────────────────
  *  Floating toolbar on text selection (v3 BubbleMenu, floating-ui).
  *  Deliberately few actions — the full format palette lives in the top menu
  *  bar and made this bar a wall of glyphs. Pure UI layer over commands the
  *  menu bar already exposes — no new node types, no codec impact. The two
- *  labeled buttons on the right are the emphasized pair: "Reference in chat" pins
- *  the selection into the chat composer (`sundial:add-chat-context`, same as
- *  ⌘J) and "Comment" starts a comment draft. The inline ask popup
+ *  labeled controls on the right are workspace-customizable assistant actions
+ *  plus Comment. Assistant actions send the selected passage through the
+ *  normal chat run (`sundial:add-chat-context`); Comment starts a draft. The inline ask popup
  *  (`sundial:open-inline-ask` → editor-ask-input.tsx) lives in the AI-tools
  *  flyout; its instruction is sent as a normal chat turn and replies come
  *  back as reviewable suggestions instead of a blind replace.
@@ -96,22 +106,17 @@ function useFollowEditorScroll(editor: Editor, pluginKey: string, visible: (edit
 
 const BUBBLE_BUTTON =
   'rounded-lg p-1.5 transition-colors text-stone-600 hover:bg-stone-100 hover:text-stone-900';
-// Shared with the code editor's selection bubble (collab-code-editor.tsx) so
-// the two surfaces stay pixel-identical — restyle here, both follow.
-export const BUBBLE_SURFACE =
-  'flex items-center gap-0.5 rounded-xl border border-stone-200 bg-white p-1 shadow-[0_2px_8px_rgba(28,25,23,0.12)]';
-export const BUBBLE_LABEL_BUTTON =
-  'flex items-center gap-1 rounded-lg px-2 py-1.5 text-[12px] font-medium text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-900';
-export const BUBBLE_LABEL_ACCENT =
-  'flex items-center gap-1 rounded-lg px-2 py-1.5 text-[12px] font-medium text-beige-600 transition-colors hover:bg-beige-50';
-
 export function EditorBubbleMenu({
   editor,
   filePath,
+  selectionActionsProjectId,
   hiddenRef,
 }: {
   editor: Editor;
   filePath: string | null;
+  /** Present only for a cloud workspace whose member has workspace-wide
+   *  write access. File-scoped edit grants must not expose global actions. */
+  selectionActionsProjectId?: string;
   /** External veto (e.g. the link popover is open) read by shouldShow. A ref,
    *  not a prop value — remounting a BubbleMenu re-registers its ProseMirror
    *  plugin, which reconfigures the whole EditorState. */
@@ -119,9 +124,9 @@ export function EditorBubbleMenu({
 }) {
   useFollowEditorScroll(editor, 'formatBubbleMenu', shouldShowFormatBubble);
   // Suggest-only users never see any of this: collab-editor mounts the bubble
-  // menu only when !suggesting, so the write-backed AI tools can't 403 for
-  // them. Local (sidecar) workspaces get the same tools — the local fetch
-  // forwards the AI routes to the cloud with the sentinel projectId.
+  // menu only when !suggesting. Workspace-global assistant actions have their
+  // own stricter capability: selectionActionsProjectId is absent for local,
+  // scoped-edit, and workspace-wide suggest-only users.
   const boldActive = useEditorState({
     editor,
     // Runs on EVERY transaction (remote Yjs edits + awareness included), so
@@ -232,7 +237,6 @@ export function EditorBubbleMenu({
   const AI_TOOLS: { label: string; event: string; testId: string }[] = [
     { label: 'Tune', event: 'sundial:open-prism', testId: 'ai-tool-prism' },
     { label: 'Resize', event: 'sundial:open-length-resize', testId: 'ai-tool-resize' },
-    { label: 'Factcheck', event: 'sundial:open-factcheck', testId: 'ai-tool-factcheck' },
     { label: 'AI detection', event: 'sundial:open-pangram', testId: 'ai-tool-pangram' },
   ];
 
@@ -260,13 +264,31 @@ export function EditorBubbleMenu({
     );
   };
 
-  // Pin the selection into the chat composer and open the chat (same seam
-  // as ⌘J — page.tsx's `sundial:add-chat-context` handler).
-  const addToChat = () => {
-    const text = collapseSelectionText();
-    if (!text) return;
+  const invokeSelectionAction = (action: WorkspaceSelectionAction) => {
+    const { from, to } = editor.state.selection;
+    const tooLong = to - from > MAX_SELECTION_ACTION_TEXT_CHARS;
+    const text = tooLong
+      ? ''
+      : editor.state.doc.textBetween(from, to, '\n', ' ').trim();
+    const selection = tooLong ? null : buildDraftDocCommentSelection(editor);
+    editor.commands.setTextSelection(to);
+    if ((!text || !selection) && !tooLong) return;
     window.dispatchEvent(
-      new CustomEvent('sundial:add-chat-context', { detail: { text, path: filePath } }),
+      new CustomEvent(INVOKE_SELECTION_ACTION_EVENT, {
+        detail: {
+          action: {
+            id: action.id,
+            label: action.label,
+            title: action.title,
+            assistant_slug: action.assistant_slug,
+            assistant_name: action.assistant_name,
+          },
+          text,
+          too_long: tooLong || undefined,
+          path: filePath,
+          selection: selection ?? undefined,
+        },
+      }),
     );
   };
 
@@ -411,16 +433,12 @@ export function EditorBubbleMenu({
           )}
         </div>
         <div className="mx-0.5 h-4 w-px bg-stone-200" />
-        <button
-          type="button"
-          aria-label="Reference selection in chat ⌘J"
-          onClick={addToChat}
-          className={BUBBLE_LABEL_BUTTON}
-        >
-          <SparkleIcon className="h-4 w-4" weight="fill" />
-          Reference in chat
-          <IconTooltip label="Pin the selection to the chat ⌘J" side="top" />
-        </button>
+        {selectionActionsProjectId ? (
+          <SelectionActionControls
+            projectId={selectionActionsProjectId}
+            onInvoke={invokeSelectionAction}
+          />
+        ) : null}
         <button
           type="button"
           aria-label="Comment on selection ⌘⌥M"

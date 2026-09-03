@@ -29,6 +29,11 @@ import { isMarkdownImageContextMenuTarget } from '@/components/workspace/collab-
 import { formatFileName, getFileName } from './workspace-file-helpers';
 
 import type { WorkspaceRouteInput } from '@/lib/workspace/public-ids';
+import {
+  INVOKE_SELECTION_ACTION_EVENT,
+  MAX_SELECTION_ACTION_TEXT_CHARS,
+  type SelectionActionInvocation,
+} from '@/lib/assistants/selection-actions';
 
 // The page's own route id, `local` flag included — these hooks forward it
 // straight to buildWorkspacePath, which is what keeps a local project's
@@ -249,9 +254,11 @@ export function useWorkspaceComments({
   const [commentBusyAction, setCommentBusyAction] = useState<string | null>(null);
   const [docCommentAnchorOffsets, setDocCommentAnchorOffsets] = useState<Record<string, number>>({});
   const [draftCommentAnchorOffset, setDraftCommentAnchorOffset] = useState<number | null>(null);
-  // 1-based source start line per thread, reported by the Monaco measure pass —
-  // the PDF comment markers map these through SyncTeX forward search.
-  const [commentAnchorLines, setCommentAnchorLines] = useState<Record<string, number>>({});
+  // 1-based [start, end] source lines per thread, reported by the Monaco
+  // measure pass — the PDF pins/highlights map these through SyncTeX forward.
+  const [commentAnchorLineSpans, setCommentAnchorLineSpans] = useState<
+    Record<string, [number, number]>
+  >({});
   // Ids a measurement pass has ATTEMPTED (threads + '__draft__'), successful or
   // not. The lane hides a card only while its id was never in a pass — so a
   // fresh card can't paint at the top:0 fallback, while a thread whose anchor
@@ -286,6 +293,10 @@ export function useWorkspaceComments({
   // resolves mid-POST (slow initial load, or the realtime polling fallback)
   // can't drop the just-typed comment/reply until its own request reconciles.
   const pendingThreadsRef = useRef<DocCommentThread[]>([]);
+  // Suppress a double-click while one selected-text invocation is being
+  // persisted. The key is released after the request settles, so explicitly
+  // checking the same passage again remains possible.
+  const pendingClaimVerifierKeysRef = useRef(new Set<string>());
   const pendingMessagesRef = useRef<Array<{ threadId: string; message: DocCommentMessage }>>([]);
   // In-flight optimistic resolve/reopen, re-merged like pendingThreadsRef so a
   // GET racing the PATCH — document OR workspace scope — can't flash the old
@@ -378,12 +389,11 @@ export function useWorkspaceComments({
   }, [applyPendingStatus]);
 
   // Comments are available on both markdown (ProseMirror) and code/LaTeX
-  // (Monaco) files; only the rendering surface differs. Never on mobile: the
-  // comment lane has no mobile surface, so offering affordances (context menu,
-  // Monaco action, highlights) would dead-end silently.
+  // (Monaco) files; only the rendering surface differs. On mobile the surface
+  // is the bottom sheet (`mobileCommentsOpen` below) — the inline lane stays
+  // desktop-only, but affordances no longer dead-end.
   const commentsAvailableForActiveFile = Boolean(
-    !isMobile &&
-      activeWorkspaceFile &&
+    activeWorkspaceFile &&
       (activeIsMarkdown || activeIsCode) &&
       !showRawView &&
       !(hasRichViewer && showRichViewer),
@@ -410,17 +420,22 @@ export function useWorkspaceComments({
       offsets: Record<string, number>;
       draftOffset: number | null;
       attempted?: boolean;
-      lines?: Record<string, number>;
+      lineSpans?: Record<string, [number, number]>;
     }) => {
-      if (data.lines) {
-        const lines = data.lines;
-        setCommentAnchorLines((current) => {
+      if (data.lineSpans) {
+        const spans = data.lineSpans;
+        setCommentAnchorLineSpans((current) => {
           const currentKeys = Object.keys(current);
-          const nextKeys = Object.keys(lines);
-          if (currentKeys.length === nextKeys.length && nextKeys.every((key) => current[key] === lines[key])) {
+          const nextKeys = Object.keys(spans);
+          if (
+            currentKeys.length === nextKeys.length &&
+            nextKeys.every(
+              (key) => current[key]?.[0] === spans[key][0] && current[key]?.[1] === spans[key][1],
+            )
+          ) {
             return current;
           }
-          return lines;
+          return spans;
         });
       }
       setDocCommentAnchorOffsets((current) => {
@@ -559,6 +574,13 @@ export function useWorkspaceComments({
         (draftCommentSelection !== null ||
           (showCommentLane &&
             (openCommentThreads.length > 0 || displayedResolvedThreads.length > 0))));
+  // The phone surface: same open/close state the lane uses, rendered as a
+  // bottom sheet by the page. Opens for a draft too, so a selection-bubble
+  // Comment on mobile lands in the composer instead of dead-ending.
+  const mobileCommentsOpen =
+    isMobile &&
+    commentsAvailableForActiveFile &&
+    (draftCommentSelection !== null || showCommentLane);
   const displayedCommentThreads = commentPanelMode === 'workspace' ? openWorkspaceCommentThreads : openCommentThreads;
   const displayedCommentsLoading = commentPanelMode === 'workspace' ? workspaceCommentsLoading : commentsLoading;
   const displayedCommentsError = commentPanelMode === 'workspace' ? workspaceCommentsError : commentsError;
@@ -805,6 +827,160 @@ export function useWorkspaceComments({
     },
     [withOptimistic],
   );
+
+  const invokeClaimVerifier = useCallback(
+    async (detail: SelectionActionInvocation) => {
+      if (!projectId) return;
+      if (detail.too_long || detail.text.length > MAX_SELECTION_ACTION_TEXT_CHARS) {
+        showWorkspaceAppNotice(
+          'error',
+          `Select at most ${MAX_SELECTION_ACTION_TEXT_CHARS.toLocaleString()} characters to verify.`,
+        );
+        return;
+      }
+
+      const filePath = detail.path?.trim() ?? '';
+      const selection = detail.selection;
+      const targetFile = workspaceFileByPath.get(filePath);
+      if (!filePath || !detail.text.trim() || !selection || !targetFile) return;
+
+      const invocationKey = [
+        detail.action.assistant_slug,
+        detail.action.id,
+        filePath,
+        JSON.stringify(selection.anchor),
+        JSON.stringify(selection.head),
+      ].join(':');
+      if (pendingClaimVerifierKeysRef.current.has(invocationKey)) return;
+      pendingClaimVerifierKeysRef.current.add(invocationKey);
+
+      const now = new Date().toISOString();
+      const optimistic: DocCommentThread = {
+        id: makeOptimisticId(),
+        kind: 'claim_verification',
+        projectId,
+        chatId: null,
+        fileId: targetFile.id,
+        filePath,
+        quote: selection.quote,
+        anchor: selection.anchor,
+        head: selection.head,
+        status: 'open',
+        createdAt: now,
+        updatedAt: now,
+        resolvedAt: null,
+        resolvedByUserId: null,
+        author: {
+          userId: 'agent:claim-verifier',
+          name: 'Claim Verifier',
+          username: 'sunny',
+          imageUrl: null,
+        },
+        messages: [],
+      };
+      pendingThreadsRef.current = [...pendingThreadsRef.current, optimistic];
+      setCommentThreads((current) => [
+        optimistic,
+        ...current.filter((thread) => thread.filePath === filePath),
+      ]);
+      setCommentThreadsPath(filePath);
+      setCommentPanelMode('document');
+      setShowCommentLane(true);
+      setDraftCommentSelection(null);
+      setCommentContextMenu(null);
+      setActiveCommentThreadId(optimistic.id);
+      setCommentsError(null);
+      if (selectedFilePath !== filePath) onSelectFile(filePath);
+
+      try {
+        const response = await api('/api/workspace/assistant-actions/invoke', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            projectId,
+            assistantSlug: detail.action.assistant_slug,
+            actionId: detail.action.id,
+            text: detail.text,
+            path: filePath,
+            anchor: selection.anchor,
+            head: selection.head,
+          }),
+        });
+        if (!response.ok) {
+          throw new Error(await readErrorMessage(response, 'Could not start Claim Verifier'));
+        }
+        const payload = (await response.json()) as {
+          threadId?: string;
+          chatId?: string;
+        };
+        if (!payload.threadId || !payload.chatId) {
+          throw new Error('Claim Verifier started without a linked comment thread.');
+        }
+
+        pendingThreadsRef.current = pendingThreadsRef.current.filter(
+          (thread) => thread.id !== optimistic.id,
+        );
+        clientKeyByThreadIdRef.current[payload.threadId] = optimistic.id;
+        setDocCommentAnchorOffsets((current) =>
+          current[optimistic.id] === undefined
+            ? current
+            : { ...current, [payload.threadId!]: current[optimistic.id] },
+        );
+        setCommentThreads((current) =>
+          current.map((thread) =>
+            thread.id === optimistic.id
+              ? {
+                  ...thread,
+                  id: payload.threadId!,
+                  clientKey: optimistic.id,
+                  chatId: payload.chatId!,
+                }
+              : thread,
+          ),
+        );
+        setActiveCommentThreadId(payload.threadId);
+        if (activeCommentFilePathRef.current === filePath) {
+          void loadComments(filePath, payload.threadId);
+        }
+        refreshWorkspaceComments();
+      } catch (error) {
+        pendingThreadsRef.current = pendingThreadsRef.current.filter(
+          (thread) => thread.id !== optimistic.id,
+        );
+        setCommentThreads((current) =>
+          current.filter((thread) => thread.id !== optimistic.id),
+        );
+        setActiveCommentThreadId((current) =>
+          current === optimistic.id ? null : current,
+        );
+        const message = error instanceof Error ? error.message : 'Could not start Claim Verifier';
+        setCommentsError(message);
+        showWorkspaceAppNotice('error', message);
+      } finally {
+        pendingClaimVerifierKeysRef.current.delete(invocationKey);
+      }
+    },
+    [
+      api,
+      loadComments,
+      onSelectFile,
+      projectId,
+      refreshWorkspaceComments,
+      selectedFilePath,
+      showWorkspaceAppNotice,
+      workspaceFileByPath,
+    ],
+  );
+
+  useEffect(() => {
+    const handle = (event: Event) => {
+      const detail = (event as CustomEvent<SelectionActionInvocation>).detail;
+      if (!detail?.action?.id || !detail.action.assistant_slug) return;
+      void invokeClaimVerifier(detail);
+    };
+    window.addEventListener(INVOKE_SELECTION_ACTION_EVENT, handle);
+    return () => window.removeEventListener(INVOKE_SELECTION_ACTION_EVENT, handle);
+  }, [invokeClaimVerifier]);
 
   const createComment = useCallback(
     /** `selectionOverride` lets a caller post against a selection it captured
@@ -1551,8 +1727,11 @@ export function useWorkspaceComments({
     resolvedCommentRanges,
     draftCommentRange,
     openCommentThreads,
+    openWorkspaceCommentThreads,
+    refreshWorkspaceComments,
     reportCommentAnchors,
     showInlineCommentLane,
+    mobileCommentsOpen,
     commentsLaneToggled,
     displayedCommentThreads,
     displayedResolvedThreads,
@@ -1563,7 +1742,7 @@ export function useWorkspaceComments({
     commentDocumentLabel,
     commentPanelMode,
     docCommentAnchorOffsets,
-    commentAnchorLines,
+    commentAnchorLineSpans,
     measuredCommentAnchorIds,
     draftCommentAnchorOffset,
     activeCommentThreadId,

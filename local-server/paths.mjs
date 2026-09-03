@@ -4,6 +4,7 @@ import { isIgnoredPath as policyIsIgnoredPath, policy } from '../lib/crdt-js/syn
 
 const TEXT_EXTS = new Set(policy.crdt_extensions ?? []);
 const BLOB_EXTS = new Set(policy.blob_extensions ?? []);
+const TEXT_NAMES = new Set(policy.text_filenames ?? []);
 
 /** Normalize a project-relative path: forward slashes, no leading slash,
  *  no empty/dot segments. Returns null for unsafe paths (absolute, `..`). */
@@ -81,6 +82,23 @@ export function fileKind(rel) {
   if (TEXT_EXTS.has(ext)) return 'text';
   if (BLOB_EXTS.has(ext)) return 'blob';
   return null;
+}
+
+/** Classification for a path KNOWN to be a regular file (post-stat). Unlike
+ *  fileKind — whose null doubles as "maybe a folder event" in the watcher
+ *  routing (see server.mjs) — every file gets a kind here: well-known
+ *  extension-less text names (Makefile, LICENSE, Dockerfile…) edit as text,
+ *  and everything else syncs as an opaque blob (byte-faithful both ways, no
+ *  CRDT editing). The old skip-silently behavior made unknown-extension files
+ *  — and any folder holding only such files — vanish from sync and the
+ *  listing entirely, which users read as "some of my files were not synced".
+ *  The ignore list (policy.json ignored_paths) is the only exclusion now. */
+export function fileKindForFile(rel) {
+  const known = fileKind(rel);
+  if (known) return known;
+  const lower = rel.toLowerCase();
+  if (TEXT_NAMES.has(lower.slice(lower.lastIndexOf('/') + 1))) return 'text';
+  return 'blob';
 }
 
 /** Serving/upload content types by extension (shared by the HTTP server and

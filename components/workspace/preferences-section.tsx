@@ -21,7 +21,12 @@ import {
 import { getProviderIcon } from '@/components/workspace/provider-icons';
 import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
-import { formatShortcut, isMacPlatform, workspaceShortcuts } from '@/lib/workspace/shortcuts';
+import {
+  formatShortcut,
+  isMacPlatform,
+  markdownSyntaxShortcuts,
+  workspaceShortcuts,
+} from '@/lib/workspace/shortcuts';
 
 export function ShortcutsSection({ desktopShell }: { desktopShell: boolean }) {
   // ⌘ vs Ctrl is a client fact — read after mount to keep SSR markup stable.
@@ -50,6 +55,25 @@ export function ShortcutsSection({ desktopShell }: { desktopShell: boolean }) {
                 {formatShortcut(combo, mac)}
               </kbd>
             ))}
+          </li>
+        ))}
+      </ul>
+      <div className="pt-2">
+        <h4 className="text-sm font-medium text-stone-800">Markdown syntax</h4>
+        <p className="mt-1 text-xs text-stone-500">
+          Type these in a Markdown document; they format as you type.
+        </p>
+      </div>
+      <ul
+        className="divide-y divide-stone-100 rounded-lg border border-stone-200 bg-white"
+        data-testid="markdown-syntax-list"
+      >
+        {markdownSyntaxShortcuts().map((spec) => (
+          <li key={spec.id} className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-stone-700">
+            <span className="min-w-0 flex-1 truncate">{spec.label}</span>
+            <kbd className="rounded border border-stone-200 bg-stone-50 px-1 py-px font-mono text-[10px] text-stone-400">
+              {spec.syntax}
+            </kbd>
           </li>
         ))}
       </ul>

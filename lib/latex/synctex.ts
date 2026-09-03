@@ -18,10 +18,17 @@ const MAX_RECORDS = 500_000;
 
 export type SyncTexForwardHit = { page: number; x: number; y: number };
 export type SyncTexInverseHit = { file: string; line: number };
+/** A horizontal slice of rendered material (PDF pt, top-left origin; y is the
+ *  baseline) that a source line range produced — one per rendered-line run. */
+export type SyncTexSpan = { page: number; x: number; y: number; w: number };
 
 export type SyncTexIndex = {
   forward(file: string, line: number): SyncTexForwardHit | null;
   inverse(page: number, xPt: number, yPt: number): SyncTexInverseHit | null;
+  /** All rendered material for source lines [startLine, endLine] of `file`,
+   *  from the word records' end-marker intervals — what a comment highlight
+   *  paints over the PDF. Junk-tagged leading records contribute nothing. */
+  forwardSpans(file: string, startLine: number, endLine: number): SyncTexSpan[];
 };
 
 type Box = { x: number; y: number; w: number; h: number; d: number; file: string; line: number };
@@ -226,26 +233,76 @@ export function parseSyncTexText(text: string): SyncTexIndex {
       if (!best) return null;
       // Word-level refinement: a line box carries one source line for the whole
       // rendered line, but a paragraph typed across several source lines puts
-      // words from later lines on it — the box line then lands EARLY. When the
-      // click sits on a real text line (a word point within one line-height
-      // vertically), the point nearest the click carries the true per-word
-      // file + line. Whitespace clicks keep the box's snap-to-nearest-line.
+      // words from later lines on it — the box line then lands lines away. The
+      // word points carry the true per-word line, with two decoding rules
+      // (verified against real pdflatex output):
+      //   1. A record marks the END of its material — the material between two
+      //      records belongs to the SECOND one, so the click's owner is the
+      //      first record at-or-right-of it, not the nearest.
+      //   2. The first record of a rendered line is tagged with the line BOX's
+      //      line (the paragraph's break line), not its material's — when it
+      //      matches the box tag and a second record exists, trust the second.
+      // Whitespace clicks (no baseline within one line-height) keep the box's
+      // snap-to-nearest-line behavior.
       const points = pointsByPage.get(page);
       if (points) {
-        let refined: Point | null = null;
-        let refinedScore = Infinity;
+        let lineY: number | null = null;
+        let lineVDist = Infinity;
         for (const p of points) {
           const vDist = Math.abs(p.y - yPt);
-          if (vDist > POINT_REFINE_MAX_VDIST_PT) continue;
-          const score = vDist * 4 + Math.abs(p.x - xPt);
-          if (score < refinedScore) {
-            refinedScore = score;
-            refined = p;
+          if (vDist <= POINT_REFINE_MAX_VDIST_PT && vDist < lineVDist) {
+            lineVDist = vDist;
+            lineY = p.y;
           }
         }
-        if (refined) return { file: refined.file, line: refined.line };
+        if (lineY !== null) {
+          const row = points.filter((p) => p.y === lineY).sort((a, b) => a.x - b.x);
+          let idx = row.findIndex((p) => p.x >= xPt);
+          if (idx === -1) idx = row.length - 1;
+          if (idx === 0 && row.length > 1 && row[0].line === best.line && row[0].file === best.file) {
+            idx = 1;
+          }
+          return { file: row[idx].file, line: row[idx].line };
+        }
       }
       return { file: best.file, line: best.line };
+    },
+
+    forwardSpans(file, startLine, endLine) {
+      const target = normalizePath(file);
+      const spans: SyncTexSpan[] = [];
+      for (const [page, points] of pointsByPage) {
+        // Rendered rows share an exact baseline; walk each row in x order and
+        // take the end-marker intervals (prev.x, point.x] whose line is in
+        // range. The row's first record has no interval (and carries the line
+        // box's junk tag anyway — see inverse()).
+        const rows = new Map<number, Point[]>();
+        for (const p of points) {
+          const row = rows.get(p.y);
+          if (row) row.push(p);
+          else rows.set(p.y, [p]);
+        }
+        for (const [y, row] of rows) {
+          row.sort((a, b) => a.x - b.x);
+          let open: { x: number; w: number } | null = null;
+          for (let i = 1; i < row.length; i++) {
+            const p = row[i];
+            const from = row[i - 1].x;
+            const inRange =
+              p.line >= startLine && p.line <= endLine && normalizePath(p.file) === target;
+            if (inRange && p.x > from) {
+              if (open && from <= open.x + open.w + 0.5) {
+                open.w = p.x - open.x;
+              } else {
+                if (open) spans.push({ page, x: open.x, y, w: open.w });
+                open = { x: from, w: p.x - from };
+              }
+            }
+          }
+          if (open) spans.push({ page, x: open.x, y, w: open.w });
+        }
+      }
+      return spans;
     },
   };
 }

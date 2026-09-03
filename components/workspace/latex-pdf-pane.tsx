@@ -6,6 +6,7 @@ import { Spinner } from '@/components/ui/spinner';
 import { LATEX_PANE_HEADER_CLASS } from '@/components/workspace/latex-workbench';
 import type { SyncTexIndex } from '@/lib/latex/synctex';
 import type {
+  PdfCommentHighlight,
   PdfCommentMarker,
   PdfCommentSelection,
   SyncTexJump,
@@ -33,7 +34,7 @@ interface LatexPdfPaneProps {
   stateKey?: string;
   /** Parsed SyncTeX index for click-to-source (W4.synctex); optional. */
   synctex?: SyncTexIndex | null;
-  onInverseSearch?: (file: string, line: number) => void;
+  onInverseSearch?: (file: string, line: number, word?: string) => void;
   /** Forward search target (§4.2); the viewer scrolls + flashes when it changes. */
   jumpTarget?: SyncTexJump | null;
   /** Leading header cluster (Recompile + view switcher) — rendered by the
@@ -46,8 +47,14 @@ interface LatexPdfPaneProps {
   headerCut?: boolean;
   /** Comment pins + selection commenting (pdf_comments_enabled); optional. */
   commentMarkers?: PdfCommentMarker[] | null;
+  commentHighlights?: PdfCommentHighlight[] | null;
   onMarkerClick?: (threadId: string) => void;
   onCommentSelection?: (selection: PdfCommentSelection) => void;
+  /** Continuous scroll sync (see the viewer's props). */
+  onViewportScroll?: (pos: { page: number; yPt: number }) => void;
+  followTarget?: SyncTexJump | null;
+  scrollSyncEnabled?: boolean;
+  onToggleScrollSync?: () => void;
 }
 
 function getFileName(path: string): string {
@@ -70,8 +77,13 @@ export function LatexPdfPane({
   headerLeft,
   headerCut,
   commentMarkers,
+  commentHighlights,
   onMarkerClick,
   onCommentSelection,
+  onViewportScroll,
+  followTarget,
+  scrollSyncEnabled,
+  onToggleScrollSync,
 }: LatexPdfPaneProps) {
   // The viewer is a dynamically-imported chunk; until its header actually
   // mounts (and again whenever it unmounts) the pane keeps a fallback bar up,
@@ -106,8 +118,13 @@ export function LatexPdfPane({
             headerCut={headerCut}
             onViewerReady={handleViewerReady}
             commentMarkers={commentMarkers}
+            commentHighlights={commentHighlights}
             onMarkerClick={onMarkerClick}
             onCommentSelection={onCommentSelection}
+            onViewportScroll={onViewportScroll}
+            followTarget={followTarget}
+            scrollSyncEnabled={scrollSyncEnabled}
+            onToggleScrollSync={onToggleScrollSync}
           />
         ) : (
           <div className="flex h-full min-h-[420px] items-center justify-center p-6 text-center">

@@ -50,7 +50,7 @@ const JOBS: Job[] = [
     id: 'maintain',
     art: 'book',
     title: 'Start a doc the Agent keeps up to date',
-    body: 'A paper, a literature review, a running set of notes. Add sources as you go and Agent folds them into the document.',
+    body: 'A spec, a launch plan, a running set of notes. Add sources as you go and Agent folds them into the document.',
     cta: 'Choose a template',
     run: (a) => a.onTemplate(),
   },

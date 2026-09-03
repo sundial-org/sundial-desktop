@@ -47,7 +47,42 @@ export function workspaceShortcuts({ desktopShell }: { desktopShell: boolean }):
     { id: 'chat-context', label: 'Add selection to chat', keys: ['Mod+J'] },
     { id: 'new-chat', label: 'New chat', keys: ['Mod+Shift+J'] },
     { id: 'insert-link', label: 'Insert or edit link (text selected)', keys: ['Mod+K'] },
+    { id: 'find', label: 'Find in document', keys: ['Mod+F'] },
     { id: 'find-replace', label: 'Find and replace', keys: ['Mod+Shift+H'] },
+    { id: 'fold-all', label: 'Collapse all headings and lists', keys: ['Mod+Alt+['] },
+    { id: 'unfold-all', label: 'Expand all headings and lists', keys: ['Mod+Alt+]'] },
     { id: 'new-comment', label: 'New comment', keys: ['Mod+Alt+M'] },
+  ];
+}
+
+export type MarkdownSyntaxSpec = {
+  id: string;
+  label: string;
+  /** What to type, shown verbatim (not a key combo). */
+  syntax: string;
+};
+
+/**
+ * Markdown typing shortcuts — text typed into the document that turns into
+ * formatting, listed under the keyboard shortcuts in Settings. Like the combos
+ * above this is reference copy only; the behavior lives in the editor's input
+ * rules and the markdown codec.
+ */
+export function markdownSyntaxShortcuts(): MarkdownSyntaxSpec[] {
+  return [
+    { id: 'heading', label: 'Heading 1–6 (start of line)', syntax: '# … ###### + space' },
+    { id: 'bullet-list', label: 'Bullet list', syntax: '- + space' },
+    { id: 'numbered-list', label: 'Numbered list', syntax: '1. + space' },
+    { id: 'task-list', label: 'Task list', syntax: '- [ ] + space' },
+    { id: 'quote', label: 'Quote', syntax: '> + space' },
+    { id: 'code-block', label: 'Code block', syntax: '```' },
+    { id: 'divider', label: 'Divider', syntax: '---' },
+    { id: 'bold', label: 'Bold', syntax: '**text**' },
+    { id: 'italic', label: 'Italic', syntax: '*text*' },
+    { id: 'strikethrough', label: 'Strikethrough', syntax: '~~text~~' },
+    { id: 'inline-code', label: 'Inline code', syntax: '`text`' },
+    { id: 'highlight', label: 'Highlight', syntax: '==text==' },
+    { id: 'math', label: 'Math (inline / block)', syntax: '$x$ / $$x$$' },
+    { id: 'wiki-link', label: 'Link to another file', syntax: '[[name]]' },
   ];
 }

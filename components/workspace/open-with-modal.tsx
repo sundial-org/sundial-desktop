@@ -21,10 +21,10 @@ import { isDesktopApp, openExternalOnDesktop } from '@/lib/desktop';
  * - **Web**: the paste-into-any-AI /start prompt, ChatGPT and Claude.ai
  *   opened with THAT SAME prompt prefilled (join over the HTTP rail — web
  *   agents have no shell, and ChatGPT's sandbox no network, so they never
- *   get a curl command; the hosted MCP connector remains in Settings), and
+ *   get a curl command; direct MCP setup remains in Settings → Advanced), and
  *   Overleaf / GitHub links.
  * - **Desktop**: Claude Desktop via its official deep link
- *   (claude://claude.ai/new?q= prefills the folder-explicit sync prompt),
+ *   (claude://claude.ai/new?q= prefills the current-folder sync prompt),
  *   ChatGPT Desktop by copying that prompt (the app registers no prompt
  *   deep link), and the Sundial desktop app download (macOS build).
  *
@@ -51,51 +51,24 @@ export function buildWorkspaceStartPrompt(workspaceUrl: string): string {
 }
 
 /**
- * The DESKTOP-app handoff prompt: the start prompt plus a fully concrete
- * serve.sh command — a named local folder, created if missing — because a
- * desktop agent (Claude Desktop, ChatGPT Desktop's Codex) has a shell and
- * full network on this machine and can run it verbatim. The agent learns
- * the ropes from /start (including that a keyless URL uses the machine's
- * Sundial sign-in). Web agents never get this shape: ChatGPT's web sandbox
- * has no shell or network, so the web tab hands over the plain start
- * prompt (the same one shown in the paste box) and syncing stays a
- * human-run command.
+ * The DESKTOP-app handoff prompt: the workspace, current-folder sync command,
+ * and requested result. Both bootstraps default to the current working
+ * directory and refuse a bare home directory or filesystem root. Desktop has
+ * one prompt, intentionally ending with the requested TeX handoff. Web agents
+ * get the plain start prompt instead.
  */
 export function buildWorkspaceSyncPrompt(
   workspaceUrl: string,
-  folder: string,
   platform: 'posix' | 'windows' = 'posix',
 ): string {
   const origin = new URL(workspaceUrl).origin;
-  // Windows gets the PowerShell bootstrap (serve.sh is POSIX-only; a
-  // Windows agent handed curl|sh has no sh to pipe into). The command
-  // contains NO $ and no nested double quotes on purpose: it parses
-  // identically pasted into cmd.exe or PowerShell, and the home directory
-  // resolves as an object inside PowerShell, so a username with a space
-  // ("Bingran You" broke the first draft) can never split an argument.
-  // serve.ps1's folder defaults to the current directory it lands in.
-  const slug = folder.split(/[\\/]/).pop() ?? 'workspace';
+  // Windows gets the native PowerShell bootstrap; both commands deliberately
+  // omit a folder so serve.ps1 / serve.sh use the current working directory.
   const command =
     platform === 'windows'
-      ? `powershell -ExecutionPolicy Bypass -Command "Set-Location (New-Item -Force -ItemType Directory -Path (Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Sundial\\${slug}')).FullName; & ([scriptblock]::Create((irm ${origin}/serve.ps1))) -Workspace ${workspaceUrl}"`
-      : `mkdir -p ${folder} && curl -fsSL ${origin}/serve.sh | sh -s -- ${folder} --workspace ${workspaceUrl}`;
-  return (
-    `Fetch ${origin}/start and follow it, then join my workspace at ${workspaceUrl}. ` +
-    `Sync it with my local folder ${folder} by running: ` +
-    `${command} ` +
-    `(or hand me the command to run). Then ask what we should work on.`
-  );
-}
-
-/** Default local folder for the desktop-tab prompt: under the home dir's
- *  Sundial folder, named by the workspace slug — predictable and
- *  collision-free per workspace. Tilde for POSIX shells, $HOME (expanded by
- *  PowerShell inside the quoted -Command) on Windows. */
-export function defaultSyncFolder(workspaceUrl: string, platform: 'posix' | 'windows' = 'posix'): string {
-  const slug = /\/w\/([^/?]+)/.exec(new URL(workspaceUrl).pathname)?.[1] ?? 'workspace';
-  // The Windows value is DISPLAY prose only (the command resolves the home
-  // dir itself, space-safely); the POSIX value is used verbatim in sh.
-  return platform === 'windows' ? `~\\Sundial\\${slug}` : `~/Sundial/${slug}`;
+      ? `powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm ${origin}/serve.ps1))) -Workspace ${workspaceUrl}"`
+      : `curl -fsSL ${origin}/serve.sh | sh -s -- --workspace ${workspaceUrl}`;
+  return `Workspace: ${workspaceUrl}. Run \`${command}\` to sync this folder, then show me the TeX file.`;
 }
 
 /** Claude Desktop's official deep link, in CODE mode: opens the app
@@ -227,11 +200,11 @@ export function OpenWithModal({
   // What the buttons hand over. Web ChatGPT/Claude get the SAME prompt the
   // paste box shows (join over the HTTP rail — a web agent has no shell, and
   // ChatGPT's sandbox no network, so a curl command would only confuse it).
-  // Desktop apps get the folder-explicit sync prompt: they run commands on
-  // this machine, so the prompt names a concrete folder to create and sync.
+  // Desktop apps get the current-folder sync prompt: they run commands on
+  // this machine, and both bootstraps default to the folder already open.
   const desktopPlatform = detectOS() === 'windows' ? 'windows' : 'posix';
   const desktopSyncPrompt = workspaceUrl
-    ? buildWorkspaceSyncPrompt(workspaceUrl, defaultSyncFolder(workspaceUrl, desktopPlatform), desktopPlatform)
+    ? buildWorkspaceSyncPrompt(workspaceUrl, desktopPlatform)
     : '';
   const claudeWebUrl = `https://claude.ai/new?q=${encodeURIComponent(startPrompt)}`;
   const claudeDesktopUrl = buildClaudeDesktopUrl(desktopSyncPrompt);
@@ -514,7 +487,7 @@ export function OpenWithModal({
                   testId="open-with-claude-desktop"
                   icon={<BrandMark src="/agent-logos/claude.svg" alt="Claude" />}
                   title="Claude Desktop"
-                  subtitle="Opens the Claude app with the prompt prefilled: learn Sundial, sync this workspace locally"
+                  subtitle="Opens Claude with the sync prompt prefilled"
                   action={
                     isHttps ? (
                       <a

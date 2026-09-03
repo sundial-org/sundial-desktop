@@ -14,7 +14,8 @@ import {
   type IconProps,
 } from '@phosphor-icons/react';
 
-import { STARTER_PACKS, type StarterPack } from '@/lib/local/starter-packs';
+import { productFlavor } from '@/lib/flags/product-flavor';
+import { starterPacksForFlavor, type StarterPack } from '@/lib/local/starter-packs';
 
 /**
  * The starter-pack cards, shared by the desktop home (app/local) and the web
@@ -23,9 +24,13 @@ import { STARTER_PACKS, type StarterPack } from '@/lib/local/starter-packs';
  * grid itself is presentation, and keeping two copies drifted three times: the
  * icon map, the arrival file, and the expanded-by-default state each landed on
  * one surface only. Callers supply just their own creation call.
+ *
+ * The listing is flavor-gated: a general build (desktop/OSS) drops the
+ * scientific packs rather than opening on LaTeX and papers.
  */
+const PACKS = starterPacksForFlavor(productFlavor());
+
 const PACK_ICONS: Record<string, ComponentType<IconProps>> = {
-  reagent: MagnifyingGlassIcon,
   'research-paper': GraduationCapIcon,
   'lit-review': BooksIcon,
   writing: PenNibIcon,
@@ -96,7 +101,7 @@ export function StarterPackGrid({
 }) {
   return (
     <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-      {STARTER_PACKS.map((pack) => {
+      {PACKS.map((pack) => {
         const Icon = PACK_ICONS[pack.id] ?? FolderSimpleIcon;
         return (
           <button

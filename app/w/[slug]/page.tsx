@@ -12,7 +12,6 @@ import {
   CaretRightIcon,
   CaretUpIcon,
   ChatTeardropIcon,
-  ChatCircleDotsIcon,
   TextAaIcon,
   ChatTextIcon,
   CreditCardIcon,
@@ -33,7 +32,6 @@ import {
   LightningIcon,
   ListBulletsIcon,
   ListIcon,
-  SparkleIcon,
   MegaphoneIcon,
   NotePencilIcon,
   PaintBrushIcon,
@@ -78,7 +76,7 @@ import {
 import { pickDefaultDocument } from '@/lib/workspace/default-document';
 import { fetchWithDeadline } from '@/lib/workspace/fetch-deadline';
 import { ANON_AUTHOR_PREFIX, anonDisplayName, toAnonAuthorId } from '@/lib/auth/anon-identity';
-import { createLocalBinaryUpload, createLocalWorkspaceFetch } from '@/lib/local/workspace-api';
+import { createLocalBinaryUpload, createLocalWorkspaceFetch, survivingFolders } from '@/lib/local/workspace-api';
 import { ApiFetchProvider } from '@/lib/workspace/api-fetch-context';
 import { getLaunchParam, resolveSidecarConfig, sidecar as localSidecar, type SidecarConfig } from '@/lib/local/sidecar';
 import { workspaceTitleLabel } from '@/lib/local/project-label';
@@ -110,6 +108,7 @@ import {
   MAX_EDITOR_PANES,
   moveTab as movePaneTab,
   normalizePanes,
+  openOverlayTab,
   openTab as openPaneTab,
   openToSide as openPaneToSide,
   panesSnapshot,
@@ -120,6 +119,7 @@ import {
   openWithChatAside,
   replaceActiveTab,
   isPathWithin,
+  diffRemoteRenames,
   remapPanePaths,
   remapPath,
   removePanePaths,
@@ -129,17 +129,35 @@ import {
   type EditorPane,
   type TabDragPayload,
 } from '@/lib/workspace/editor-panes';
-import { chatTab, chatIdOfTab, diffTab, diffIdOfTab, isChatTab, isDiffTab, isLauncherTab, isReviewTab, isSpecialTab, reviewTab, reviewChatIdOfTab, LAUNCHER_TAB } from '@/lib/workspace/editor-tabs';
+import {
+  ASSISTANTS_TAB,
+  LAUNCHER_TAB,
+  SUPPORT_TAB,
+  chatIdOfTab,
+  chatTab,
+  diffIdOfTab,
+  diffTab,
+  isAssistantsTab,
+  isChatTab,
+  isDiffTab,
+  isLauncherTab,
+  isReviewTab,
+  isSpecialTab,
+  isSupportTab,
+  reviewChatIdOfTab,
+  reviewTab,
+} from '@/lib/workspace/editor-tabs';
 import { parseWikiTarget, resolveWorkspacePath } from '@/lib/markdown/anchors.mjs';
 import { scrollEditorToAnchor, type WikiAnchor } from '@/lib/workspace/anchor-navigation';
 import type { CodeEditorHandle } from '@/components/workspace/collab-code-editor';
 import type { CommandPaletteAction } from '@/components/workspace/command-palette';
 import type {
+  PdfCommentHighlight,
   PdfCommentMarker,
   PdfCommentSelection,
   SyncTexJump,
 } from '@/components/workspace/latex-pdf-viewer';
-import { matchPdfSelectionToSource } from '@/lib/latex/pdf-comment-anchor';
+import { matchPdfSelectionToSource, quoteLineSpan } from '@/lib/latex/pdf-comment-anchor';
 import type { LatexViewMode } from '@/components/workspace/latex-workbench';
 import { PanelSurfaceSwitcher, type PanelNavTarget } from '@/components/workspace/panel-surface-switcher';
 import { applyPanelCommand, usePanelControl } from './_components/use-panel-control';
@@ -182,9 +200,16 @@ import { CreditBalancePill } from '@/components/workspace/credit-balance-pill';
 import dynamic from 'next/dynamic';
 import { useLinkedRepos } from '@/lib/workspace/use-linked-repos';
 import { SchedulesPanel, ChatHeaderScheduleText } from '@/components/workspace/schedules-panel';
+import { AssistantsPanel } from '@/components/workspace/assistants-panel';
+import { AssistantDemo } from '@/components/workspace/assistant-demo';
+import { AssistantsSidebarSection } from '@/components/workspace/assistants-sidebar-section';
+import {
+  resolveSelectionActionsProjectId,
+  shouldShowSelectionActionChat,
+} from '@/lib/assistants/selection-actions';
 import { track } from '@/lib/analytics/track';
 import { MarkdownTOC } from '@/components/workspace/markdown-toc';
-import type { TocHeading } from '@/lib/markdown/toc';
+import { readEditorHeadings, type TocHeading } from '@/lib/markdown/toc';
 import { MarkdownEditorFrame, type MarkdownPageChrome } from '@/components/workspace/markdown-editor-frame';
 import { EditModeControl } from '@/components/workspace/edit-mode-control';
 import { useDocumentEditMode } from '@/lib/workspace/document-edit-mode-context';
@@ -205,6 +230,8 @@ import { useAfterFirstPaint } from '@/lib/hooks/use-after-first-paint';
 import { MAX_ZIP_ENTRY_COUNT, ensureUniquePath, formatBytes, resolveDraftPath, sanitizeFilename } from '@/lib/workspace/uploads';
 import { dropEntriesFrom, readDroppedEntries } from '@/lib/workspace/dropped-entries';
 import { type WorkspaceKind } from '@/lib/workspace/kinds';
+import { needsCloudSignIn } from '@/lib/workspace/anon-send-gate';
+import type { WorkspaceLocalSyncStatus } from '@/lib/workspace/local-sync-status';
 import { ModalShell } from '@/components/modal-shell';
 import { WorkspaceTab, SecretsTab, findRootAgentsFile } from '@/components/workspace/config-tab';
 import { PreferencesSection, ShortcutsSection } from '@/components/workspace/preferences-section';
@@ -252,6 +279,7 @@ import {
 import { resolveTranscriptUserLabel } from '@/lib/workspace/transcript-speaker';
 import { chatFolderRelation } from '@/lib/workspace/chat-placement';
 import {
+  ANON_RUN_MODEL_ID,
   CHAT_HARNESS_LABELS,
   DEFAULT_MODEL_REF,
   getChatModelLabel,
@@ -290,7 +318,7 @@ import {
   useWorkspaceFileEditingEffects,
   useWorkspaceFileInputEffects,
 } from './_components/workspace-file-ui-effects';
-import { useWorkspaceShare, useWorkspaceAudienceProbe, shareOrigin, isLinkSharedInfo } from './_components/workspace-share';
+import { useWorkspaceShare, useWorkspaceAudienceProbe, shareOrigin, linkOriginFor, isLinkSharedInfo } from './_components/workspace-share';
 import { PathShareModal, usePathShares } from './_components/path-share-modal';
 import {
   broaderAccessLabel,
@@ -306,7 +334,7 @@ import { usePathShareRealtimeAuthReady } from '@/lib/workspace/use-path-share-re
 import { DocColumnControls, DocFileNameControl } from './_components/doc-column-controls';
 import { useWorkspaceComments, WorkspaceCommentContextMenu } from './_components/workspace-comments';
 import { TopbarShareButton } from './_components/topbar-share-button';
-import { LocalAgentModeModal, WorkspaceLocalAgentModal, useWorkspaceLocalAgent } from './_components/workspace-local-agent-modal';
+import { LocalAgentModeModal } from './_components/workspace-local-agent-modal';
 import { useWorkspaceLinkCopy } from './_components/workspace-link-copy';
 import { ClaimOwnershipNudge, SidebarIdentity } from './_components/sidebar-identity';
 import { ClaimKeyGate } from './_components/claim-key-gate';
@@ -343,13 +371,19 @@ import {
   type MessageAttachment,
 } from './_components/workspace-chat-model';
 import { FilesTabPanel } from './_components/files-tab-panel';
+import { LocalFolderSyncStatus } from './_components/local-folder-sync-status';
 import { ProjectSidebar } from './_components/project-sidebar';
 import { SundialSupport } from '@/components/support/sundial-support';
 import { ShellNavControls, SidebarTopChrome } from './_components/sidebar-top-chrome';
 import { GetSetUpCard } from '@/components/desktop/get-set-up-card';
 import { OpenWithModal, OpenWithRow } from '@/components/workspace/open-with-modal';
 import { WorkspaceCreationOverlay, WorkspaceRouteLoading } from '@/components/workspace/workspace-route-loading';
-import { WELCOME_TEX_INITIAL_COMPILE_ERROR, WELCOME_TEX_PATH } from '@/lib/workspace/welcome-doc';
+import {
+  hasWelcomeTexInitialCompileMarker,
+  WELCOME_TEX_ERROR_TARGET,
+  WELCOME_TEX_INITIAL_COMPILE_ERROR,
+  WELCOME_TEX_PATH,
+} from '@/lib/workspace/welcome-doc';
 import {
   clearOnboardingCreationTiming,
   onboardingElapsedMs,
@@ -385,7 +419,11 @@ import {
   isAgentTurnJustStarted,
   type LatexChatCollapseState,
 } from '@/lib/workspace/latex-layout';
-import { buildLatexMarkers, resolveLatexLogPath } from '@/lib/workspace/latex-log-navigation';
+import {
+  buildLatexMarkers,
+  resolveLatexLogPath,
+  type LatexMarker,
+} from '@/lib/workspace/latex-log-navigation';
 import { WorkspaceChatPane } from './_components/workspace-chat-pane';
 import { ChatArrivalHero, EmptyChatPrompt } from './_components/chat-arrival-hero';
 import { LocalEngineNotice } from './_components/local-engine-notice';
@@ -449,6 +487,10 @@ const LatexPdfPane = dynamic(
 );
 const LatexWorkbench = dynamic(
   () => import('@/components/workspace/latex-workbench').then((module) => module.LatexWorkbench),
+  { ssr: false },
+);
+const MobileCommentsSheet = dynamic(
+  () => import('@/components/workspace/mobile-comments-sheet').then((m) => m.MobileCommentsSheet),
   { ssr: false },
 );
 const SyncTexTipCard = dynamic(
@@ -551,8 +593,8 @@ const WorkspaceShareModal = dynamic(
   () => import('./_components/workspace-share-modal').then((module) => module.WorkspaceShareModal),
   { ssr: false },
 );
-const HostedConnectorTab = dynamic(
-  () => import('@/components/workspace/hosted-connector-tab').then((module) => module.HostedConnectorTab),
+const HostedConnectorSection = dynamic(
+  () => import('@/components/workspace/hosted-connector-tab').then((module) => module.HostedConnectorSection),
   { ssr: false },
 );
 const DeleteChatDialog = dynamic(
@@ -1079,6 +1121,7 @@ export default function WorkspacePage() {
   const deepLinkedFilePath = searchParams.get('filePath')?.trim() || null;
   const onboardingTexIntent = searchParams.get('onboarding') === 'tex';
   const onboardingPerfReportedRef = useRef<string | null>(null);
+  const onboardingDiagnosticReportedRef = useRef<string | null>(null);
   const onboardingGuideReportedRef = useRef<string | null>(null);
   const [showOnboardingTexGuide, setShowOnboardingTexGuide] = useState(false);
   const deepLinkedChatId = searchParams.get('chatId')?.trim() || null;
@@ -1111,6 +1154,44 @@ export default function WorkspacePage() {
   const lastFileStorageKey = projectId ? `${LAST_FILE_KEY_PREFIX}${projectId}` : '';
   const router = useRouter();
   const { user, isLoaded: isAuthLoaded } = useUser();
+  // Cloud mirror of the desktop rows' engine status: whose credential a
+  // Claude Code / Codex turn would run on — the payer's Claude subscription
+  // ("Connect your Claude Code"), their BYOK key, or Sundial's (null). Drives
+  // the Agent dropdown's status lines + connect prompts. Refreshed whenever
+  // the model picker opens, so connecting in Settings shows up on the next
+  // look without a reload.
+  const [cloudEngineAuth, setCloudEngineAuth] = useState<{
+    claude: 'subscription' | 'api-key' | null;
+    openai: 'api-key' | null;
+  } | null>(null);
+  const reloadCloudEngineAuth = useCallback(async () => {
+    if (isLocalWorkspace || !user) {
+      setCloudEngineAuth(null);
+      return;
+    }
+    try {
+      const [oauthRes, keysRes] = await Promise.all([
+        fetch('/api/user/claude-oauth', { credentials: 'include', cache: 'no-store' }),
+        fetch('/api/user/provider-keys', { credentials: 'include', cache: 'no-store' }),
+      ]);
+      const oauth = oauthRes.ok
+        ? ((await oauthRes.json()) as { connected?: boolean })
+        : null;
+      const keys = keysRes.ok
+        ? (((await keysRes.json()) as { keys?: Array<{ provider: string }> }).keys ?? [])
+        : [];
+      const hasKey = (provider: string) => keys.some((key) => key.provider === provider);
+      setCloudEngineAuth({
+        claude: oauth?.connected ? 'subscription' : hasKey('anthropic') ? 'api-key' : null,
+        openai: hasKey('openai') ? 'api-key' : null,
+      });
+    } catch {
+      // Keep the last known state — the rows fall back to generic hints.
+    }
+  }, [isLocalWorkspace, user]);
+  useEffect(() => {
+    void reloadCloudEngineAuth();
+  }, [reloadCloudEngineAuth]);
   const { openSignIn, signOut: clerkSignOut } = useClerk();
   const [hasMounted, setHasMounted] = useState(false);
   const backgroundDataReady = useAfterFirstPaint(hasMounted, projectId);
@@ -1311,6 +1392,10 @@ export default function WorkspacePage() {
    *  the stored-layout restore decides it) — a first visit is the absence. */
   const arrivalHadStoredLayoutRef = useRef(false);
   const [showRawView, setShowRawView] = useState(false);
+  // Split panes get their own raw view (each shows a different file).
+  // Storing the PATH the raw view is on, not a bare flag, drops the pane
+  // back to the rendered doc by itself when its tab changes file.
+  const [paneRawPath, setPaneRawPath] = useState<Record<string, string | null>>({});
   // Raw ↔ rendered swap: the two views have different total heights inside the
   // shared `doc-editor-body` scroll container, so a naive toggle clamps scrollTop
   // to 0 (jumps to the top). Capture the scroll *fraction* at click time (see the
@@ -1437,6 +1522,10 @@ export default function WorkspacePage() {
   // (never persisted anywhere): remembered so account hydration skips it.
   const urlAutocompleteOverrideRef = useRef<boolean | null>(null);
   const [showModelPicker, setShowModelPicker] = useState(false);
+  // Fresh credential status every time the picker opens (see the state above).
+  useEffect(() => {
+    if (showModelPicker) void reloadCloudEngineAuth();
+  }, [showModelPicker, reloadCloudEngineAuth]);
   const [showAppsPicker, setShowAppsPicker] = useState(false);
   const [workspaceMode, setWorkspaceMode] = useState<'assistant' | 'model_only'>('assistant');
   const [defaultAssistantId, setDefaultAssistantId] = useState<string | null>(null);
@@ -1447,6 +1536,7 @@ export default function WorkspacePage() {
   const appsPickerRef = useRef<HTMLDivElement>(null);
   const appConnectionHandledRef = useRef<string | null>(null);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [advancedMcpExpanded, setAdvancedMcpExpanded] = useState(false);
   const [showAddRepoModal, setShowAddRepoModal] = useState(false);
   // null = closed; 'create' arrives via "＋ New schedule" with the form open.
   const [schedulesPanelMode, setSchedulesPanelMode] = useState<null | 'list' | 'create'>(null);
@@ -1499,21 +1589,21 @@ export default function WorkspacePage() {
   }, []);
   // The right dock (PR #907 right panel): History (the review timeline) or
   // Outline. Closed by default; the top-bar toggle reopens the last-used view.
-  const [rightDockView, setRightDockView] = useState<'history' | 'outline' | 'support' | null>(null);
+  const [rightDockView, setRightDockView] = useState<'history' | 'outline' | null>(null);
   const [supportPanelHost, setSupportPanelHost] = useState<HTMLDivElement | null>(null);
-  const rightDockLastViewRef = useRef<'history' | 'outline' | 'support'>('history');
-  const openRightDock = useCallback((view: 'history' | 'outline' | 'support') => {
+  const [supportLauncherHost, setSupportLauncherHost] = useState<HTMLDivElement | null>(null);
+  // A sidebar suggestion click opens the central Assistants surface on that
+  // assistant's details; null opens the browse list.
+  const [assistantsFocusSlug, setAssistantsFocusSlug] = useState<string | null>(null);
+  const [assistantsFocusRequestId, setAssistantsFocusRequestId] = useState(0);
+  const rightDockLastViewRef = useRef<'history' | 'outline'>('history');
+  const openRightDock = useCallback((view: 'history' | 'outline') => {
     rightDockLastViewRef.current = view;
     setRightDockView(view);
     // A selected Sync commit short-circuits the center to the diff viewer —
     // drop it so the dock actually appears beside the editor.
     setSelectedCommit(null);
   }, []);
-  useEffect(() => {
-    if (savedFlags && !savedFlags.sundial_support_enabled) {
-      setRightDockView((current) => (current === 'support' ? null : current));
-    }
-  }, [savedFlags]);
   // The pinned top-right cluster (dock toggle · Share) overlays
   // whichever strip row runs beneath it — its measured width is reserved as
   // right padding there so tabs/icons never slide under Share.
@@ -1754,6 +1844,12 @@ export default function WorkspacePage() {
   const primaryLauncherActive = !isMobile && isLauncherTab(editorPanes[0].active);
   const primaryReviewActive = !isMobile && isReviewTab(editorPanes[0].active);
   const primaryDiffActive = !isMobile && isDiffTab(editorPanes[0].active);
+  const primaryAssistantsActive = !isMobile && isAssistantsTab(editorPanes[0].active);
+  const primarySupportActive = !isMobile && isSupportTab(editorPanes[0].active);
+  const utilitySurfaceActive = editorPanes.some(
+    (pane) => isAssistantsTab(pane.active) || isSupportTab(pane.active),
+  );
+  const supportSurfaceOpen = editorPanes.some((pane) => isSupportTab(pane.active));
   const paneChatVisible = editorPanes.some((p) => isChatTab(p.active));
   const paneFileVisible = editorPanes.some((p) => p.active !== '' && !isSpecialTab(p.active));
   const isEditorVisible = isMobile ? openPanels.includes('editor') : paneFileVisible;
@@ -1932,6 +2028,11 @@ export default function WorkspacePage() {
   // payload proves the visitor is NOT the owner. Reset on project switch so a
   // non-owned workspace's state never leaks into the next arrival.
   const [isOwner, setIsOwner] = useState(true);
+  // Claim state from the files payload (anon owners only). null = unknown;
+  // true suppresses the claim nudge — a claimed local-backing workspace
+  // keeps user_id NULL by design, so only the server can say.
+  const [workspaceClaimed, setWorkspaceClaimed] = useState<boolean | null>(null);
+  const [canManageAssistantActions, setCanManageAssistantActions] = useState(false);
   const [canSuggest, setCanSuggest] = useState(true);
   const [canComment, setCanComment] = useState(true);
   const [canAccessSecrets, setCanAccessSecrets] = useState<boolean | null>(null);
@@ -1982,7 +2083,12 @@ export default function WorkspacePage() {
   const { mode: documentEditMode, setMode: setDocumentEditMode } = useDocumentEditMode();
   const [projectTitle, setProjectTitle] = useState('Untitled workspace');
   const [projectStatus, setProjectStatus] = useState<'active' | 'archived'>('active');
-  const [projectKind, setProjectKind] = useState<WorkspaceKind | null>(null);
+  const [projectKind, setProjectKind] = useState<WorkspaceKind | null>(
+    initialFilesPayload?.projectKind ?? null,
+  );
+  const [localSyncStatus, setLocalSyncStatus] = useState<WorkspaceLocalSyncStatus | null>(
+    initialFilesPayload?.localSyncStatus ?? null,
+  );
   const [projectCreatedAt, setProjectCreatedAt] = useState<string | null>(null);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editingTitleValue, setEditingTitleValue] = useState('');
@@ -3174,6 +3280,7 @@ export default function WorkspacePage() {
 
   const closeSettingsModal = useCallback(() => {
     setShowSettingsModal(false);
+    setAdvancedMcpExpanded(false);
   }, []);
 
   const openSettingsTab = useCallback((tab: SettingsTab) => {
@@ -3194,10 +3301,18 @@ export default function WorkspacePage() {
     draft: string;
   } | null>(null);
   // Free anonymous runs left on an anon-owned workspace (null: not anon-owned
-  // / unknown). Fed by the files payload; read at send time only, so a ref —
-  // it must not re-render anything, and staleness just means the server gate
-  // gives the honest answer instead.
+  // / unknown). Fed by the files payload; read at send time via the ref
+  // (staleness just means the server gate gives the honest answer instead).
+  // The state mirror drives the composer's model label: free runs execute on
+  // the pinned cheap model, and the picker must not advertise the stamped
+  // workspace default the run won't use.
   const anonRunsRemainingRef = useRef<number | null>(null);
+  const [anonRunsRemaining, setAnonRunsRemaining] = useState<number | null>(null);
+  // Did the SERVER recognize an identity on our last files read? `null` until
+  // one lands. The ONLY signal that separates a server-authed caller (Clerk
+  // cookie or `sd_` bearer / loopback sidecar) from a genuinely anonymous one
+  // when anonRunsRemaining is null — both read null on that field alone.
+  const serverAuthedRef = useRef<boolean | null>(null);
 
   // Integrations are account-scoped. A logged-out user clicking one goes
   // straight to Clerk sign-in — NOT a connect modal with the sign-in modal
@@ -3262,17 +3377,21 @@ export default function WorkspacePage() {
         workspaceId?: string;
         canWrite?: boolean;
         isOwner?: boolean;
+        claimed?: boolean;
         canSuggest?: boolean;
         canComment?: boolean;
         canAccessSecrets?: boolean;
         isMember?: boolean;
+        canManageAssistantActions?: boolean;
         anonRunsRemaining?: number | null;
+        serverAuthed?: boolean;
         pathGrants?: PathGrant[];
         chatGrants?: string[];
         scoped?: boolean;
         projectTitle?: string | null;
         projectStatus?: 'active' | 'archived' | null;
         projectKind?: WorkspaceKind | null;
+        localSyncStatus?: WorkspaceLocalSyncStatus | null;
         projectCreatedAt?: string | null;
         hostUrl?: string | null;
         cold?: boolean;
@@ -3357,8 +3476,15 @@ export default function WorkspacePage() {
       }
       if (typeof payload.anonRunsRemaining === 'number' || payload.anonRunsRemaining === null) {
         anonRunsRemainingRef.current = payload.anonRunsRemaining;
+        setAnonRunsRemaining(payload.anonRunsRemaining);
       }
+      // Absent (local sidecar payloads, older servers) must stay UNKNOWN
+      // rather than collapsing to "anonymous" — the gates below only fire on
+      // an explicit false.
+      if (typeof payload.serverAuthed === 'boolean') serverAuthedRef.current = payload.serverAuthed;
       if (typeof payload.isOwner === 'boolean') setIsOwner(payload.isOwner);
+      if (typeof payload.claimed === 'boolean') setWorkspaceClaimed(payload.claimed);
+      setCanManageAssistantActions(payload.canManageAssistantActions === true);
       setCanAccessSecrets(Boolean(payload.canAccessSecrets));
       // Both servers (files route + SSR preload) always include the field;
       // a payload WITHOUT it predates grants support and must not clear
@@ -3377,8 +3503,16 @@ export default function WorkspacePage() {
       if (payload.projectStatus === 'active' || payload.projectStatus === 'archived') {
         setProjectStatus(payload.projectStatus);
       }
-      if (payload.projectKind === 'standard') {
+      if (payload.projectKind === 'standard' || payload.projectKind === 'local-backing') {
         setProjectKind(payload.projectKind);
+      }
+      // New servers always include this field. An older local-backing payload
+      // intentionally falls through to `null`, which the files panel renders
+      // as "status unknown" instead of implying that every file has arrived.
+      if (Object.prototype.hasOwnProperty.call(payload, 'localSyncStatus')) {
+        setLocalSyncStatus(payload.localSyncStatus ?? null);
+      } else if (payload.projectKind !== undefined) {
+        setLocalSyncStatus(null);
       }
       if (payload.projectCreatedAt) setProjectCreatedAt(payload.projectCreatedAt);
       // Legacy CRDT-snapshot prefetch is gone under Sunny sandbox — Supabase
@@ -3506,9 +3640,12 @@ export default function WorkspacePage() {
     setIsCreatingGroupChat(false);
     setPreferencesLoaded(false);
     setFilesLoaded(false);
+    setProjectKind(null);
+    setLocalSyncStatus(null);
     // Back to the optimistic default until the new workspace's payload lands —
     // a previous workspace's non-owner state must not leak into this arrival.
     setIsOwner(true);
+    setCanManageAssistantActions(false);
   }, []);
 
   useWorkspaceFileLifecycle({
@@ -3630,22 +3767,7 @@ export default function WorkspacePage() {
     setShowAppsPicker,
   });
 
-  const {
-    showLocalAgentModal,
-    setShowLocalAgentModal,
-    localAgentJoinInfo,
-    localAgentLoading,
-    localAgentError,
-    localAgentCopied,
-    openLocalAgentModal,
-    copyLocalAgentText,
-  } = useWorkspaceLocalAgent({
-    projectId,
-    onOpen: () => {
-      setShowShareModal(false);
-      setShareDropdown(null);
-    },
-  });
+  const openWithWorkspace = useCallback(() => setShowOpenWithModal(true), []);
 
   // `?modal=` deep-link dispatch: connectOrSignIn return paths (addRepo /
   // addOverleaf / chatApps) and the seeded starter docs' `?modal=connectAgent`
@@ -3655,16 +3777,19 @@ export default function WorkspacePage() {
   // and re-clicking the same doc link is a no-op (searchParams never change).
   // Openers live in a ref so the effect keys on the param alone.
   const modalDeepLinkOpenersRef = useRef<Record<string, () => void>>({});
-  // All four targets are cloud-workspace connect flows (the file-tree menu
+  // All targets are cloud-workspace connect flows (the file-tree menu
   // gates them the same way) — a local project ignores integration deep links.
   modalDeepLinkOpenersRef.current = isLocalWorkspace
     ? {}
     : {
         addRepo: () => setShowAddRepoModal(true),
         addOverleaf: () => setShowAddOverleafModal(true),
-        chatApps: () => openSettingsTab('chatApps'),
-        connectAgent: () => void openLocalAgentModal(),
-        openWith: () => setShowOpenWithModal(true),
+        chatApps: () => {
+          setAdvancedMcpExpanded(true);
+          openSettingsTab('preferences');
+        },
+        connectAgent: openWithWorkspace,
+        openWith: openWithWorkspace,
       };
   useEffect(() => {
     const open = modalDeepLinkParam ? modalDeepLinkOpenersRef.current[modalDeepLinkParam] : null;
@@ -4057,8 +4182,13 @@ export default function WorkspacePage() {
     // Wait for Clerk to settle: a signed-in user is briefly null while
     // hydrating, and treating that as anonymous would seed new chats (and the
     // startup auto-chat) with the app default before the saved one loads.
-    if (!hasMounted || !isAuthLoaded) return;
-    if (!user?.id) {
+    // clerkNeverLoads: the packaged shell's loopback origin never gets a
+    // Clerk load at all — without the escape this effect never ran and the
+    // Settings model picker spun on "Loading…" forever (team bug thread,
+    // Aug 26). Desktop sign-in (sd_ credentials) authenticates the
+    // preferences read through the sidecar proxy instead.
+    if (!hasMounted || !(isAuthLoaded || clerkNeverLoads())) return;
+    if (!user?.id && !desktopSignedIn) {
       setSavedDefaultModel(DEFAULT_MODEL_REF);
       setSavedAutocompleteModel(null);
       // No account to read from — the per-browser flag store (URL /
@@ -4120,7 +4250,7 @@ export default function WorkspacePage() {
     return () => {
       cancelled = true;
     };
-  }, [hasMounted, isAuthLoaded, user?.id, projectId]);
+  }, [hasMounted, isAuthLoaded, user?.id, desktopSignedIn, projectId]);
 
   const handleAutocompleteModeChange = useCallback((mode: AutocompleteMode) => {
     setSavedAutocompleteMode(mode);
@@ -4174,8 +4304,15 @@ export default function WorkspacePage() {
             onAutocompleteChange={setSavedAutocompleteModel}
             onFlagChange={handleFlagChange}
             onAutocompleteModeChange={handleAutocompleteModeChange}
-            canSavePreferences={Boolean(user?.id)}
+            canSavePreferences={Boolean(user?.id) || desktopSignedIn}
           />
+          {!isLocalWorkspace ? (
+            <HostedConnectorSection
+              projectId={projectId}
+              expanded={advancedMcpExpanded}
+              onExpandedChange={setAdvancedMcpExpanded}
+            />
+          ) : null}
         </div>
       </div>
     );
@@ -4513,6 +4650,7 @@ export default function WorkspacePage() {
     workspaceRouteId,
     currentChatId,
     user,
+    desktopSignedIn,
     router,
     openSignIn,
     eagerLoad: backgroundDataReady,
@@ -4821,7 +4959,7 @@ export default function WorkspacePage() {
     'New chat';
   const currentChatLink =
     currentChatId && !isDraftChatId(currentChatId) && typeof window !== 'undefined'
-      ? `${window.location.origin}${buildWorkspaceChatPath(workspaceRouteId, currentChatId)}`
+      ? (() => { const path = buildWorkspaceChatPath(workspaceRouteId, currentChatId); return `${linkOriginFor(path)}${path}`; })()
       : '';
   // (Below currentChatHeaderTitle on purpose — the deps close over it.)
   // Local chats share at CHAT scope: only this conversation mirrors to the
@@ -4878,7 +5016,17 @@ export default function WorkspacePage() {
   // nothing renders it there yet — so they stay gated (the button opens the
   // share modal instead of copying).
   const chatShareReady = !isLocalWorkspace && shareStatus !== 'private';
-  const currentChatModel = normalizeChatModelRef(currentChat?.model ?? preferredChatModel);
+  // A signed-out sender with free anonymous runs left always executes on the
+  // pinned cheap model (the server gate rewrites chats.model on send) — show
+  // that model, not the stamped workspace default the run won't honor.
+  const anonModelPinned =
+    !isLocalWorkspace &&
+    (isClerkLoaded || clerkNeverLoads()) &&
+    !isClerkSignedIn &&
+    (anonRunsRemaining ?? 0) > 0;
+  const currentChatModel = normalizeChatModelRef(
+    anonModelPinned ? ANON_RUN_MODEL_ID : (currentChat?.model ?? preferredChatModel),
+  );
   const currentChatHarness = parseChatHarness(currentChat?.harness);
   const [chatEditModeByChatId, setChatEditModeByChatId] = useState<Record<string, WorkspaceEditMode>>({});
   const chatEditMode = currentChatId
@@ -5198,10 +5346,13 @@ export default function WorkspacePage() {
         return b.index - a.index;
       });
   }, [chatThreadsForCurrentProject]);
-  const activeChats = chatEntries.filter((entry) => !entry.isArchived);
+  const navigableChatEntries = chatEntries.filter((entry) =>
+    shouldShowSelectionActionChat(entry.chat, selectedDirectChatId),
+  );
+  const activeChats = navigableChatEntries.filter((entry) => !entry.isArchived);
   const pinnedActiveChats = activeChats.filter((entry) => isChatPinned(entry.chat));
   const unpinnedActiveChats = activeChats.filter((entry) => !isChatPinned(entry.chat));
-  const archivedChats = chatEntries.filter((entry) => entry.isArchived);
+  const archivedChats = navigableChatEntries.filter((entry) => entry.isArchived);
   const sunnyAvatarByChatId = useMemo(
     () => buildSunnyAvatarMap(chatEntries.map((entry) => entry.chat)),
     [chatEntries],
@@ -5678,6 +5829,33 @@ export default function WorkspacePage() {
   const workspaceFileByPath = useMemo(() => {
     return new Map(workspaceFiles.map((file) => [file.path, file]));
   }, [workspaceFiles]);
+  // ── Remote rename follow ────────────────────────────────────────────────
+  // A collaborator's rename/move arrives here as a plain files-list refresh:
+  // the selected path (and any open tab) simply stops existing, so the pane
+  // dropped to "Nothing open" — the renamer kept their view (movePath's
+  // optimistic remap), everyone else got kicked. Ids are stable across
+  // renames, so track id→path and follow: when a known id resurfaces at a
+  // new path while its old path is gone, remap the selection and the open
+  // tabs with the same helpers the local move uses. Local moves are a no-op
+  // here (their optimistic remap already rewrote this state before the
+  // refresh), and paths covered by an in-flight local move are skipped —
+  // the pending-move freeze owns those until the PATCH settles.
+  const knownFilePathsByIdRef = useRef<Map<string, string>>(new Map());
+  useEffect(() => {
+    const { remaps, nextPathById } = diffRemoteRenames(knownFilePathsByIdRef.current, workspaceFiles);
+    knownFilePathsByIdRef.current = nextPathById;
+    if (remaps.length === 0) return;
+    const coveredByPendingMove = (path: string) =>
+      (pendingOpenFileMove &&
+        (isPathWithin(path, pendingOpenFileMove.from) || isPathWithin(path, pendingOpenFileMove.to))) ||
+      pendingPaneMoves.some((m) => isPathWithin(path, m.from) || isPathWithin(path, m.to));
+    const applicable = remaps.filter((r) => !coveredByPendingMove(r.from) && !coveredByPendingMove(r.to));
+    if (applicable.length === 0) return;
+    setEditorPanes((panes) => applicable.reduce((acc, r) => remapPanePaths(acc, r.from, r.to), panes));
+    setSelectedFilePath((path) =>
+      path ? applicable.reduce((acc, r) => remapPath(acc, r.from, r.to), path) : path,
+    );
+  }, [workspaceFiles, pendingOpenFileMove, pendingPaneMoves]);
   // Fallback via the pre-move path: a background reload racing an in-flight
   // open-file move can briefly restore the old server paths — without it the
   // lookup at the new path misses and the editor unmounts mid-move.
@@ -5937,6 +6115,15 @@ export default function WorkspacePage() {
       ),
     [canWrite, canSuggest, canComment, pathGrants, activeWorkspaceFile?.path, user],
   );
+  // Assistant selection actions mutate workspace-global state. Presence of
+  // this id is the editors' complete capability: wait for the authoritative
+  // files payload, require a true workspace member with write access (never a
+  // link/path grant), and exclude local workspaces.
+  const selectionActionsProjectId = resolveSelectionActionsProjectId({
+    filesLoaded,
+    canManageAssistantActions,
+    cloudProjectId,
+  });
   // Commenters (canSuggest without canWrite) get an editable editor locked to
   // Suggesting — their typing lands as reviewable suggestions, GDocs-style.
   const documentReadOnly = !activeFileCap.canWrite && !activeFileCap.canSuggest;
@@ -5955,14 +6142,14 @@ export default function WorkspacePage() {
       ? documentEditMode
       : 'edit';
   const documentEditorReadOnly = documentReadOnly || effectiveDocEditMode === 'view';
-  // Raw markdown has no Suggesting: if a doc was in Suggesting when raw view
-  // opens, switch it to Editing so raw writes don't persist as suggestions.
-  // (Editors only — commenters must never land in Editing.)
-  useEffect(() => {
-    if (activeFileCap.canWrite && showRawView && activeIsMarkdown && documentEditMode === 'suggest') {
-      setDocumentEditMode('edit');
-    }
-  }, [activeFileCap.canWrite, showRawView, activeIsMarkdown, documentEditMode, setDocumentEditMode]);
+  // Raw markdown has no Suggesting, but that lives entirely in the EFFECTIVE
+  // mode: RAW_MARKDOWN_DOC_EDIT_MODES lacks 'suggest', so the coercion above
+  // renders and binds the editor as Editing while raw view is open, and the
+  // stored mode comes back untouched when it closes. This used to also
+  // PERSIST 'edit' over the stored mode — a view toggle silently and
+  // permanently overwrote the user's chosen Suggesting, surfacing later as
+  // "my mode switched from suggest to edit on its own" (team bug thread,
+  // Aug 24). Never write the stored mode from a view state.
   // Pin commenters to Suggesting: the editors read the stored mode from
   // context (default 'edit'), and their socket token/UI must only suggest.
   useEffect(() => {
@@ -6101,8 +6288,16 @@ export default function WorkspacePage() {
     fetchImpl: apiFetch,
     liveRefresh: !isLocalWorkspace,
     resolveLogPath: resolveLatexLog,
+    // Seed the canned onboarding error only while the intentional \input line
+    // is actually (still) in the doc — `onboarding=tex` stays in the URL for
+    // the whole session, so an unconditional seed resurrected the fixed error
+    // on every return to welcome.tex. Pre-hydration (content null) stays
+    // null: the creation overlay covers that window.
     initialCompileError:
-      onboardingTexIntent && latexRootPath === WELCOME_TEX_PATH
+      onboardingTexIntent &&
+      latexRootPath === WELCOME_TEX_PATH &&
+      typeof viewerContent === 'string' &&
+      /^\\input\{sundial-intentional-error/m.test(viewerContent)
         ? WELCOME_TEX_INITIAL_COMPILE_ERROR
         : null,
     // Cloud only: local projects already have the sidecar's own file-watch
@@ -6280,7 +6475,10 @@ export default function WorkspacePage() {
     const value = new URLSearchParams(window.location.search).get('pdfcomments');
     if (value === 'on' || value === 'off') setPdfCommentsUrlOverride(value === 'on');
   }, []);
-  const pdfCommentsEnabled = pdfCommentsUrlOverride ?? savedFlags?.pdf_comments_enabled ?? false;
+  // Pre-hydration fallback reads the store (registry default: on) so the
+  // launched feature doesn't blink off while preferences load.
+  const pdfCommentsEnabled =
+    pdfCommentsUrlOverride ?? savedFlags?.pdf_comments_enabled ?? getFlag('pdf_comments_enabled');
 
   const {
     commentLaneRowRef,
@@ -6289,8 +6487,11 @@ export default function WorkspacePage() {
     resolvedCommentRanges,
     draftCommentRange,
     openCommentThreads,
+    openWorkspaceCommentThreads,
+    refreshWorkspaceComments,
     reportCommentAnchors,
     showInlineCommentLane,
+    mobileCommentsOpen,
     commentsLaneToggled,
     displayedCommentThreads,
     displayedResolvedThreads,
@@ -6301,7 +6502,7 @@ export default function WorkspacePage() {
     commentDocumentLabel,
     commentPanelMode,
     docCommentAnchorOffsets,
-    commentAnchorLines,
+    commentAnchorLineSpans,
     measuredCommentAnchorIds,
     draftCommentAnchorOffset,
     activeCommentThreadId,
@@ -6386,10 +6587,19 @@ export default function WorkspacePage() {
   // Creation decided eligibility and encoded it in the URL. `filePath` lets
   // the server preload this exact Y.Doc; `onboarding=tex` claims the primary
   // pane without a checklist request or a file-download verification probe.
+  // Claims ONCE per workspace (mirroring deepLinkClaimedForRef): the param
+  // stays in the URL for the whole session, and without the guard every
+  // sidebar click that changed selectedFilePath re-ran this and yanked the
+  // user back to welcome.tex.
+  const onboardingTexClaimedRef = useRef<string | null>(null);
+  // Latches after welcome.tex's first hydration; see onboardingWorkspaceLoading.
+  const onboardingCoverDoneRef = useRef(false);
   useEffect(() => {
     if (!onboardingTexIntent || !filesLoaded || !workspaceFileByPath.has(WELCOME_TEX_PATH)) return;
     if (localConfig || pathGrants.length > 0) return;
     if (!canWrite || panelViewActive) return;
+    if (onboardingTexClaimedRef.current === projectId) return;
+    onboardingTexClaimedRef.current = projectId;
     if (selectedFilePath !== WELCOME_TEX_PATH) {
       setSelectedFilePath(WELCOME_TEX_PATH);
       claimPrimaryWithFile(WELCOME_TEX_PATH);
@@ -6402,6 +6612,7 @@ export default function WorkspacePage() {
     pathGrants.length,
     canWrite,
     panelViewActive,
+    projectId,
     selectedFilePath,
     claimPrimaryWithFile,
   ]);
@@ -6432,23 +6643,37 @@ export default function WorkspacePage() {
     if (!workspaceFileByPath.has(WELCOME_TEX_PATH)) return;
     onboardingPerfReportedRef.current = projectId;
     const elapsedMs = Math.round(onboardingElapsedMs());
-    const navigationElapsedMs = Math.round(performance.now());
     track('onboarding_workspace_visible', {
       projectId,
       elapsedMs,
       budgetMs: WORKSPACE_VISIBLE_BUDGET_MS,
       withinBudget: elapsedMs <= WORKSPACE_VISIBLE_BUDGET_MS,
     });
-    // The known error is supplied synchronously to the compile controller in
-    // this same render, so this is also the diagnostic-visible milestone.
-    track('onboarding_diagnostic_visible', {
-      projectId,
-      elapsedMs: navigationElapsedMs,
-      budgetMs: STARTER_DIAGNOSTIC_BUDGET_MS,
-      withinBudget: navigationElapsedMs <= STARTER_DIAGNOSTIC_BUDGET_MS,
-    });
     clearOnboardingCreationTiming();
   }, [filesLoaded, onboardingTexIntent, projectId, workspaceFileByPath]);
+
+  const handleOnboardingCompileMarkersVisible = useCallback(
+    (markedFilePath: string, installedMarkers: readonly LatexMarker[]) => {
+      // The marker acknowledgement comes from the mounted Monaco instance
+      // after both its owned marker and gutter collection exist. Keep the
+      // open-file check explicit so a stale callback from a departing editor
+      // can never claim this milestone for a different surface.
+      if (!onboardingTexIntent || markedFilePath !== WELCOME_TEX_PATH) return;
+      if (activeWorkspaceFile?.path !== WELCOME_TEX_PATH) return;
+      if (!viewerContent?.includes(WELCOME_TEX_ERROR_TARGET)) return;
+      if (!hasWelcomeTexInitialCompileMarker(installedMarkers)) return;
+      if (onboardingDiagnosticReportedRef.current === projectId) return;
+      onboardingDiagnosticReportedRef.current = projectId;
+      const elapsedMs = Math.round(performance.now());
+      track('onboarding_diagnostic_visible', {
+        projectId,
+        elapsedMs,
+        budgetMs: STARTER_DIAGNOSTIC_BUDGET_MS,
+        withinBudget: elapsedMs <= STARTER_DIAGNOSTIC_BUDGET_MS,
+      });
+    },
+    [activeWorkspaceFile?.path, onboardingTexIntent, projectId, viewerContent],
+  );
 
   // Single invalidation token feeding the inline-diff hook. Combines every
   // upstream "you should refetch now" signal we have:
@@ -6948,14 +7173,7 @@ export default function WorkspacePage() {
   useEffect(() => {
     if (!outlineLaneOpen) return;
     const compute = () => {
-      const els = docEditorBodyRef.current?.querySelectorAll('.tiptap :is(h1,h2,h3,h4,h5,h6)');
-      setOutlineHeadings(
-        Array.from(els ?? [], (el, index) => ({
-          level: Number(el.tagName[1]),
-          text: el.textContent ?? '',
-          index,
-        })),
-      );
+      setOutlineHeadings(readEditorHeadings(docEditorBodyRef.current));
     };
     compute();
     if (!markdownEditor || markdownEditor.isDestroyed) return;
@@ -7168,6 +7386,8 @@ export default function WorkspacePage() {
         return `Edits · ${thread?.chat.title?.trim() || 'chat'}`;
       }
       if (isLauncherTab(tab)) return 'New tab';
+      if (isAssistantsTab(tab)) return 'Assistants';
+      if (isSupportTab(tab)) return 'Sundial Support';
       return formatFileName(getFileName(tab));
     },
     [chatThreadsForCurrentProject],
@@ -7654,6 +7874,70 @@ export default function WorkspacePage() {
     [saveChatScrollPosition],
   );
 
+  // Assistants and Support are central workspace utilities, not right-dock
+  // views. Open them as ephemeral tabs in the primary canvas: the current
+  // document stays immediately behind the utility and returns on close.
+  const openCentralUtilityTab = useCallback(
+    (tab: typeof ASSISTANTS_TAB | typeof SUPPORT_TAB) => {
+      if (isMobile) return;
+      setSelectedCommit(null);
+      applyPaneTransition(
+        (prev) => {
+          let panes = prev;
+          const other = tab === ASSISTANTS_TAB ? SUPPORT_TAB : ASSISTANTS_TAB;
+          for (let guard = 0; guard < MAX_EDITOR_PANES; guard += 1) {
+            const holder = panes.find((pane) => pane.tabs.includes(other));
+            if (!holder) break;
+            panes = closePaneTab(panes, holder.id, other).panes;
+          }
+          return {
+            panes: openOverlayTab(
+              dropTabElsewhere(panes, tab, PRIMARY_PANE_ID),
+              PRIMARY_PANE_ID,
+              tab,
+            ),
+            primaryActive: tab,
+          };
+        },
+        { preferPaneId: PRIMARY_PANE_ID, preferTab: tab },
+      );
+      setWorkspaceViewMode('space');
+    },
+    [applyPaneTransition, isMobile, setWorkspaceViewMode],
+  );
+
+  const closeCentralUtilityTabs = useCallback(
+    (targets: readonly string[] = [ASSISTANTS_TAB, SUPPORT_TAB]) => {
+      if (!editorPanesRef.current.some((pane) => pane.tabs.some((tab) => targets.includes(tab)))) return;
+      applyPaneTransition((prev) => {
+        let panes = prev;
+        let primaryActive: string | undefined;
+        for (const target of targets) {
+          for (let guard = 0; guard < MAX_EDITOR_PANES; guard += 1) {
+            const pane = panes.find((entry) => entry.tabs.includes(target));
+            if (!pane) break;
+            const result = closePaneTab(panes, pane.id, target);
+            panes = result.panes;
+            primaryActive = result.primaryActive ?? primaryActive;
+          }
+        }
+        return { panes, primaryActive };
+      });
+    },
+    [applyPaneTransition],
+  );
+
+  // A preference can change while its utility is open. Remove the ephemeral
+  // tab immediately rather than leave an unreachable, flag-disabled surface.
+  useEffect(() => {
+    if (!savedFlags) return;
+    const disabled = [
+      savedFlags.assistants_enabled === false ? ASSISTANTS_TAB : null,
+      savedFlags.sundial_support_enabled === false ? SUPPORT_TAB : null,
+    ].filter((tab): tab is typeof ASSISTANTS_TAB | typeof SUPPORT_TAB => tab !== null);
+    if (disabled.length) closeCentralUtilityTabs(disabled);
+  }, [closeCentralUtilityTabs, savedFlags]);
+
   const deletePaths = useCallback(async (paths: string[]) => {
     if (paths.length === 0 || !paths.every((path) => canWriteWorkspacePath(path))) return;
     if (!projectId) return;
@@ -7677,6 +7961,12 @@ export default function WorkspacePage() {
     const succeeded: string[] = [];
     const folders = new Set<string>();
     const texts = new Set<string>();
+    // Local workspaces preserve ignored content (.git, node_modules, …), which
+    // keeps the folder holding it on disk. Those paths must survive the
+    // optimistic tree prune below, or the row vanishes and the next listing
+    // puts it straight back ("deleted a cloned repo, some files stayed").
+    const keptPaths: string[] = [];
+    const survived = new Set<string>();
     let undoable = true;
     let deletedCount = 0;
     let before: string | null = null;
@@ -7687,7 +7977,13 @@ export default function WorkspacePage() {
         deleted?: unknown;
         deletedAt?: unknown;
         restorable?: { folders?: unknown; texts?: unknown } | null;
+        kept?: unknown;
       } | null;
+      const kept = Array.isArray(body?.kept) ? body.kept.map(String) : [];
+      if (kept.length) {
+        keptPaths.push(...kept);
+        for (const folder of survivingFolders(paths[i], kept)) survived.add(folder);
+      }
       if (Array.isArray(body?.deleted)) deletedCount += body.deleted.length;
       if (typeof body?.deletedAt === 'string' && (before === null || body.deletedAt > before)) before = body.deletedAt;
       if (body?.restorable == null) undoable = false;
@@ -7710,7 +8006,11 @@ export default function WorkspacePage() {
     }
     setDeleteSeq((s) => s + 1);
     mutateWorkspaceFiles((prev) =>
-      prev.filter((file) => !succeeded.some((p) => file.path === p || file.path.startsWith(`${p}/`))),
+      prev.filter(
+        (file) =>
+          survived.has(file.path) ||
+          !succeeded.some((p) => file.path === p || file.path.startsWith(`${p}/`)),
+      ),
     );
     // Close every tab under the deleted paths; when the primary pane's active
     // tab dies its neighbor takes over ('' when the pane emptied — the old
@@ -7727,7 +8027,14 @@ export default function WorkspacePage() {
     setSelectedPaths(new Set());
     setOpenMenuPath(null);
     filesChannelRef.current?.postMessage({ type: 'refresh' });
-  }, [applyPaneTransition, canWriteWorkspacePath, projectId, selectedFilePath]);
+    if (keptPaths.length) {
+      const names = keptPaths.slice(0, 2).join(', ');
+      showWorkspaceAppNotice(
+        'error',
+        `Kept ${names}${keptPaths.length > 2 ? ` and ${keptPaths.length - 2} more` : ''} on disk. Sundial never deletes repos or caches, so the folder is still there; remove it yourself to finish.`,
+      );
+    }
+  }, [applyPaneTransition, canWriteWorkspacePath, projectId, selectedFilePath, showWorkspaceAppNotice]);
 
   const restoreLastDeletedPaths = useCallback(async () => {
     if (!projectId) return;
@@ -7877,7 +8184,8 @@ export default function WorkspacePage() {
   const buildFileUrl = useCallback((file: WorkspaceFileRow) => {
     if (typeof window === 'undefined') return '';
     if (file.type === 'folder' || file.type === 'proposal') return '';
-    return `${window.location.origin}${buildWorkspaceFilePath(workspaceRouteId, file.id)}`;
+    const path = buildWorkspaceFilePath(workspaceRouteId, file.id);
+    return `${linkOriginFor(path)}${path}`;
   }, [workspaceRouteId]);
 
   const downloadFile = useCallback((file: WorkspaceFileRow) => {
@@ -8013,6 +8321,10 @@ export default function WorkspacePage() {
   }, [panelViewActive, selectedFilePath]);
   const showPanelSurface = useCallback(
     (surface: PanelNavTarget, fileOverride?: WorkspaceFileRow) => {
+      // Assistants/Support are local utility destinations, not steerable
+      // panel surfaces. Any explicit Files/Doc/Chat/Review selection replaces
+      // them under the embedded panel's one-surface contract.
+      closeCentralUtilityTabs();
       if (surface === 'files') {
         setOpenLeftRail('project');
         return;
@@ -8060,7 +8372,7 @@ export default function WorkspacePage() {
         handleLatexViewModeChange(surface);
       }
     },
-    [closeRightDock, handleFileClick, handleLatexViewModeChange, openRightDock, selectedFilePath, workspaceFileByPath, workspaceFiles],
+    [closeCentralUtilityTabs, closeRightDock, handleFileClick, handleLatexViewModeChange, openRightDock, selectedFilePath, workspaceFileByPath, workspaceFiles],
   );
   usePanelControl({
     enabled: panelViewActive,
@@ -8343,12 +8655,13 @@ export default function WorkspacePage() {
   }, []);
 
   const openFileAtLine = useCallback(
-    (result: { path: string; line: number }) => {
+    (result: { path: string; line: number; word?: string }) => {
       const file = workspaceFileByPath.get(result.path);
       if (!file || file.type === 'folder') return;
       if (result.path === selectedFilePath) {
-        // Already open — reveal directly, no remount to wait on.
-        if (result.line > 0) textEditorRef.current?.revealLine?.(result.line);
+        // Already open — reveal directly, no remount to wait on. `word` (the
+        // text a PDF double-click selected) snaps the jump to the exact word.
+        if (result.line > 0) textEditorRef.current?.revealLine?.(result.line, result.word);
         return;
       }
       pendingRevealLineRef.current = result.line > 0 ? result.line : null;
@@ -8373,7 +8686,7 @@ export default function WorkspacePage() {
     }
   }, []);
   const handleSynctexInverse = useCallback(
-    (file: string, line: number) => {
+    (file: string, line: number, word?: string) => {
       const candidates = [pathFromRoot(latexRootPath ?? '', file), file];
       let resolved = candidates.find((p) => workspaceFileByPath.has(p));
       if (!resolved) {
@@ -8386,7 +8699,7 @@ export default function WorkspacePage() {
         }
       }
       if (!resolved) return;
-      openFileAtLine({ path: resolved, line });
+      openFileAtLine({ path: resolved, line, word });
       try {
         if (localStorage.getItem('sundial:synctex-tip-seen') !== '1') setShowSynctexTip(true);
       } catch {
@@ -8405,9 +8718,9 @@ export default function WorkspacePage() {
     const rel = pathRelativeToRoot(latexRootPath ?? activeWorkspaceFile.path, activeWorkspaceFile.path);
     const markers: PdfCommentMarker[] = [];
     for (const thread of openCommentThreads) {
-      const line = commentAnchorLines[thread.id];
-      if (!line) continue;
-      const hit = synctexIndex.forward(rel, line);
+      const span = commentAnchorLineSpans[thread.id];
+      if (!span) continue;
+      const hit = synctexIndex.forward(rel, span[0]);
       if (!hit) continue;
       markers.push({
         id: thread.id,
@@ -8417,7 +8730,137 @@ export default function WorkspacePage() {
       });
     }
     return markers.length > 0 ? markers : null;
-  }, [pdfCommentsEnabled, synctexIndex, activeTexFile, activeWorkspaceFile, latexRootPath, openCommentThreads, commentAnchorLines, activeCommentThreadId]);
+  }, [pdfCommentsEnabled, synctexIndex, activeTexFile, activeWorkspaceFile, latexRootPath, openCommentThreads, commentAnchorLineSpans, activeCommentThreadId]);
+
+  // Highlight rectangles over the commented material itself (the pins mark
+  // the margin; these mark the words). Word-record intervals via forwardSpans.
+  const pdfCommentHighlights = useMemo<PdfCommentHighlight[] | null>(() => {
+    if (!pdfCommentsEnabled || !synctexIndex || !activeTexFile || !activeWorkspaceFile) return null;
+    const rel = pathRelativeToRoot(latexRootPath ?? activeWorkspaceFile.path, activeWorkspaceFile.path);
+    const highlights: PdfCommentHighlight[] = [];
+    for (const thread of openCommentThreads) {
+      const span = commentAnchorLineSpans[thread.id];
+      if (!span) continue;
+      const rects = synctexIndex.forwardSpans(rel, span[0], span[1]);
+      if (rects.length === 0) continue;
+      highlights.push({ id: thread.id, rects, active: thread.id === activeCommentThreadId });
+    }
+    return highlights.length > 0 ? highlights : null;
+  }, [pdfCommentsEnabled, synctexIndex, activeTexFile, activeWorkspaceFile, latexRootPath, openCommentThreads, commentAnchorLineSpans, activeCommentThreadId]);
+
+  // Comments on OTHER compiled files (\input'd chapters while the root is
+  // open) also project onto the PDF. Their Yjs anchors need each file's Y.Doc,
+  // but every thread carries its quote — fetch the file text once and span the
+  // quote. Runs off the workspace-scope thread list, which this effect also
+  // primes (it otherwise loads lazily with the All-comments lane).
+  const [childCommentSpans, setChildCommentSpans] = useState<
+    Record<string, { rel: string; span: [number, number] }>
+  >({});
+  const childSpanTextCacheRef = useRef<Map<string, string>>(new Map());
+  useEffect(() => {
+    if (!pdfCommentsEnabled || !synctexIndex || !activeTexFile) return;
+    refreshWorkspaceComments();
+    // synctexIndex identity changes per compile — re-prime then, not more.
+  }, [pdfCommentsEnabled, synctexIndex, activeTexFile, refreshWorkspaceComments]);
+  useEffect(() => {
+    if (!pdfCommentsEnabled || !synctexIndex || !activeTexFile || !activeWorkspaceFile) {
+      setChildCommentSpans((prev) => (Object.keys(prev).length ? {} : prev));
+      return;
+    }
+    const root = latexRootPath ?? activeWorkspaceFile.path;
+    const activePath = activeWorkspaceFile.path;
+    const candidates = openWorkspaceCommentThreads.filter(
+      (thread) =>
+        thread.filePath !== activePath && /\.(tex|sty|cls)$/i.test(thread.filePath) && thread.quote,
+    );
+    if (candidates.length === 0) {
+      setChildCommentSpans((prev) => (Object.keys(prev).length ? {} : prev));
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const byFile = new Map<string, typeof candidates>();
+      for (const thread of candidates) {
+        const list = byFile.get(thread.filePath);
+        if (list) list.push(thread);
+        else byFile.set(thread.filePath, [thread]);
+      }
+      const next: Record<string, { rel: string; span: [number, number] }> = {};
+      for (const [path, threads] of byFile) {
+        const rel = pathRelativeToRoot(root, path);
+        // Only files this compile actually read (forward snaps to the nearest
+        // recorded line, so any known file answers for line 1).
+        if (!synctexIndex.forward(rel, 1)) continue;
+        let text = childSpanTextCacheRef.current.get(path);
+        if (text === undefined) {
+          try {
+            const params = new URLSearchParams({ projectId, path });
+            const res = await apiFetch(`/api/workspace/files/download?${params.toString()}`);
+            if (!res.ok) continue;
+            text = await res.text();
+            childSpanTextCacheRef.current.set(path, text);
+          } catch {
+            continue;
+          }
+        }
+        for (const thread of threads) {
+          const span = quoteLineSpan(text, thread.quote);
+          if (span) next[thread.id] = { rel, span };
+        }
+      }
+      if (!cancelled) setChildCommentSpans(next);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // The text cache is cleared per compile below; threads re-span on change.
+  }, [pdfCommentsEnabled, synctexIndex, activeTexFile, activeWorkspaceFile, latexRootPath, openWorkspaceCommentThreads, projectId, apiFetch]);
+  useEffect(() => {
+    // A recompile means sources may have changed — drop the fetched-text cache.
+    childSpanTextCacheRef.current.clear();
+  }, [synctexIndex]);
+
+  const pdfChildCommentMarkers = useMemo<PdfCommentMarker[] | null>(() => {
+    if (!synctexIndex) return null;
+    const markers: PdfCommentMarker[] = [];
+    for (const [id, entry] of Object.entries(childCommentSpans)) {
+      const hit = synctexIndex.forward(entry.rel, entry.span[0]);
+      if (!hit) continue;
+      markers.push({ id, page: hit.page, yPt: hit.y, active: id === activeCommentThreadId });
+    }
+    return markers.length > 0 ? markers : null;
+  }, [synctexIndex, childCommentSpans, activeCommentThreadId]);
+  const pdfChildCommentHighlights = useMemo<PdfCommentHighlight[] | null>(() => {
+    if (!synctexIndex) return null;
+    const highlights: PdfCommentHighlight[] = [];
+    for (const [id, entry] of Object.entries(childCommentSpans)) {
+      const rects = synctexIndex.forwardSpans(entry.rel, entry.span[0], entry.span[1]);
+      if (rects.length === 0) continue;
+      highlights.push({ id, rects, active: id === activeCommentThreadId });
+    }
+    return highlights.length > 0 ? highlights : null;
+  }, [synctexIndex, childCommentSpans, activeCommentThreadId]);
+  const mergedPdfCommentMarkers = useMemo(
+    () => (pdfCommentMarkers || pdfChildCommentMarkers ? [...(pdfCommentMarkers ?? []), ...(pdfChildCommentMarkers ?? [])] : null),
+    [pdfCommentMarkers, pdfChildCommentMarkers],
+  );
+  const mergedPdfCommentHighlights = useMemo(
+    () => (pdfCommentHighlights || pdfChildCommentHighlights ? [...(pdfCommentHighlights ?? []), ...(pdfChildCommentHighlights ?? [])] : null),
+    [pdfCommentHighlights, pdfChildCommentHighlights],
+  );
+  // A pin on the active file selects in place; a child file's pin opens that
+  // file with its thread selected (the workspace-thread open flow).
+  const handlePdfMarkerClick = useCallback(
+    (threadId: string) => {
+      if (openCommentThreads.some((thread) => thread.id === threadId)) {
+        selectCommentThread(threadId);
+        return;
+      }
+      const thread = openWorkspaceCommentThreads.find((t) => t.id === threadId);
+      if (thread) openWorkspaceCommentThread(thread);
+    },
+    [openCommentThreads, openWorkspaceCommentThreads, selectCommentThread, openWorkspaceCommentThread],
+  );
 
   // A PDF text selection confirmed as a comment: SyncTeX inverse resolves the
   // page point to a source line, the matcher narrows it to the selected span,
@@ -8487,6 +8930,58 @@ export default function WorkspacePage() {
     const text = forwardSyncTex(textEditorRef.current?.getCursorLine?.());
     setSynctexHint(text ? { text, nonce: Date.now() } : null);
   }, [forwardSyncTex]);
+
+  // Continuous scroll sync (Overleaf-style follow): in split view the panes
+  // track each other as either scrolls — editor top line → forward search →
+  // PDF follow target; PDF viewport top → inverse search → silent editor
+  // scroll. Each side mutes its own reports while a follow lands, so there is
+  // no feedback loop. Toggle lives in the PDF header, persisted per browser.
+  const [latexScrollSync, setLatexScrollSync] = useState(true);
+  useEffect(() => {
+    try {
+      if (localStorage.getItem('sundial:latex-scroll-sync') === 'off') setLatexScrollSync(false);
+    } catch {
+      /* storage denied: default on holds for the session */
+    }
+  }, []);
+  const toggleLatexScrollSync = useCallback(() => {
+    setLatexScrollSync((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('sundial:latex-scroll-sync', next ? 'on' : 'off');
+      } catch {
+        /* storage denied: in-session flip still holds */
+      }
+      return next;
+    });
+  }, []);
+  const [pdfFollowTarget, setPdfFollowTarget] = useState<SyncTexJump | null>(null);
+  const scrollSyncActive =
+    latexScrollSync && Boolean(activeTexFile) && latexViewMode === 'split' && !isMobile;
+  const handleEditorScrollTopLine = useCallback(
+    (line: number) => {
+      if (!synctexIndex || !activeWorkspaceFile) return;
+      const hit = synctexIndex.forward(
+        pathRelativeToRoot(latexRootPath ?? activeWorkspaceFile.path, activeWorkspaceFile.path),
+        line,
+      );
+      if (hit) setPdfFollowTarget({ ...hit, nonce: Date.now() });
+    },
+    [synctexIndex, activeWorkspaceFile, latexRootPath],
+  );
+  const handlePdfViewportScroll = useCallback(
+    (pos: { page: number; yPt: number }) => {
+      if (!synctexIndex || !activeWorkspaceFile) return;
+      // Mid-column x: following is line-grained, any in-text x resolves it.
+      const hit = synctexIndex.inverse(pos.page, 306, pos.yPt + 6);
+      if (!hit) return;
+      const target = pathFromRoot(latexRootPath ?? activeWorkspaceFile.path, hit.file);
+      // Never switch files from a scroll — follow only within the open one.
+      if (target !== activeWorkspaceFile.path) return;
+      textEditorRef.current?.scrollToLineTop?.(hit.line);
+    },
+    [synctexIndex, activeWorkspaceFile, latexRootPath],
+  );
   useEffect(() => {
     if (!synctexHint) return;
     const t = setTimeout(() => setSynctexHint(null), 2000);
@@ -9870,12 +10365,12 @@ export default function WorkspacePage() {
     const localEngineChat = isLocalWorkspace && (chatEngine === 'claude' || chatEngine === 'openai');
     if (
       !localEngineChat &&
-      (clerkAuthRef.current.isLoaded || clerkNeverLoads()) &&
-      !clerkAuthRef.current.isSignedIn &&
-      // Anonymous free-taste runs left: send instead of nagging — the server
-      // gate is the authority and serves it (or answers signin_required,
-      // which the transport surfaces honestly, if this count went stale).
-      !((anonRunsRemainingRef.current ?? 0) > 0)
+      needsCloudSignIn({
+        clerkResolved: clerkAuthRef.current.isLoaded || clerkNeverLoads(),
+        clerkSignedIn: clerkAuthRef.current.isSignedIn,
+        serverAuthed: serverAuthedRef.current,
+        anonRunsRemaining: anonRunsRemainingRef.current,
+      })
     ) {
       // Cloud workspaces opened in the packaged app have no localConfig, but
       // the loopback sidecar still holds the sd_ credentials that authenticate
@@ -10450,11 +10945,13 @@ export default function WorkspacePage() {
               return setLatexFixBlocked({ kind: 'signin', message: 'Sign in to let the agent fix this.' });
           }
         } else if (
-          (clerkAuthRef.current.isLoaded || clerkNeverLoads()) &&
-          !clerkAuthRef.current.isSignedIn &&
-          // Anonymous free-taste runs left: attempt the fix — the server gate
-          // is the authority and serves it, exactly like the composer.
-          !((anonRunsRemainingRef.current ?? 0) > 0)
+          // Same gate as the composer's, on the twin LaTeX auto-fix path.
+          needsCloudSignIn({
+            clerkResolved: clerkAuthRef.current.isLoaded || clerkNeverLoads(),
+            clerkSignedIn: clerkAuthRef.current.isSignedIn,
+            serverAuthed: serverAuthedRef.current,
+            anonRunsRemaining: anonRunsRemainingRef.current,
+          })
         ) {
           const config = await resolveSidecarConfig();
           const desktopCredentials = config ? await desktopCredentialsUsable(config) : false;
@@ -10722,10 +11219,10 @@ export default function WorkspacePage() {
       // the ⌘T chooser is its home now, same gating the rail entry had.
       if (!isLocalWorkspace) {
         actions.push({
-          id: 'connect-local-agent',
-          label: 'Connect local agent',
-          keywords: 'claude code codex bridge attach',
-          run: () => void openLocalAgentModal(),
+          id: 'open-with',
+          label: 'Open with…',
+          keywords: 'claude code codex chatgpt overleaf github local agent bridge attach',
+          run: openWithWorkspace,
         });
       }
     }
@@ -10782,7 +11279,7 @@ export default function WorkspacePage() {
     isMobile,
     macShortcuts,
     openCenterPanel,
-    openLocalAgentModal,
+    openWithWorkspace,
     openRightDock,
     openPaneTabBesideChat,
     openSettingsTab,
@@ -10804,14 +11301,14 @@ export default function WorkspacePage() {
   // untitled). rankChats drops the archived ones — those live in Settings.
   const paletteChats = useMemo(
     () =>
-      chatEntries.map((entry) => ({
+      navigableChatEntries.map((entry) => ({
         id: entry.chat.id,
         title: usesGroupChatPresentation(entry.chat.chat_kind, entry.chat)
           ? buildGroupChatDisplayName(entry.chat)
           : entry.chat.title?.trim() || 'New chat',
         archived: entry.isArchived,
       })),
-    [chatEntries],
+    [navigableChatEntries],
   );
 
   // Desktop shell only: browsers reserve ⌘N/⌘T for new windows/tabs, so
@@ -11449,12 +11946,12 @@ export default function WorkspacePage() {
           type="button"
           onClick={() => {
             closeAssistantPicker();
-            void openLocalAgentModal();
+            openWithWorkspace();
           }}
           className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 hover:bg-stone-50"
         >
           <LightningIcon className="h-3.5 w-3.5 flex-shrink-0" weight="regular" aria-hidden />
-          Connect local agent
+          Open with…
         </button>
       )}
     </div>
@@ -11523,7 +12020,7 @@ export default function WorkspacePage() {
     const hasUnread = unreadCount > 0;
     const isChatMenuOpen = openChatMenuId === chat.id;
     const chatHoverLink = canCopyChatLink && typeof window !== 'undefined'
-      ? `${window.location.origin}${buildWorkspaceChatPath(workspaceRouteId, chat.id)}`
+      ? (() => { const path = buildWorkspaceChatPath(workspaceRouteId, chat.id); return `${linkOriginFor(path)}${path}`; })()
       : '';
     // External sessions get no actions menu: rename/pin/archive/copy-link all
     // assume a real chat row the sidecar owns.
@@ -12295,6 +12792,11 @@ export default function WorkspacePage() {
       projectId={projectId}
       fileUrl={buildFileUrl(activeWorkspaceFile) || null}
       localWorkspace={isLocalWorkspace}
+      onRevealInFinder={
+        localConfig && projectId && activeWorkspaceFile
+          ? () => void localSidecar.revealPath(localConfig, projectId, activeWorkspaceFile.path).catch(() => {})
+          : null
+      }
       rawMarkdown={
         activeIsMarkdown
           ? {
@@ -12561,7 +13063,11 @@ export default function WorkspacePage() {
         }
       />
     );
-    const showToolbar = isMarkdown && (docsPage || showFormatToolbar);
+    // ⋯ → Raw markdown for THIS pane. The IDE style drops the formatting bar
+    // over the raw source (the primary's rule); the Docs style keeps the pill
+    // mounted, inert, because the ⋯ itself rides its right end.
+    const paneRawView = isMarkdown && paneRawPath[paneId] === file.path;
+    const showToolbar = isMarkdown && (docsPage || (showFormatToolbar && !paneRawView));
     const nameControl = (large = false) => (
       <DocFileNameControl
         large={large}
@@ -12602,10 +13108,23 @@ export default function WorkspacePage() {
         // Docs style: the toolbar's condensed tiers fold in here — ONE dots
         // menu on the pill (same as the primary's docsToolbarOverflowItems).
         formattingItems={
-          docsPage && flags && !flags.showClear && editor && !editor.isDestroyed && !editorReadOnly && cap.canWrite
+          docsPage && flags && !flags.showClear && editor && !editor.isDestroyed && !editorReadOnly && cap.canWrite && !paneRawView
             ? (close) => <ToolbarOverflowItems editor={editor} flags={flags} onClose={close} hidePrint />
             : undefined
         }
+        // Parity with the primary's ⋯ (Belinda, 2026-08-23 — the split menu
+        // was missing Raw markdown / Show file title / Google Docs view).
+        // Print stays out on purpose: the pane is print:hidden.
+        rawMarkdown={
+          isMarkdown
+            ? {
+                active: paneRawView,
+                onToggle: () =>
+                  setPaneRawPath((prev) => ({ ...prev, [paneId]: paneRawView ? null : file.path })),
+              }
+            : null
+        }
+        inlineTitle={isMarkdown ? { active: showDocTitle, onToggle: toggleDocTitle } : null}
         horizontalDots={docsPage}
         menuAlign="right"
         editor={editor}
@@ -12634,6 +13153,11 @@ export default function WorkspacePage() {
         onRename={renameFromMenu}
         onDuplicate={() => void duplicateFile(file)}
         onDelete={() => void deletePath(file.path)}
+        onRevealInFinder={
+          localConfig && projectId
+            ? () => void localSidecar.revealPath(localConfig, projectId, file.path).catch(() => {})
+            : null
+        }
       />
     );
     const header = docsPage && isMarkdown ? (
@@ -12712,6 +13236,11 @@ export default function WorkspacePage() {
     return {
       header,
       showToolbar,
+      showRawView: paneRawView,
+      inlineTitle:
+        showDocTitle && isMarkdown
+          ? formatFileName(getFileName(file.path)).replace(/\.[^.]+$/, '')
+          : null,
       toolbarFirst: desktopTabs && !docsPage,
       toolbarTrailing,
       readOnly: editorReadOnly,
@@ -12777,6 +13306,7 @@ export default function WorkspacePage() {
   const renderChatSurface = (sole: boolean) => (
     <WorkspaceChatPane
                     variant="space-side"
+                    onOpenWith={isLocalWorkspace ? undefined : openWithWorkspace}
                     notice={
                       localEngineNotice ? (
                         <LocalEngineNotice harness={localEngineNotice} onDismiss={dismissLocalEngineNotice} />
@@ -13200,7 +13730,7 @@ export default function WorkspacePage() {
                             isHardStreamOpenFailure(sundialChat.error))
                         ),
                       turnLinkBase: currentChatId && typeof window !== 'undefined'
-                        ? `${window.location.origin}${buildWorkspaceChatPath(workspaceRouteId, currentChatId)}`
+                        ? (() => { const path = buildWorkspaceChatPath(workspaceRouteId, currentChatId); return `${linkOriginFor(path)}${path}`; })()
                         : undefined,
                       onTurnLinkShareGate: chatShareReady ? undefined : openChatShare,
                       highlightedDiffId: deepLinkedDiffId,
@@ -13284,6 +13814,7 @@ export default function WorkspacePage() {
                       showModelPicker,
                       setShowModelPicker,
                       currentChatModel,
+                      anonModelPinned,
                       onSelectChatRuntime: handleSelectChatRuntime,
                       modelPickerRef,
                       harness: currentChatHarness,
@@ -13291,6 +13822,8 @@ export default function WorkspacePage() {
                       localEngines: isLocalWorkspace
                         ? { claude: localEngines.claude, codex: localEngines.codex }
                         : null,
+                      cloudEngineAuth: isLocalWorkspace ? null : cloudEngineAuth,
+                      onConnectEngine: () => openSettingsTab('apikeys'),
                       // Locked the moment the conversation has ANY message.
                       // The summary's message_count covers the reload window
                       // before the transcript loads; the live list covers the
@@ -13386,7 +13919,7 @@ export default function WorkspacePage() {
       {/* Same gating as the palette action: local workspaces ARE the local
           agent surface — nothing to connect. */}
       {canWrite && !isLocalWorkspace
-        ? launcherOption('new-tab-connect-agent', 'Connect local agent', () => void openLocalAgentModal())
+        ? launcherOption('new-tab-open-with', 'Open with…', openWithWorkspace)
         : null}
     </div>
   );
@@ -13405,6 +13938,31 @@ export default function WorkspacePage() {
   // corner when the rail is collapsed — a surface whose × lives there shifts
   // past it, same measure the chat header and file view use.
   const leftmostPaneInset = openLeftRail === null ? topbarLeftFloatWidth : 0;
+
+  const renderAssistantsSurface = () =>
+    cloudProjectId ? (
+      <AssistantsPanel
+        projectId={cloudProjectId}
+        initialSlug={assistantsFocusSlug}
+        focusRequestId={assistantsFocusRequestId}
+        renderDemo={(assistant) => <AssistantDemo assistantSlug={assistant.slug} />}
+        onClose={() => closeCentralUtilityTabs([ASSISTANTS_TAB])}
+        onConnected={() => {
+          // The seeded files land server-side; pull the tree so they appear
+          // without waiting for the fallback poll.
+          void reloadFiles(false);
+          filesChannelRef.current?.postMessage({ type: 'refresh' });
+        }}
+      />
+    ) : null;
+
+  const renderSupportSurface = () => (
+    <div
+      ref={setSupportPanelHost}
+      data-testid="sundial-support-panel-host"
+      className="flex min-h-0 flex-1 flex-col"
+    />
+  );
 
   const renderChatEditsSurface = (tab: string, headerInsetLeft = 0) => {
     const scopedChatId = reviewChatIdOfTab(tab);
@@ -13790,7 +14348,9 @@ export default function WorkspacePage() {
     !primaryChatActive &&
     !primaryLauncherActive &&
     !primaryReviewActive &&
-    !primaryDiffActive;
+    !primaryDiffActive &&
+    !primaryAssistantsActive &&
+    !primarySupportActive;
   // No-bar layout with the rail collapsed: Home + the sidebar toggle would
   // have no home (their bar seat is gone), so they float bare at the window's
   // top-left — the mirror of the pinned top-right cluster. Keeps the macOS
@@ -13818,8 +14378,16 @@ export default function WorkspacePage() {
   // itself is ready, keep the SAME creation card over its real editor skeleton
   // until the seeded TeX Y.Doc has hydrated — no spinner-only gap between the
   // two loading stages.
+  // One-shot: the creation card covers only the FIRST welcome.tex hydration.
+  // `onboarding=tex` stays in the URL for the whole session, so without the
+  // latch the overlay came back permanently the moment the user opened any
+  // other file (activeWorkspaceFile stops matching).
+  if (onboardingTexIntent && activeWorkspaceFile?.path === WELCOME_TEX_PATH && fileContentReady) {
+    onboardingCoverDoneRef.current = true;
+  }
   const onboardingWorkspaceLoading =
     onboardingTexIntent &&
+    !onboardingCoverDoneRef.current &&
     workspaceFileByPath.has(WELCOME_TEX_PATH) &&
     (activeWorkspaceFile?.path !== WELCOME_TEX_PATH || !fileContentReady);
 
@@ -14088,17 +14656,21 @@ export default function WorkspacePage() {
                 />
                 <ProjectSidebar
                   header={workspaceTitleControl}
+                  assistants={
+                    savedFlags?.assistants_enabled === true && cloudProjectId && canWrite && !isMobile ? (
+                      <AssistantsSidebarSection
+                        projectId={cloudProjectId}
+                        onOpenPanel={(slug) => {
+                          setAssistantsFocusSlug(slug ?? null);
+                          setAssistantsFocusRequestId((requestId) => requestId + 1);
+                          openCentralUtilityTab(ASSISTANTS_TAB);
+                        }}
+                      />
+                    ) : null
+                  }
                   support={
                     savedFlags?.sundial_support_enabled === true && !isMobile ? (
-                      <SundialSupport
-                        workspaceId={cloudProjectId}
-                        open={rightDockView === 'support'}
-                        onOpenChange={(nextOpen) => {
-                          if (nextOpen) openRightDock('support');
-                          else setRightDockView((current) => (current === 'support' ? null : current));
-                        }}
-                        panelTarget={supportPanelHost}
-                      />
+                      <div ref={setSupportLauncherHost} className="w-full" />
                     ) : null
                   }
                   // "Open with …" docks above the footer (in-flow, never
@@ -14112,7 +14684,7 @@ export default function WorkspacePage() {
                     // pathname-only, which would hand an external agent a
                     // URL their access token isn't part of.
                     !isScopedGuest && !isLocalWorkspace && pathGrants.length === 0 ? (
-                      <OpenWithRow onOpen={() => setShowOpenWithModal(true)} />
+                      <OpenWithRow onOpen={openWithWorkspace} />
                     ) : null
                   }
                   footer={
@@ -14123,6 +14695,7 @@ export default function WorkspacePage() {
                         (isClerkLoaded || desktopSignedIn || clerkNeverLoads()) &&
                         !(Boolean(isClerkSignedIn) || desktopSignedIn) &&
                         isOwner &&
+                        workspaceClaimed !== true &&
                         filesLoaded &&
                         !workspaceRouteContext?.local &&
                         !claimNudgeDismissed
@@ -14226,7 +14799,7 @@ export default function WorkspacePage() {
                       childOrder={fileOrder}
                       collapsed={isSectionCollapsed(sidebarSections, 'files')}
                       onToggleCollapsed={() => toggleSidebarSectionCollapsed('files')}
-                      onConnectLocalAgent={isLocalWorkspace ? undefined : () => void openLocalAgentModal()}
+                      onOpenWith={isLocalWorkspace ? undefined : openWithWorkspace}
                       // Cloud-only: the modal posts to /api/workspace/skills, and
                       // the local sidecar has no skills route to answer it.
                       // Workspace-level canWrite, not the ＋ menu's folder-scoped
@@ -14366,10 +14939,18 @@ export default function WorkspacePage() {
                   chatsCollapsed={isSectionCollapsed(sidebarSections, 'chats')}
                   onToggleChats={() => toggleSidebarSectionCollapsed('chats')}
                   syncPanel={
-                    linkedRepos.length > 0 ? (
+                    // The Sync section covers every connected sync method:
+                    // linked repos (GitHub/Overleaf) and the local folder
+                    // mirror's status card both live here.
+                    linkedRepos.length > 0 || localSyncStatus || projectKind === 'local-backing' ? (
                       <CommitsRail
                         projectId={projectId}
                         repos={linkedRepos}
+                        localSync={
+                          localSyncStatus || projectKind === 'local-backing' ? (
+                            <LocalFolderSyncStatus projectKind={projectKind} status={localSyncStatus} />
+                          ) : undefined
+                        }
                         collapsed={isSectionCollapsed(sidebarSections, 'sync')}
                         onToggleCollapsed={() => toggleSidebarSectionCollapsed('sync')}
                         selectedCommitSha={selectedCommit?.sha ?? null}
@@ -14517,7 +15098,7 @@ export default function WorkspacePage() {
                 >
                 {/* An active chat tab claims the pane: the chat surface renders
                     where the doc chrome would (the wireframe's chats-as-tabs). */}
-                {primaryChatActive ? renderChatSurface(editorPanes.length === 1) : primaryLauncherActive ? renderLauncherPanel(PRIMARY_PANE_ID) : primaryReviewActive ? renderChatEditsSurface(editorPanes[0].active, leftmostPaneInset) : primaryDiffActive ? renderDiffSurface(editorPanes[0].active, leftmostPaneInset) : (<>
+                {primaryChatActive ? renderChatSurface(editorPanes.length === 1) : primaryLauncherActive ? renderLauncherPanel(PRIMARY_PANE_ID) : primaryAssistantsActive ? renderAssistantsSurface() : primarySupportActive ? renderSupportSurface() : primaryReviewActive ? renderChatEditsSurface(editorPanes[0].active, leftmostPaneInset) : primaryDiffActive ? renderDiffSurface(editorPanes[0].active, leftmostPaneInset) : (<>
                 {/* The file's own header row (wireframe): its identity —
                     folder path + name — leads, and the always-on controls
                     (mode picker · Aa · Share · ⋯, plus Comments when any
@@ -14994,6 +15575,7 @@ export default function WorkspacePage() {
                                   filePath={activeWorkspaceFile.path}
                                   collabPath={activeCollabPath}
                                   workspaceId={projectId}
+                                  selectionActionsProjectId={selectionActionsProjectId}
                                   apiFetch={apiFetch}
                                   user={collabUser}
                                   readOnly={documentEditorReadOnly}
@@ -15001,6 +15583,7 @@ export default function WorkspacePage() {
                                   editMode={effectiveDocEditMode === 'suggest' ? 'suggest' : 'edit'}
                                   bare
                                   compileMarkers={latexMarkers}
+                                  onCompileMarkersVisible={handleOnboardingCompileMarkersVisible}
                                   onImageUpload={handleLatexImageUpload}
                                   onReady={handleCodeEditorReady}
                                   onContentChange={handleViewerContentChange}
@@ -15013,6 +15596,7 @@ export default function WorkspacePage() {
                                   revealPeer={peerReveal?.path === activeWorkspaceFile.path ? peerReveal : null}
                                   onRevealPeerDone={handlePeerRevealDone}
                                   onFocused={() => handleEditorFocusedPath(activeWorkspaceFile.path)}
+                                  onScrollTopLine={scrollSyncActive ? handleEditorScrollTopLine : undefined}
                                   onShowInPdf={handleSynctexForward}
                                   {...codeCommentProps}
                                 />
@@ -15033,8 +15617,13 @@ export default function WorkspacePage() {
                                   synctex={synctexIndex}
                                   onInverseSearch={handleSynctexInverse}
                                   jumpTarget={synctexJump}
-                                  commentMarkers={pdfCommentMarkers}
-                                  onMarkerClick={pdfCommentsEnabled ? selectCommentThread : undefined}
+                                  commentMarkers={mergedPdfCommentMarkers}
+                                  commentHighlights={mergedPdfCommentHighlights}
+                                  onMarkerClick={pdfCommentsEnabled ? handlePdfMarkerClick : undefined}
+                                  onViewportScroll={scrollSyncActive ? handlePdfViewportScroll : undefined}
+                                  followTarget={scrollSyncActive ? pdfFollowTarget : null}
+                                  scrollSyncEnabled={latexScrollSync}
+                                  onToggleScrollSync={!isMobile ? toggleLatexScrollSync : undefined}
                                   // synctexIndex gates the offer itself: with
                                   // no line map (pre-compile, older artifact)
                                   // the bubble would silently do nothing.
@@ -15126,6 +15715,7 @@ export default function WorkspacePage() {
                                 filePath={activeWorkspaceFile.path}
                                 collabPath={activeCollabPath}
                                 workspaceId={projectId}
+                                selectionActionsProjectId={selectionActionsProjectId}
                                 apiFetch={apiFetch}
                                 user={collabUser}
                                 readOnly={documentEditorReadOnly}
@@ -15240,6 +15830,7 @@ export default function WorkspacePage() {
                                   filePath={activeWorkspaceFile.path}
                                   collabPath={activeCollabPath}
                                   workspaceId={projectId}
+                                  selectionActionsProjectId={selectionActionsProjectId}
                                   user={collabUser}
                                   readOnly={documentEditorReadOnly}
                                   canResolveSuggestions={activeFileCap.canWrite}
@@ -15461,7 +16052,7 @@ export default function WorkspacePage() {
                         </div>
                         ) : null}
                         <div className="relative flex min-h-0 flex-1 flex-col">
-                          {isChatTab(paneEntry.active) ? renderChatSurface(false) : isLauncherTab(paneEntry.active) ? renderLauncherPanel(paneEntry.id) : isReviewTab(paneEntry.active) ? renderChatEditsSurface(paneEntry.active) : isDiffTab(paneEntry.active) ? renderDiffSurface(paneEntry.active) : (
+                          {isChatTab(paneEntry.active) ? renderChatSurface(false) : isLauncherTab(paneEntry.active) ? renderLauncherPanel(paneEntry.id) : isAssistantsTab(paneEntry.active) ? renderAssistantsSurface() : isSupportTab(paneEntry.active) ? renderSupportSurface() : isReviewTab(paneEntry.active) ? renderChatEditsSurface(paneEntry.active) : isDiffTab(paneEntry.active) ? renderDiffSurface(paneEntry.active) : (
                           <SplitEditorPaneReviewBody
                             file={paneFile}
                             collabPath={paneCollabPath}
@@ -15469,6 +16060,7 @@ export default function WorkspacePage() {
                             isMarkdown={isMarkdownFile(paneFile)}
                             isBinary={isBinaryFile(paneFile)}
                             workspaceId={projectId}
+                            selectionActionsProjectId={selectionActionsProjectId}
                             user={collabUser}
                             onMarkdownEditor={paneEditorSetter(paneEntry.id)}
                             // The primary's doc chrome + mode semantics, per
@@ -15567,21 +16159,6 @@ export default function WorkspacePage() {
                       <ClockCounterClockwiseIcon className="h-5 w-5" weight={rightDockView === 'history' ? 'bold' : 'regular'} aria-hidden />
                       <IconTooltip label="History" />
                     </button>
-                    {savedFlags?.sundial_support_enabled === true ? (
-                      <button
-                        type="button"
-                        data-testid="dock-view-support"
-                        onClick={() => openRightDock('support')}
-                        aria-pressed={rightDockView === 'support'}
-                        aria-label="Sundial Support"
-                        className={`relative group/tip inline-flex h-8 w-8 items-center justify-center rounded-lg hover:bg-stone-100 ${
-                          rightDockView === 'support' ? 'bg-stone-100 text-stone-700' : 'text-stone-400 hover:text-stone-600'
-                        }`}
-                      >
-                        <ChatCircleDotsIcon className="h-5 w-5" weight={rightDockView === 'support' ? 'bold' : 'regular'} aria-hidden />
-                        <IconTooltip label="Support" />
-                      </button>
-                    ) : null}
                     {standaloneDiffHref && isSpaceMode && selectedFilePath ? (
                       <Link
                         href={standaloneDiffHref}
@@ -15591,13 +16168,7 @@ export default function WorkspacePage() {
                       </Link>
                     ) : null}
                   </div>
-                  {rightDockView === 'support' ? (
-                    <div
-                      ref={setSupportPanelHost}
-                      data-testid="sundial-support-panel-host"
-                      className="flex min-h-0 flex-1 flex-col"
-                    />
-                  ) : rightDockView === 'outline' ? (
+                  {rightDockView === 'outline' ? (
                     <div data-testid="outline-lane" className="flex min-h-0 flex-1 flex-col py-2">
                       <MarkdownTOC headings={outlineLaneOpen ? outlineHeadings : []} onSelect={handleOutlineSelect} />
                       {!outlineLaneOpen ? (
@@ -15672,8 +16243,8 @@ export default function WorkspacePage() {
             </div>
             {/* Pinned top-right cluster — absolute against this content row so
                 it survives splits, the right dock, and the commit diff view. */}
-            {!isMobile ? topBarRightControls : null}
-            {!isMobile && !desktopTabs && openLeftRail === null && !docsHeaderOwnsTopLeft
+            {!isMobile && !utilitySurfaceActive ? topBarRightControls : null}
+            {!isMobile && !utilitySurfaceActive && !desktopTabs && openLeftRail === null && !docsHeaderOwnsTopLeft
               ? topBarLeftFloat
               : null}
           </div>
@@ -15681,6 +16252,24 @@ export default function WorkspacePage() {
         </div>
 
       </div>
+
+      {isMobile ? (
+        <MobileCommentsSheet
+          open={mobileCommentsOpen}
+          threads={displayedCommentThreads}
+          activeThreadId={activeCommentThreadId}
+          draftSelection={draftCommentSelection}
+          draftBody={draftCommentBody}
+          busyAction={commentBusyAction}
+          canComment={canCommentOnActiveFile}
+          onCreate={createComment}
+          onCancelDraft={cancelCommentDraft}
+          onReply={replyToComment}
+          onResolve={updateCommentStatus}
+          onSelectThread={selectCommentThread}
+          onClose={closeCommentLane}
+        />
+      ) : null}
 
       <WorkspaceCommentContextMenu
         menu={commentContextMenu}
@@ -15719,7 +16308,10 @@ export default function WorkspacePage() {
           openSyncSection();
         }}
         linkedProjects={linkedRepos
-          .filter((r) => r.provider === 'overleaf')
+          // A failed export leaves a durable `exporting` reservation so the
+          // next click can resume it; it is not yet a linked project and must
+          // not replace the retry button with "Already synced".
+          .filter((r) => r.provider === 'overleaf' && r.bridgeState?.transport !== 'exporting')
           .map((r) => ({ id: r.id, label: r.repoLabel, joinLink: r.bridgeState?.joinLink ?? null }))}
         onOpenSync={openSyncSection}
       /> : null}
@@ -15802,10 +16394,26 @@ export default function WorkspacePage() {
         />
       ) : null}
 
+      {/* One state owner survives tab/background and rail changes; only its
+          portal target comes and goes with the central Support surface. */}
+      {savedFlags?.sundial_support_enabled === true && !isMobile ? (
+        <SundialSupport
+          key={cloudProjectId ?? 'support-without-workspace'}
+          workspaceId={cloudProjectId}
+          open={supportSurfaceOpen}
+          onOpenChange={(nextOpen) => {
+            if (nextOpen) openCentralUtilityTab(SUPPORT_TAB);
+            else closeCentralUtilityTabs([SUPPORT_TAB]);
+          }}
+          panelTarget={supportPanelHost}
+          launcherTarget={supportLauncherHost}
+        />
+      ) : null}
+
       {/* Embedded panel (?view=panel): the floating surface switcher — every
           button REPLACES the single surface, mirroring the /g/show contract.
           Mobile widths keep their own one-surface nav. */}
-      {panelViewActive && !isMobile ? (
+      {panelViewActive && !isMobile && !utilitySurfaceActive ? (
         <PanelSurfaceSwitcher
           surfaces={panelSurfaces}
           active={panelActiveSurface}
@@ -15938,12 +16546,6 @@ export default function WorkspacePage() {
               'API keys',
               <KeyIcon className="h-4 w-4" weight="fill" aria-hidden />,
             )}
-            {!isLocalWorkspace &&
-              renderContextTabButton(
-                'chatApps',
-                'ChatGPT & Claude.ai',
-                <SparkleIcon className="h-4 w-4" weight="fill" aria-hidden />,
-              )}
             {/* The onboarding checklist's home since it left the sidebar. */}
             {renderContextTabButton(
               'gettingStarted',
@@ -16011,6 +16613,7 @@ export default function WorkspacePage() {
               templateSlug={workspaceRouteContext?.initialFiles?.templateSlug ?? null}
               templateName={workspaceRouteContext?.initialFiles?.templateName ?? null}
               templateDefaultAddendum={workspaceRouteContext?.initialFiles?.templateDefaultAddendum ?? null}
+              templateLatestAddendum={workspaceRouteContext?.initialFiles?.templateLatestAddendum ?? null}
               templateAddendumOverride={workspaceRouteContext?.initialFiles?.templateAddendumOverride ?? null}
               archivedChats={archivedChats.map((entry) => ({ id: entry.chat.id, title: entry.chat.title ?? null }))}
               onUnarchiveChat={canWrite ? (chatId) => void toggleChatArchive(chatId, false) : undefined}
@@ -16050,7 +16653,6 @@ export default function WorkspacePage() {
 
           {settingsTab === 'apikeys' && <UserApiKeysTab />}
 
-          {settingsTab === 'chatApps' && !isLocalWorkspace && <HostedConnectorTab />}
           {settingsTab === 'gettingStarted' && (
             <div className="max-w-xl px-6 py-8">
               <GetSetUpCard config={localConfig} projectId={projectId} />
@@ -16499,7 +17101,15 @@ export default function WorkspacePage() {
         onVisibilityChange={handleVisibilityChange}
         onPublicAccessChange={handlePublicAccessChange}
         onOpenTeamPermissions={handleOpenTeamPermissions}
-        onOpenLocalAgent={isLocalWorkspace ? undefined : openLocalAgentModal}
+        onOpenWith={
+          isLocalWorkspace
+            ? undefined
+            : () => {
+                setShowShareModal(false);
+                setShareDropdown(null);
+                openWithWorkspace();
+              }
+        }
         formatRelativeTime={formatRelativeTimeShort}
       /> : null}
 
@@ -16542,18 +17152,6 @@ export default function WorkspacePage() {
         formatRelativeTime={formatRelativeTimeShort}
         accessCaption="General access applies to the whole workspace, including this chat."
       /> : null}
-
-      <WorkspaceLocalAgentModal
-        open={showLocalAgentModal}
-        loading={localAgentLoading}
-        error={localAgentError}
-        joinInfo={localAgentJoinInfo}
-        copied={localAgentCopied}
-        onClose={() => setShowLocalAgentModal(false)}
-        onCopy={copyLocalAgentText}
-        activeCollaborators={activeWorkspaceCollaborators}
-        projectId={projectId}
-      />
 
       {(() => {
         const agent = localAgentModeAgentId

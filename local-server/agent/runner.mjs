@@ -758,6 +758,25 @@ export function turnEditsMetadata(store, projectId, assistantMessageId) {
   return count > 0 ? { has_turn_edits: true, edited_file_count: count } : {};
 }
 
+/** Turn-details footer meta — model, token usage, wall-clock duration, under
+ *  the SAME metadata keys the cloud brain persists (messages.model /
+ *  input_tokens / output_tokens land in metadata via the messages route). A
+ *  locally-run engine that omits them renders no turn menu at all, so the
+ *  desktop lost the model + token readout the cloud shows. Every field is
+ *  optional: an engine that can't report usage still contributes what it has. */
+export function turnMetaMetadata({ model, inputTokens, outputTokens, durationMs } = {}) {
+  const count = (value) => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null);
+  const input = count(inputTokens);
+  const output = count(outputTokens);
+  const duration = count(durationMs);
+  return {
+    ...(typeof model === 'string' && model ? { model } : {}),
+    ...(input === null ? {} : { input_tokens: input }),
+    ...(output === null ? {} : { output_tokens: output }),
+    ...(duration === null ? {} : { duration_ms: duration }),
+  };
+}
+
 /** …and the live twin: without this frame the chip only appears on reload. */
 export function writeTurnEditsMetadata(stream, editsMeta) {
   if (editsMeta.has_turn_edits) stream.write({ type: 'message-metadata', messageMetadata: editsMeta });
@@ -1493,7 +1512,7 @@ export class LocalAgentHost {
         } catch (error) {
           result = { isError: true, content: error?.message ?? 'Tool failed' };
         }
-        log(`local-agent tool=${call.toolName} error=${result.isError} chat=${chatId}`);
+        log(`local-agent tool=${call.toolName} error=${result.isError} chat=${chatId}${result.isError ? ` msg=${String(result.content).slice(0, 300)}` : ''}`);
         // BOTH rows, together, after the call returns — never the call up front
         // and the result later. A cancel-and-REPLACE is soft, so this tool can
         // still be running (up to 600s) while the replacing turn writes its own

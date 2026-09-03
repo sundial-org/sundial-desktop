@@ -218,6 +218,9 @@ export function extractLatexErrorLines(details: string, rootFile: string | null 
   return errorLinesFromProblems(parseLatexProblems(details, rootFile), rootFile);
 }
 
+const hasLocatedError = (error: CompileErrorState | null, rootFile: string | null): boolean =>
+  Boolean(error && extractLatexErrorLines(error.details, rootFile).length > 0);
+
 interface UseLatexCompileArgs {
   projectId: string;
   chatId?: string | null;
@@ -413,9 +416,23 @@ export function useLatexCompile({
   );
   const needsAutoCompileWhenSourceArrivesRef = useRef(false);
   const preserveNextAutoErrorRef = useRef(false);
+  // A seeded, line-addressable diagnostic survives only its first verification
+  // request. Key it to the text it describes so typing cannot resurrect stale
+  // markers when that request settles.
+  const preservedInitialErrorRef = useRef<{ source: string } | null>(null);
+  const compileErrorRef = useRef(compileError);
+  useEffect(() => {
+    compileErrorRef.current = compileError;
+  }, [compileError]);
 
   useEffect(() => {
     needsAutoCompileWhenSourceArrivesRef.current = false;
+    preservedInitialErrorRef.current = null;
+    // `initialCompileError` often appears after this hook's first render, once
+    // the starter source hydrates. Keep the imperative compile path in sync
+    // in this same effect; its verification is scheduled on the next frame
+    // and can otherwise beat the passive state/ref update.
+    compileErrorRef.current = initialCompileError;
     setCompileError(initialCompileError);
     setSuccessLog('');
     successLogShaRef.current = null;
@@ -486,9 +503,31 @@ export function useLatexCompile({
     }
     compileInFlight.current = true;
     const requestTarget = targetKeyRef.current;
+    const requestClock = clockRef.current();
+    const preserveLocatedError = Boolean(
+      opts?.preserveError &&
+      preservedInitialErrorRef.current?.source === requestClock &&
+      hasLocatedError(compileErrorRef.current, texPath)
+    );
+    const clearError = () => {
+      preservedInitialErrorRef.current = null;
+      setCompileError(null);
+    };
+    const publishFailure = (nextError: CompileErrorState) => {
+      // A verification response for text that has since changed is stale.
+      if (opts?.preserveError && requestClock !== clockRef.current()) {
+        clearError();
+        return;
+      }
+      // Otherwise a line-less response may keep the seeded marker; a real
+      // location replaces it immediately.
+      if (preserveLocatedError && !hasLocatedError(nextError, texPath)) return;
+      preservedInitialErrorRef.current = null;
+      setCompileError(nextError);
+    };
     trailingRef.current = null; // this run reads the latest source, satisfying any queued request
     setCompiling(true);
-    if (!opts?.preserveError) setCompileError(null);
+    if (!preserveLocatedError) clearError();
     const localEditsAtStart = localEditNow();
     try {
       echoSeenInFlightRef.current = false;
@@ -526,7 +565,7 @@ export function useLatexCompile({
       const live = targetKeyRef.current === requestTarget;
       if (!response.ok || !result.ok || !(result.pdfBase64 || result.pdfSha)) {
         if (live) {
-          setCompileError({
+          publishFailure({
             message: result.error ?? `compile failed (${response.status})`,
             details: buildCompileDetails(result),
             trigger,
@@ -567,6 +606,7 @@ export function useLatexCompile({
         sha = pdfSource.sha;
       }
       if (live) {
+        clearError();
         setSuccessLog(foreignBytes ? '' : buildCompileDetails(result));
         setPdf({ source: pdfSource, nonce: Date.now() });
         setLastCompiledAt(Date.now());
@@ -597,7 +637,7 @@ export function useLatexCompile({
       PDF_CACHE.set(cacheKey(projectId, pdfPath), pdfSource);
     } catch (error) {
       if (targetKeyRef.current === requestTarget) {
-        setCompileError({
+        publishFailure({
           message: error instanceof Error ? error.message : 'compile failed',
           details: '',
           trigger,
@@ -718,6 +758,13 @@ export function useLatexCompile({
   // under an unchanged open file (late resolution) — the dirty text will be
   // compiled by the incoming root, not the one we are leaving.
   const carryOnSeedRef = useRef(false);
+  useEffect(() => {
+    const preserved = preservedInitialErrorRef.current;
+    if (preserved && preserved.source !== changeClock) {
+      preservedInitialErrorRef.current = null;
+      setCompileError(null);
+    }
+  }, [changeClock]);
   useEffect(
     () => () => {
       // Leaving a seeded file (or root) re-seeds the clock; a still-dirty text
@@ -778,9 +825,15 @@ export function useLatexCompile({
     }
     let cancelled = false;
     if (initialCompileError) {
+      compileErrorRef.current = initialCompileError;
       setCompileError(initialCompileError);
       setInitialLoad(false);
       preserveNextAutoErrorRef.current = true;
+      const clock = clockRef.current();
+      preservedInitialErrorRef.current =
+        clock !== null && hasLocatedError(initialCompileError, texPath)
+          ? { source: clock }
+          : null;
       // Let the known diagnostic paint first. Verification then runs without
       // the two serialized preview/download probes used for ordinary files.
       const frame = requestAnimationFrame(() => {
@@ -859,6 +912,10 @@ export function useLatexCompile({
     needsAutoCompileWhenSourceArrivesRef.current = false;
     const preserveError = preserveNextAutoErrorRef.current;
     preserveNextAutoErrorRef.current = false;
+    if (preserveError && hasLocatedError(compileErrorRef.current, null)) {
+      const clock = clockRef.current();
+      preservedInitialErrorRef.current = clock === null ? null : { source: clock };
+    }
     void compileRef.current('auto', { preserveError });
   }, [source]);
 

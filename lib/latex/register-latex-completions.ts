@@ -47,6 +47,21 @@ const LATEX_TOKENIZER: import('monaco-editor').languages.IMonarchLanguage = {
   },
 };
 
+const LATEX_LANGUAGE_CONFIGURATION: import('monaco-editor').languages.LanguageConfiguration = {
+  comments: { lineComment: '%' },
+  brackets: [['{', '}'], ['[', ']'], ['(', ')']],
+  autoClosingPairs: [
+    { open: '{', close: '}' },
+    { open: '[', close: ']' },
+    { open: '(', close: ')' },
+  ],
+  surroundingPairs: [
+    { open: '{', close: '}' },
+    { open: '[', close: ']' },
+    { open: '(', close: ')' },
+  ],
+};
+
 export function registerLatexCompletions(monaco: typeof import('monaco-editor')): void {
   if (registered) return;
   registered = true;
@@ -54,6 +69,7 @@ export function registerLatexCompletions(monaco: typeof import('monaco-editor'))
     monaco.languages.register({ id: 'latex', extensions: ['.tex', '.sty', '.cls'], aliases: ['LaTeX', 'tex'] });
     monaco.languages.setMonarchTokensProvider('latex', LATEX_TOKENIZER);
   }
+  monaco.languages.setLanguageConfiguration('latex', LATEX_LANGUAGE_CONFIGURATION);
   monaco.languages.registerCompletionItemProvider(
     'latex',
     createLatexCompletionProvider(monaco, () => projectContext),

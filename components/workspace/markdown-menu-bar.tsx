@@ -12,11 +12,13 @@ import type { Editor } from '@tiptap/react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { FindReplacePanel } from './find-replace';
 import { canAlignSelection, ImageInsertField, openEditorLinkMenu } from './markdown-toolbar';
+import { foldAll, unfoldAll } from '@/lib/tiptap/fold';
 import { insertDefaultTable } from '@/lib/tiptap/slash-items';
 import { setDocStylePreference } from '@/lib/doc-style';
 import { isMarkdownFile } from '@/lib/sync/policy';
 import { appendPathShareTokenToUrl } from '@/lib/workspace/path-share-token-client';
 import { useApiFetch } from '@/lib/workspace/api-fetch-context';
+import { printPage } from '@/lib/desktop';
 
 type MenuBarFile = {
   id: string;
@@ -325,7 +327,7 @@ export function MarkdownMenuBar({
       type: 'action',
       label: 'Print',
       shortcut: '⌘P',
-      onClick: () => run(() => typeof window !== 'undefined' && window.print()),
+      onClick: () => run(() => printPage()),
     });
   }
 
@@ -340,6 +342,21 @@ export function MarkdownMenuBar({
     });
     viewItems.push({ type: 'separator' });
   }
+  viewItems.push({
+    type: 'action',
+    label: 'Collapse all',
+    shortcut: '⌘⌥[',
+    disabled: noEditor,
+    onClick: () => run(() => foldAll(editor!)),
+  });
+  viewItems.push({
+    type: 'action',
+    label: 'Expand all',
+    shortcut: '⌘⌥]',
+    disabled: noEditor,
+    onClick: () => run(() => unfoldAll(editor!)),
+  });
+  viewItems.push({ type: 'separator' });
   viewItems.push({
     type: 'action',
     label: 'Full screen',

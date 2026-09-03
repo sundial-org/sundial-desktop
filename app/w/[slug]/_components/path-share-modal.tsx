@@ -361,7 +361,7 @@ export function PathShareModal({
 
         {broaderAccess && (
           <div
-            className="mb-4 flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2.5"
+            className="mb-4 flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5"
             data-testid="share-broader-access"
           >
             <WarningIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" weight="regular" aria-hidden />

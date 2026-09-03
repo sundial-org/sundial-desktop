@@ -18,6 +18,14 @@ import { SITE_URL } from '@/lib/seo';
  *  server from minting links for some other worktree's port. */
 export const shareOrigin = () => (isSidecarServedOrigin() ? SITE_URL : window.location.origin);
 
+/** Origin for a copied workspace/chat/file link with a known path. Cloud
+ *  (`/w/`) paths follow shareOrigin — in the packaged shell they'd otherwise
+ *  copy as `http://127.0.0.1:<port>/w/...`, meaningless off this machine.
+ *  `/local/` paths exist ONLY on this machine's sidecar, so the loopback
+ *  origin is the only one that resolves and is kept. */
+export const linkOriginFor = (path: string) =>
+  path.startsWith('/local/') ? window.location.origin : shareOrigin();
+
 import type { WorkspaceRouteInput } from '@/lib/workspace/public-ids';
 
 // The page's own route id, `local` flag included — these hooks forward it
@@ -65,9 +73,10 @@ export type ShareMember = {
 };
 
 /** The workspace-root grant: "anyone with the link" as a `path_shares` row.
- *  Tokened rows carry the capability in the ?pshare= URL (`id`/`url` are
- *  owner-only in the payload); TOKENLESS rows (converted legacy-public) mean
- *  the bare /w/<id> URL grants `role`, so `url` is served to every reader. */
+ *  On cloud workspaces the bare /w/<id> URL grants `role` (tokened or not);
+ *  the ?pshare= URL is a superset that also survives local-backing shares,
+ *  where the token is the only credential. `id`/`url` on tokened rows are
+ *  owner-only in the payload. */
 export type ShareLinkShare = { id?: string; role: 'view' | 'suggest' | 'edit'; url?: string };
 
 export type ShareInfo = {
@@ -219,6 +228,7 @@ export function useWorkspaceShare({
   workspaceRouteId,
   currentChatId,
   user,
+  desktopSignedIn = false,
   router,
   openSignIn,
   mintScopeGeneration,
@@ -229,6 +239,12 @@ export function useWorkspaceShare({
   workspaceRouteId: WorkspaceRouteId;
   currentChatId: string | null;
   user: WorkspaceUser;
+  /** Packaged-shell sign-in (sd_ credentials in the sidecar). Clerk never
+   *  loads on the loopback origin, so gating share on `user` alone sent
+   *  signed-in desktop users to the browser sign-in on every click — an
+   *  endless loop, since the round-trip can never produce a Clerk user
+   *  here. Requests authenticate via the sidecar proxy regardless. */
+  desktopSignedIn?: boolean;
   router: RouterLike;
   openSignIn: (options?: { redirectUrl?: string }) => void;
   /** Local project shares (PR #1033): the sidecar scope generation to stamp
@@ -329,12 +345,12 @@ export function useWorkspaceShare({
   const handleOpenShare = useCallback(() => {
     if (!projectId) return;
     if (!canShowShareControls) return;
-    if (!user) {
+    if (!user && !desktopSignedIn) {
       openSignIn({ redirectUrl: buildWorkspacePath(workspaceRouteId) });
       return;
     }
     setShowShareModal(true);
-  }, [canShowShareControls, openSignIn, projectId, user, workspaceRouteId]);
+  }, [canShowShareControls, desktopSignedIn, openSignIn, projectId, user, workspaceRouteId]);
 
   const handleCopyInvite = useCallback(async (link: string) => {
     track('share_copy_link_clicked', { projectId, kind: 'invite' });
@@ -462,7 +478,8 @@ export function useWorkspaceShare({
       try {
         if (visibility === 'public') {
           // Link sharing ON mints the workspace-ROOT grant: its own token +
-          // role (Viewer to start), so the bare /w/<id> URL grants nothing
+          // role (Viewer to start). On cloud workspaces the bare /w/<id> URL
+          // grants the same role (only local-backing shares stay token-only)
           // and per-path links stay independent. Local project shares stamp
           // the scope generation so the watermark gate can refuse a mint
           // that lost to a stop (PR #1033).

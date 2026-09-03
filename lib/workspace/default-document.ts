@@ -1,4 +1,5 @@
-import { WELCOME_TEX_PATH } from '@/lib/workspace/welcome-doc';
+import { productFlavor } from '@/lib/flags/product-flavor';
+import { WELCOME_PATH, WELCOME_TEX_PATH } from '@/lib/workspace/welcome-doc';
 import { isIgnoredWorkspacePath } from '@/lib/workspace/ignored-paths';
 import { isWorkspaceMetaPath } from '@/lib/workspace/spaces';
 import { isMarkdownFile } from '@/lib/sync/policy';
@@ -33,7 +34,12 @@ export function pickDefaultDocument<T extends DefaultDocumentCandidate>(files: T
   // exists: eligible new users force it open themselves, and an
   // experienced user creating a template must land in the template, not the
   // tutorial. Only when it is the sole document (blank workspace) does it land.
-  const withoutOnboarding = files.filter((file) => file.path !== WELCOME_TEX_PATH);
+  // welcome.tex lives at a nested path only we seed, so it is always the
+  // tutorial. A root welcome.md is only ours on the general flavor (which
+  // seeds it); on the scientific flavor it is a user's own document.
+  const isOnboardingDoc = (path: string) =>
+    path === WELCOME_TEX_PATH || (path === WELCOME_PATH && productFlavor() === 'general');
+  const withoutOnboarding = files.filter((file) => !isOnboardingDoc(file.path));
   if (withoutOnboarding.length !== files.length) {
     const fallback = pickDefaultDocument(withoutOnboarding);
     if (fallback) return fallback;

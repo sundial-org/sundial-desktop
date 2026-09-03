@@ -8,6 +8,9 @@ const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
 const nextConfig: NextConfig = {
   output: "export",
+  // The local desktop surface is always the general (markdown-first) product;
+  // the scientific/LaTeX flavor lives on the cloud deployments only.
+  env: { NEXT_PUBLIC_SUNDIAL_FLAVOR: "general" },
   agentRules: false,
   devIndicators: false,
   images: { unoptimized: true },

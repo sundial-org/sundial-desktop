@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useClerk, useUser } from '@/lib/auth/optional-auth';
-import { DESKTOP_CREDENTIALS_EVENT } from '@/lib/desktop';
+import { DESKTOP_CREDENTIALS_EVENT, isDesktopApp } from '@/lib/desktop';
 
 type FetchedIdentity = { name: string | null; email: string | null; imageUrl: string | null };
 
@@ -28,6 +28,10 @@ export function ProfileMenu() {
   // (still null) — the event is the only signal to drop the previous
   // account's identity and refetch.
   const [credentialsEpoch, setCredentialsEpoch] = useState(0);
+  // Resolved after mount: the static/SSR render has no window, so deciding
+  // synchronously would render the link and then strip it on hydration.
+  const [desktop, setDesktop] = useState(false);
+  useEffect(() => setDesktop(isDesktopApp()), []);
   useEffect(() => {
     const bump = () => setCredentialsEpoch((n) => n + 1);
     window.addEventListener(DESKTOP_CREDENTIALS_EVENT, bump);
@@ -100,9 +104,13 @@ export function ProfileMenu() {
                 {handleLine ? <div className="truncate text-xs text-stone-500">{handleLine}</div> : null}
               </div>
             ) : null}
-            <Link href="/templates" onClick={() => setOpen(false)} className={item}>
-              Templates
-            </Link>
+            {/* /templates only exists on the web app; the packaged shell's
+                static export has no such route, so the link would dead-end. */}
+            {!desktop ? (
+              <Link href="/templates" onClick={() => setOpen(false)} className={item}>
+                Templates
+              </Link>
+            ) : null}
             <Link href="/docs" onClick={() => setOpen(false)} className={item}>
               Docs
             </Link>

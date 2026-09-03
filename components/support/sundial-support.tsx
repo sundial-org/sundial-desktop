@@ -40,6 +40,10 @@ type Props = {
   onOpenChange: (open: boolean) => void;
   panelTarget: Element | null;
   fetchImpl?: typeof fetch;
+  showLauncher?: boolean;
+  /** When provided, the launcher follows this host while the conversation
+   * state remains mounted elsewhere. A null host intentionally hides it. */
+  launcherTarget?: Element | null;
 };
 
 function originUrl() {
@@ -78,7 +82,15 @@ function AttachmentLink({ message, index }: { message: SupportMessage; index: nu
   );
 }
 
-export function SundialSupport({ workspaceId, open, onOpenChange, panelTarget, fetchImpl = fetch }: Props) {
+export function SundialSupport({
+  workspaceId,
+  open,
+  onOpenChange,
+  panelTarget,
+  fetchImpl = fetch,
+  showLauncher = true,
+  launcherTarget,
+}: Props) {
   const [payload, setPayload] = useState<SupportThreadPayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
@@ -328,25 +340,35 @@ export function SundialSupport({ workspaceId, open, onOpenChange, panelTarget, f
     (message) => message.role === 'user' && message.responseStatus && message.responseStatus !== 'answered',
   );
 
+  const launcher = showLauncher ? (
+    <button
+      type="button"
+      onClick={() => onOpenChange(true)}
+      data-testid="sundial-support-button"
+      aria-pressed={open}
+      className="group flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-left text-xs text-stone-500 transition-colors hover:bg-stone-100 hover:text-stone-700 max-sm:hidden"
+    >
+      <span className="truncate font-medium">Sundial Support</span>
+      <span className="relative flex h-5 w-5 shrink-0 items-center justify-center text-stone-700">
+        <ChatCircleDotsIcon className="h-4 w-4" weight="regular" aria-hidden />
+        {payload?.unreadCount ? (
+          <span className="absolute -right-1 -top-1 flex h-3.5 min-w-3.5 animate-pulse items-center justify-center rounded-full bg-stone-800 px-0.5 text-[8px] font-semibold text-white motion-reduce:animate-none">
+            {Math.min(payload.unreadCount, 9)}
+          </span>
+        ) : null}
+      </span>
+    </button>
+  ) : null;
+  const renderedLauncher =
+    launcherTarget === undefined
+      ? launcher
+      : launcherTarget && launcher
+        ? createPortal(launcher, launcherTarget)
+        : null;
+
   return (
     <>
-      <button
-        type="button"
-        onClick={() => onOpenChange(true)}
-        data-testid="sundial-support-button"
-        aria-pressed={open}
-        className="group flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-left text-xs text-stone-500 transition-colors hover:bg-stone-100 hover:text-stone-700 max-sm:hidden"
-      >
-        <span className="truncate font-medium">Sundial Support</span>
-        <span className="relative flex h-5 w-5 shrink-0 items-center justify-center text-stone-700">
-          <ChatCircleDotsIcon className="h-4 w-4" weight="regular" aria-hidden />
-          {payload?.unreadCount ? (
-            <span className="absolute -right-1 -top-1 flex h-3.5 min-w-3.5 animate-pulse items-center justify-center rounded-full bg-stone-800 px-0.5 text-[8px] font-semibold text-white motion-reduce:animate-none">
-              {Math.min(payload.unreadCount, 9)}
-            </span>
-          ) : null}
-        </span>
-      </button>
+      {renderedLauncher}
 
       {open && panelTarget
         ? createPortal(

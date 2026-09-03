@@ -14,14 +14,26 @@ export const REVIEW_TAB_PREFIX = 'sundial-review://';
 /** The ⌘T "New tab" chooser (Obsidian-style). Transient: consumed in place by
  *  whatever opens next in its pane, and never restored from a snapshot. */
 export const LAUNCHER_TAB = 'sundial-launcher://new';
+/** Workspace utilities that temporarily take the document canvas. They are
+ *  ordinary ephemeral tabs, so closing one returns to the document beneath
+ *  it and persisted pane snapshots never restore it. */
+export const ASSISTANTS_TAB = 'sundial-assistants://catalog';
+export const SUPPORT_TAB = 'sundial-support://thread';
 
 export const isChatTab = (tab: string) => tab.startsWith(CHAT_TAB_PREFIX);
 export const isDiffTab = (tab: string) => tab.startsWith(DIFF_TAB_PREFIX);
 export const isReviewTab = (tab: string) => tab.startsWith(REVIEW_TAB_PREFIX);
 export const isLauncherTab = (tab: string) => tab === LAUNCHER_TAB;
+export const isAssistantsTab = (tab: string) => tab === ASSISTANTS_TAB;
+export const isSupportTab = (tab: string) => tab === SUPPORT_TAB;
 /** Non-file tabs: never path-remapped, never validated against the file list. */
 export const isSpecialTab = (tab: string) =>
-  isChatTab(tab) || isDiffTab(tab) || isReviewTab(tab) || isLauncherTab(tab);
+  isChatTab(tab) ||
+  isDiffTab(tab) ||
+  isReviewTab(tab) ||
+  isLauncherTab(tab) ||
+  isAssistantsTab(tab) ||
+  isSupportTab(tab);
 
 export const chatTab = (chatId: string) => `${CHAT_TAB_PREFIX}${chatId}`;
 export const chatIdOfTab = (tab: string) => (isChatTab(tab) ? tab.slice(CHAT_TAB_PREFIX.length) : null);

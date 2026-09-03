@@ -42,7 +42,7 @@ import {
   DropdownMenuContent,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { ChatCircleIcon, GitDiffIcon, ReceiptIcon } from '@phosphor-icons/react';
+import { ChatCircleIcon, DetectiveIcon, GitDiffIcon, ReceiptIcon } from '@phosphor-icons/react';
 import { IconTooltip } from '@/components/collab-bubbles';
 import { WikiLinkInline } from '@/components/workspace/wiki-link-inline';
 import { textHasWikiLinks } from '@/lib/workspace/wiki-file-links';
@@ -64,6 +64,7 @@ import {
 import { splitInlineAskContext } from '@/lib/workspace/inline-ask-context';
 import { resolveCommentEvent, type CommentEvent } from '@/lib/workspace/comment-event';
 import { skillToolUse, skillsUsedIn } from '@/lib/skills/tool-call';
+import { isClaimVerifierSelectionAction } from '@/lib/assistants/selection-actions';
 import {
   Component,
   memo,
@@ -459,6 +460,12 @@ function toolIsActive(state: ToolUIPart['state']): boolean {
   );
 }
 
+/** The state an orphaned input-state part reads as once its turn is over —
+ *  the grey settled dot, never the pulsing "running" one. */
+function settleOrphanState(state: ToolUIPart['state']): ToolUIPart['state'] {
+  return toolIsActive(state) ? 'output-available' : state;
+}
+
 type WebSource = { url?: string; title?: string; pageAge?: string };
 
 function hostOf(url: string | undefined): string {
@@ -510,8 +517,12 @@ function webSearchSources(part: ToolUIPart): WebSource[] | null {
 /** One row inside an expanded ToolGroup: grey status dot + human label,
  *  expandable to the (clamped) input/output payload. Link-like, no button
  *  chrome. */
-function ToolRow({ part }: { part: ToolUIPart }) {
+function ToolRow({ part, turnActive = true }: { part: ToolUIPart; turnActive?: boolean }) {
   const failed = part.state === 'output-error' || part.state === 'output-denied';
+  // After the turn ends, an input-state part is an orphan, not a live run —
+  // see ToolGroup's turnActive doc. Render it settled (past-tense verb, no
+  // pulsing dot) instead of "Running …" forever.
+  const rowActive = turnActive && toolIsActive(part.state);
   const sources = webSearchSources(part);
   // A skill read reads as its own action, not a file read — a reviewer asking
   // "which skill did it apply?" shouldn't have to decode `Read skills/…`.
@@ -522,7 +533,7 @@ function ToolRow({ part }: { part: ToolUIPart }) {
       ? skill.kind === 'entry'
         ? `Read the ${skill.id} skill`
         : `Read ${skill.id} › ${skill.path.slice(`skills/${skill.id}/`.length)}`
-      : humanToolLabel(part, toolIsActive(part.state));
+      : humanToolLabel(part, rowActive);
   const hasDetail =
     part.input != null ||
     part.state === 'output-available' ||
@@ -538,7 +549,7 @@ function ToolRow({ part }: { part: ToolUIPart }) {
           <SparklesIcon className="size-3 text-amber-500" />
         </span>
       ) : (
-        toolStatusDot(part.state)
+        toolStatusDot(rowActive ? part.state : settleOrphanState(part.state))
       )}
       <span className="min-w-0 truncate text-stone-500">{label}</span>
       {failed ? <span className="shrink-0 text-[11px] text-stone-400">failed</span> : null}
@@ -610,13 +621,21 @@ function ThoughtRow({ text }: { text: string }) {
 export function ToolGroup({
   parts,
   lastReasoningStreaming = false,
+  turnActive = true,
 }: {
   parts: (ToolUIPart | GroupReasoning)[];
   lastReasoningStreaming?: boolean;
+  /** Whether this message's turn is still streaming. Once the turn is over,
+   *  nothing can still be running — a part stuck at an input state is an
+   *  orphan (e.g. a mid-stream CLI retry re-minted the tool id and the first
+   *  part never got its result), and rendering it as "Running X…" forever was
+   *  the "status still shows the agent is running after it finished" report
+   *  (team bug thread, Aug 23). Settled turns render every part settled. */
+  turnActive?: boolean;
 }) {
   const tools = parts.filter((p): p is ToolUIPart => isToolPart(p));
   const total = tools.length;
-  const activeTools = tools.filter((p) => toolIsActive(p.state));
+  const activeTools = turnActive ? tools.filter((p) => toolIsActive(p.state)) : [];
   const active = activeTools.length > 0 || lastReasoningStreaming;
   const label = lastReasoningStreaming
     ? 'Thinking…'
@@ -671,7 +690,7 @@ export function ToolGroup({
         <div className="ml-1.5 flex flex-col border-l border-stone-200 pl-3">
           {parts.map((item, i) =>
             isToolPart(item) ? (
-              <ToolRow key={item.toolCallId ?? i} part={item} />
+              <ToolRow key={item.toolCallId ?? i} part={item} turnActive={turnActive} />
             ) : groupReasoningText(item) ? (
               <ThoughtRow key={i} text={groupReasoningText(item)} />
             ) : null,
@@ -914,6 +933,7 @@ function renderMessageParts(
             key={partKey(message, i)}
             parts={items}
             lastReasoningStreaming={lastReasoningStreaming}
+            turnActive={options.isStreamingMessage}
           />,
         );
         i = j;
@@ -1257,6 +1277,56 @@ function CommentEventCard({ event }: { event: CommentEvent }) {
   );
 }
 
+type SelectionActionEvent = {
+  title: string;
+  assistantName: string;
+  filePath: string;
+  quote: string;
+};
+
+function resolveSelectionActionEvent(meta: Record<string, unknown>): SelectionActionEvent | null {
+  const raw = meta.selection_action;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const action = raw as Record<string, unknown>;
+  const isClaimVerifier = isClaimVerifierSelectionAction(action);
+  const title = isClaimVerifier
+    ? 'Claim Verifier'
+    : typeof action.title === 'string'
+      ? action.title.trim()
+      : '';
+  const assistantName = isClaimVerifier
+    ? 'Claim Verifier'
+    : typeof action.assistant_name === 'string'
+      ? action.assistant_name.trim()
+      : '';
+  const filePath = typeof action.path === 'string' ? action.path.trim() : '';
+  const quote = typeof action.quote === 'string' ? action.quote.trim() : '';
+  if (!title || !assistantName || !filePath || !quote) return null;
+  return { title, assistantName, filePath, quote };
+}
+
+function SelectionActionEventCard({ event }: { event: SelectionActionEvent }) {
+  return (
+    <div
+      data-testid="selection-action-event-card"
+      className="w-full rounded-lg border border-stone-200 bg-white px-2.5 py-2"
+    >
+      <div className="flex items-center gap-1.5 text-xs text-stone-400">
+        <DetectiveIcon className="size-3.5 shrink-0" />
+        <span className="min-w-0 truncate">
+          <span className="font-medium text-stone-600">{event.title}</span>
+          {' · '}
+          {event.filePath.split('/').pop() || event.filePath}
+        </span>
+        <span className="ml-auto shrink-0 text-[11px]">{event.assistantName}</span>
+      </div>
+      <p className="mt-1.5 border-l-2 border-stone-200 pl-2 text-[12px] italic text-stone-400">
+        “{clipText(event.quote.replace(/\s+/g, ' '), 120)}”
+      </p>
+    </div>
+  );
+}
+
 function MessageRowImpl({
   message,
   ctx,
@@ -1283,6 +1353,16 @@ function MessageRowImpl({
     );
   }
   const parts = Array.isArray(message.parts) ? message.parts : [];
+  if (message.role === 'user' && meta.source === 'selection_action') {
+    const event = resolveSelectionActionEvent(meta);
+    if (event) {
+      return (
+        <div data-message-id={message.id} className="py-1">
+          <SelectionActionEventCard event={event} />
+        </div>
+      );
+    }
+  }
   if (message.role === 'user' && meta.source === 'comment') {
     const event = resolveCommentEvent(meta, messagePlainText(parts));
     if (event) {

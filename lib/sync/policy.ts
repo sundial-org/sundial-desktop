@@ -5,6 +5,7 @@ export type SyncPolicy = {
   crdt_extensions: string[];
   blob_extensions: string[];
   office_preview_extensions: string[];
+  text_filenames: string[];
   latex_document_extensions: string[];
   latex_source_extensions: string[];
   ignored_paths: string[];
@@ -15,6 +16,7 @@ export const syncPolicy = rawPolicy as SyncPolicy;
 const markdownExtensions = new Set(syncPolicy.markdown_extensions);
 const crdtExtensions = new Set(syncPolicy.crdt_extensions);
 const blobExtensions = new Set(syncPolicy.blob_extensions);
+const textFilenames = new Set(syncPolicy.text_filenames);
 const latexDocumentExtensions = new Set(syncPolicy.latex_document_extensions);
 const latexSourceExtensions = new Set(syncPolicy.latex_source_extensions);
 
@@ -34,8 +36,16 @@ export function isMarkdownFile(path: string | null | undefined, mimeType?: strin
   return markdownExtensions.has(getExtension(path));
 }
 
+/** Well-known extension-less text files (Makefile, LICENSE, Dockerfile, …) —
+ *  policy.json `text_filenames`, matched by lowercased basename. */
+export function isTextFilename(path: string | null | undefined) {
+  const normalized = normalizeWorkspacePath(path).toLowerCase();
+  return textFilenames.has(normalized.slice(normalized.lastIndexOf('/') + 1));
+}
+
 export function isCrdtFile(path: string | null | undefined, mimeType?: string | null) {
   if (crdtExtensions.has(getExtension(path))) return true;
+  if (isTextFilename(path)) return true;
   if (mimeType?.startsWith('text/')) return true;
   return mimeType === 'application/json';
 }

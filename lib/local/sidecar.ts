@@ -169,6 +169,16 @@ export type LocalShare = {
   bridgedFiles: number;
   /** Durable count of files ever synced (absent on older sidecars). */
   syncedFiles?: number;
+  /** Current eligible-file progress (absent on sidecars before API v26). */
+  progress?: {
+    phase: 'scanning' | 'syncing' | 'up_to_date' | 'error';
+    completedFiles: number;
+    totalFiles: number | null;
+    pendingFiles: number;
+    skippedFiles: number;
+    skippedByReason: Record<string, number>;
+    updatedAt: string;
+  } | null;
   enabled: number;
 };
 
@@ -440,7 +450,7 @@ export const sidecar = {
     // Commit-before-response (see writeFile) — no liveness bound.
     request<{ ok: boolean }>(c, `/projects/${id}/rename`, { method: 'POST', body: JSON.stringify({ from, to }), deadlineMs: null }),
   deletePath: (c: SidecarConfig, id: string, path: string) =>
-    request<{ ok: boolean; deletedAt?: string; untracked?: boolean }>(c, `/projects/${id}/file?path=${encodeURIComponent(path)}`, { method: 'DELETE', deadlineMs: null }),
+    request<{ ok: boolean; deletedAt?: string; untracked?: boolean; kept?: string[] }>(c, `/projects/${id}/file?path=${encodeURIComponent(path)}`, { method: 'DELETE', deadlineMs: null }),
   createShare: (
     c: SidecarConfig,
     id: string,

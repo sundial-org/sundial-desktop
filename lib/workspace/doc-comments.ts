@@ -2,6 +2,8 @@ export type CommentAnchorPayload = Record<string, unknown>;
 
 export type DocCommentStatus = 'open' | 'resolved';
 
+export type DocCommentThreadKind = 'comment' | 'claim_verification';
+
 export type DocCommentAuthor = {
   userId: string;
   name: string | null;
@@ -27,6 +29,10 @@ export type DocCommentThread = {
    * entry animation ("the comment arrives, then arrives again").
    */
   clientKey?: string;
+  /** Specialized producers can reuse the comment lane without introducing a
+   * parallel result surface. Omitted is the ordinary `comment` kind so older
+   * clients and optimistic human comments keep their existing wire shape. */
+  kind?: DocCommentThreadKind;
   projectId: string;
   /** The thread's dedicated agent chat, once someone @sunny'd it. Optional: not
    *  every producer of this shape (e.g. the local server) fills it in. */

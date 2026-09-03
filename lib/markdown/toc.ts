@@ -54,3 +54,26 @@ export function extractMarkdownHeadings(markdown: string): TocHeading[] {
   }
   return out;
 }
+
+// Selectors for suggestion-review widgets (see lib/workspace/suggestion-marks.ts:
+// `.suggestion-gutter` and `.suggestion-inline-review` wrap the ✓/✕ buttons and
+// author chips as contenteditable=false widgets inside the rendered heading).
+// Reading `heading.textContent` naively picks up "✕✓" and author initials —
+// strip them before showing the heading in the outline.
+const REVIEW_WIDGET_SELECTOR = ".suggestion-gutter,.suggestion-inline-review";
+
+/** Read the outline entries from the live `.tiptap` DOM, skipping the inline
+ * suggestion-review widgets so their ✓/✕ text doesn't leak into the label. */
+export function readEditorHeadings(body: Element | null | undefined): TocHeading[] {
+  if (!body) return [];
+  const els = body.querySelectorAll(".tiptap :is(h1,h2,h3,h4,h5,h6)");
+  return Array.from(els, (el, index) => {
+    const clone = el.cloneNode(true) as Element;
+    clone.querySelectorAll(REVIEW_WIDGET_SELECTOR).forEach((n) => n.remove());
+    return {
+      level: Number(el.tagName[1]),
+      text: (clone.textContent ?? "").replace(/​/g, "").trim(),
+      index,
+    };
+  });
+}

@@ -1,8 +1,8 @@
 diff --git a/dist/replaceStep.js b/dist/replaceStep.js
-index 384c02d27667921a4f2e6c495b118f035fa86162..26b12ff550b396fac2696a62f0afc6f85f893668 100644
+index 384c02d27667921a4f2e6c495b118f035fa86162..b575dda665aab03d00fb866692b63f097e70e776 100644
 --- a/dist/replaceStep.js
 +++ b/dist/replaceStep.js
-@@ -175,7 +175,16 @@ import { getSuggestionMarks } from "./utils.js";
+@@ -175,13 +175,30 @@ import { getSuggestionMarks } from "./utils.js";
          // Don't allow inserting content within an existing deletion
          // mark. Instead, shift the proposed insertion to the end
          // of the deletion.
@@ -19,4 +19,21 @@ index 384c02d27667921a4f2e6c495b118f035fa86162..26b12ff550b396fac2696a62f0afc6f8
 +        const insertFrom = strictlyInsideDeletion ? findSuggestionMarkEnd($to, deletion) : $to.pos;
          // We execute the insertion normally, on top of all of the existing
          // tracked changes.
++        //
++        // Sundial patch: a cross-block ReplaceStep (delete a selection spanning
++        // block boundaries) carries a re-joining slice whose fit can be a NO-OP
++        // (Transform.replace adds no step). The original code asserted a step
++        // always exists and crashed on `insertStep.getMap()`, aborting the whole
++        // dispatch — the user's delete silently did nothing. When the replace is
++        // a no-op there is nothing to mark: skip the insertion pass and keep the
++        // deletion marks staged above (the block join happens on accept).
++        const stepsBeforeInsert = trackedTransaction.steps.length;
          trackedTransaction.replace(insertFrom, insertFrom, step.slice);
+-        const insertStep = // We just created this step, so it we can assert that it exists
+-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+-        trackedTransaction.steps[trackedTransaction.steps.length - 1];
++        if (trackedTransaction.steps.length === stepsBeforeInsert) return markId === suggestionId;
++        const insertStep = trackedTransaction.steps[trackedTransaction.steps.length - 1];
+         let insertedTo = insertStep.getMap().map(insertFrom);
+         // Then, we iterate through the newly inserted content and mark it
+         // as inserted.

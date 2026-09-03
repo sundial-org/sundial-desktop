@@ -87,6 +87,39 @@ export function clerkNeverLoads(): boolean {
   );
 }
 
+/** First shell version whose on_navigation intercepts the /desktop/print
+ *  marker. Older shells would actually NAVIGATE there (a 404), so the marker
+ *  is only used when the shell advertises at least this version. */
+const PRINT_MARKER_MIN_VERSION = '0.1.14';
+
+const versionAtLeast = (version: string, min: string): boolean => {
+  const a = version.split('.').map((p) => Number.parseInt(p, 10));
+  const b = min.split('.').map((p) => Number.parseInt(p, 10));
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? 0;
+    const y = b[i] ?? 0;
+    if (Number.isNaN(x)) return false;
+    if (x !== y) return x > y;
+  }
+  return true;
+};
+
+/** Print the current document. WKWebView implements window.print() as a
+ *  silent no-op, so packaged shells that understand it get the
+ *  /desktop/print marker instead (the shell cancels the navigation and runs
+ *  the native print panel). Browsers, and shells too old for the marker,
+ *  keep window.print() — for the latter that is the same no-op as before,
+ *  never a 404 page. */
+export function printPage(): void {
+  if (typeof window === 'undefined') return;
+  const version = getDesktopVersion();
+  if (isDesktopApp() && version && versionAtLeast(version, PRINT_MARKER_MIN_VERSION)) {
+    window.location.assign('/desktop/print');
+    return;
+  }
+  window.print();
+}
+
 const DESKTOP_VERSION_KEY = 'sundial:desktopVersion';
 
 /** Shell version (CARGO_PKG_VERSION), appended to the launch URL as

@@ -65,9 +65,8 @@ type FilesTabPanelProps = {
   /** Accordion state: when collapsed, only the Files section header renders. */
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
-  /** Connect entry point in the header's ⋮ actions menu; renders only when
-      supplied. (GitHub/Overleaf linking moved to the "Open with …" modal.) */
-  onConnectLocalAgent?: () => void;
+  /** Unified Open with… entry point in the header's ⋮ actions menu. */
+  onOpenWith?: () => void;
   /** Opens the "Add skill" dialog (install a SKILL.md from a URL or upload). */
   onAddSkill?: () => void;
   /** "+ Add folder…" under the tree: open an OUTSIDE folder as extra context
@@ -201,7 +200,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
   sharedBadgeLabel,
   collapsed,
   onToggleCollapsed,
-  onConnectLocalAgent,
+  onOpenWith,
   onAddSkill,
   onAddContextFolder,
   localRoots,
@@ -1043,12 +1042,22 @@ export const FilesTabPanel = memo(function FilesTabPanel({
               setFocusedFolder(folder);
               return;
             }
+            // The second click of a double-click (detail > 1) must not
+            // re-toggle: double-click is rename (below), and the un-toggle
+            // both flickered the subtree and swallowed the rename gesture
+            // (team bug thread, Aug 23).
+            if (event.detail > 1) return;
             setExpandedFolders((prev) => {
               const next = new Set(prev);
               if (next.has(folder)) next.delete(folder);
               else next.add(folder);
               return next;
             });
+          }}
+          onDoubleClick={(event) => {
+            if (!rowCanWrite(folder) || rootEntry || isRenaming) return;
+            event.stopPropagation();
+            onBeginRename(folder, 'list');
           }}
           onKeyDown={(event) => {
             if (event.key === 'Enter') {
@@ -1759,7 +1768,7 @@ export const FilesTabPanel = memo(function FilesTabPanel({
               </AnchoredDropdown>
             </div>
           ) : null}
-          {onShareWorkspace || onDownloadWorkspace || (canWrite && onConnectLocalAgent) ? (
+          {onShareWorkspace || onDownloadWorkspace || (canWrite && onOpenWith) ? (
           <div className="relative flex items-center" ref={openMenuPath === WORKSPACE_ACTIONS_MENU_PATH ? fileMenuRef : null}>
             <button
               type="button"
@@ -1798,17 +1807,17 @@ export const FilesTabPanel = memo(function FilesTabPanel({
                   Share workspace
                 </button>
               ) : null}
-              {canWrite && onConnectLocalAgent ? (
+              {canWrite && onOpenWith ? (
                 <button
                   onClick={(event) => {
                     event.stopPropagation();
                     setOpenMenuPath(null);
-                    onConnectLocalAgent();
+                    onOpenWith();
                   }}
                   className="flex w-full items-center gap-2 px-3 py-2 text-left text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-700"
                 >
                   <LightningIcon className="h-3.5 w-3.5 flex-shrink-0 text-amber-500" weight="fill" aria-hidden />
-                  Connect local agent
+                  Open with…
                 </button>
               ) : null}
               {onDownloadWorkspace ? (

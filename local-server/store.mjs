@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync } from 'node:fs';
 import { randomUUID, createHash } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
@@ -29,7 +29,15 @@ export function coerceModelForHarness(harness, model) {
  *  history), and share configs (which paths sync to which cloud workspace). */
 export class LocalStore {
   constructor(home = defaultHome()) {
-    mkdirSync(home, { recursive: true });
+    // This directory contains cloud sync credentials. `mkdir`'s mode only
+    // applies on first creation, so also tighten an existing install that was
+    // created under a permissive umask.
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    try {
+      chmodSync(home, 0o700);
+    } catch {
+      /* a read-only/mis-owned home will fail when SQLite opens below */
+    }
     this.home = home;
     this.db = new DatabaseSync(path.join(home, 'sundial-local.db'));
     this.db.exec(`
@@ -267,6 +275,10 @@ export class LocalStore {
       // (settings.agent_credentials) instead of an anon key — attaching a
       // workspace the signed-in account already has access to.
       'ALTER TABLE shares ADD COLUMN mint_kind TEXT',
+      // Workspace-scoped credential minted through the hosted MCP OAuth
+      // handoff. It never leaves the sidecar again; refresh is performed by
+      // the token-gated local endpoint on the row's behalf.
+      'ALTER TABLE shares ADD COLUMN refresh_credential TEXT',
       // Folder the chat was started in ("New chat in this folder") — the
       // rail's folder-focus filter reads it.
       'ALTER TABLE local_chats ADD COLUMN folder_scope TEXT',
@@ -687,6 +699,20 @@ export class LocalStore {
     return id;
   }
 
+  /** A process/engine epoch for cloud sync-progress reports. The atomic
+   *  upsert makes simultaneous old/new sidecars choose distinct generations;
+   *  the cloud can therefore reject a late report from the replaced process. */
+  nextSyncProgressGeneration(projectId) {
+    const row = this.db
+      .prepare(
+        `INSERT INTO settings (key, value) VALUES (?, '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+         RETURNING value`,
+      )
+      .get(`sync_progress_generation:${projectId}`);
+    return Number(row.value);
+  }
+
   /** Manual sidebar order for a project: {parentFolder: childBasenames[]},
    *  '__root__' for the top level. Lives here rather than in the browser so
    *  the arrangement survives a cleared cache and follows the folder, and so
@@ -937,6 +963,47 @@ export class LocalStore {
 
   setLedgerCursor(shareId, kind, rowid) {
     this.setSetting(`ledger_cursor:${shareId}:${kind}`, String(rowid));
+  }
+
+  /** Freeze a new share unit's message cursor at the current ledger head and
+   *  record the watermark: a project share mirrors a chat only once it becomes
+   *  ACTIVE above it (see syncShareLedger). A unit with no record predates the
+   *  rule and keeps mirroring every chat, so nothing in flight is stranded. */
+  seedChatActivation(cursorKey, shareId) {
+    const projectId = this.db.prepare('SELECT project_id FROM shares WHERE id = ?').get(shareId)?.project_id;
+    if (!projectId) return;
+    const head = Number(
+      this.db.prepare('SELECT MAX(rowid) AS head FROM local_messages WHERE project_id = ?').get(projectId)?.head ?? 0,
+    );
+    this.setLedgerCursor(cursorKey, 'message', head);
+    this.setChatActivation(cursorKey, { seed: head, replayed: [] });
+  }
+
+  chatActivation(cursorKey) {
+    const raw = this.getSetting(`ledger_activation:${cursorKey}`);
+    return raw ? JSON.parse(raw) : null;
+  }
+
+  setChatActivation(cursorKey, state) {
+    this.setSetting(`ledger_activation:${cursorKey}`, JSON.stringify(state));
+  }
+
+  /** Chats carrying message rows above `sinceRowid`: a project share's
+   *  activation signal (a message sent after the share, or a session import
+   *  writing one). */
+  chatsWithMessagesSince(projectId, sinceRowid) {
+    return this.db
+      .prepare('SELECT DISTINCT chat_id FROM local_messages WHERE rowid > ? AND project_id = ?')
+      .all(sinceRowid, projectId)
+      .map((row) => row.chat_id);
+  }
+
+  /** Forget the mirrored chat versions for a (project, workspace) pair. Only
+   *  ever called once the cloud purge landed: while twins exist the counter
+   *  must stay monotonic, or a re-minted v1 is dropped as a duplicate and the
+   *  mirror sticks. */
+  clearLedgerChatState(projectId, workspaceId) {
+    this.db.prepare('DELETE FROM settings WHERE key = ?').run(`ledger_chat_state:${projectId}:${workspaceId}`);
   }
 
   /** Highest local_edits id safe to trim for this project: everything is
@@ -1599,7 +1666,7 @@ export class LocalStore {
       .run(toPath, fromPath.length + 1, projectId, fromPath, fromPath);
   }
 
-  addShare({ projectId, workspaceId, scopePath = '', scopeKind = 'project', collabUrl = null, apiOrigin = null, token = null, mintKey = null, mintKind = null }) {
+  addShare({ projectId, workspaceId, scopePath = '', scopeKind = 'project', collabUrl = null, apiOrigin = null, token = null, mintKey = null, mintKind = null, refreshCredential = null }) {
     const share = {
       id: randomUUID(),
       project_id: projectId,
@@ -1611,15 +1678,16 @@ export class LocalStore {
       token,
       mint_key: mintKey,
       mint_kind: mintKind,
+      refresh_credential: refreshCredential,
       enabled: 1,
       created_at: new Date().toISOString(),
     };
     this.db
       .prepare(
-        `INSERT INTO shares (id, project_id, workspace_id, scope_path, scope_kind, collab_url, api_origin, token, mint_key, mint_kind, enabled, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO shares (id, project_id, workspace_id, scope_path, scope_kind, collab_url, api_origin, token, mint_key, mint_kind, refresh_credential, enabled, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(share.id, share.project_id, share.workspace_id, share.scope_path, share.scope_kind, share.collab_url, share.api_origin, share.token, share.mint_key, share.mint_kind, share.enabled, share.created_at);
+      .run(share.id, share.project_id, share.workspace_id, share.scope_path, share.scope_kind, share.collab_url, share.api_origin, share.token, share.mint_key, share.mint_kind, share.refresh_credential, share.enabled, share.created_at);
     return share;
   }
 
@@ -1645,6 +1713,12 @@ export class LocalStore {
     this.db
       .prepare('UPDATE shares SET collab_url = ?, api_origin = ?, token = ?, enabled = 1 WHERE id = ?')
       .run(collabUrl, apiOrigin, token, shareId);
+  }
+
+  updateShareMint(shareId, { mintKey = null, mintKind = null, refreshCredential = null }) {
+    this.db
+      .prepare('UPDATE shares SET mint_key = ?, mint_kind = ?, refresh_credential = ? WHERE id = ?')
+      .run(mintKey, mintKind, refreshCredential, shareId);
   }
 
   listShareScopes(shareId) {
@@ -1682,6 +1756,11 @@ export class LocalStore {
     const scope = this.db
       .prepare('SELECT * FROM share_scopes WHERE share_id = ? AND scope_kind = ? AND scope_path = ?')
       .get(shareId, scopeKind, scopePath);
+    // A fresh PROJECT scope starts at the message ledger's head: chats the
+    // user never touches again after the share never reach the cloud. A CHAT
+    // scope is an explicit choice of one conversation (whole history by
+    // design); folder/file scopes carry no chats at all.
+    if (result.changes > 0 && scopeKind === 'project') this.seedChatActivation(`scope:${scope.id}`, shareId);
     return { scope, inserted: result.changes > 0 };
   }
 
@@ -1692,6 +1771,7 @@ export class LocalStore {
   removeShareScope(scopeId) {
     this.db.prepare('DELETE FROM share_scopes WHERE id = ?').run(scopeId);
     this.db.prepare('DELETE FROM settings WHERE key LIKE ?').run(`ledger_cursor:scope:${scopeId}:%`);
+    this.db.prepare('DELETE FROM settings WHERE key = ?').run(`ledger_activation:scope:${scopeId}`);
   }
 
   updateShareScopePath(scopeId, scopePath) {
@@ -1828,6 +1908,18 @@ export class LocalStore {
 
   getShare(shareId) {
     return this.db.prepare('SELECT * FROM shares WHERE id = ?').get(shareId) ?? null;
+  }
+
+  /** Newest enabled share for one deployment — the diagnostics sink ships
+   *  with its bridge token, the same credential the sync heartbeat uses. */
+  latestShareForOrigin(apiOrigin) {
+    return this.db
+      .prepare(
+        `SELECT id, workspace_id, api_origin, token FROM shares
+         WHERE enabled = 1 AND api_origin = ? AND token IS NOT NULL
+         ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(apiOrigin) ?? null;
   }
 
 

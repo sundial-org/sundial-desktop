@@ -74,6 +74,12 @@ const IGNORED_GATEWAY_MODEL_SET: ReadonlySet<string> = new Set(IGNORED_GATEWAY_M
 
 export const DEFAULT_MODEL_REF: AllowedGatewayModelId = 'anthropic/claude-opus-5';
 
+// Anonymous free-taste runs always execute on this model: the server gate
+// (lib/agent/start-workspace.ts) rewrites chats.model to it before starting a
+// run. Client-safe here so the composer can display the model that will
+// actually run instead of the stamped workspace default.
+export const ANON_RUN_MODEL_ID: AllowedGatewayModelId = 'anthropic/claude-haiku-4.5';
+
 export type GatewayModelMeta = {
   id: string;
   type?: string | null;

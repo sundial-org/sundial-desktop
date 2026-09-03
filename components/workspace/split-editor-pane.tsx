@@ -2,6 +2,7 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react';
 import type { Editor } from '@tiptap/react';
+import dynamic from 'next/dynamic';
 import { CollabEditor, type PendingAddition } from '@/components/workspace/collab-editor';
 import { MarkdownEditorFrame, type MarkdownPageChrome } from '@/components/workspace/markdown-editor-frame';
 import {
@@ -43,6 +44,13 @@ export function useDocAlignLeft(): boolean {
   return left;
 }
 
+/** Same lazy raw-markdown surface the primary pane uses (⋯ -> Raw markdown).
+ *  Client-only: it serializes the live ProseMirror doc on mount. */
+const RawMarkdownEditor = dynamic(
+  () => import('@/components/workspace/raw-markdown-editor').then((module) => module.RawMarkdownEditor),
+  { ssr: false },
+);
+
 type SplitPaneFile = {
   id: string;
   path: string;
@@ -57,6 +65,9 @@ interface SplitEditorPaneBodyProps {
   isMarkdown: boolean;
   isBinary: boolean;
   workspaceId: string;
+  /** Cloud project id authorized for workspace-global assistant actions.
+   *  Omitted for local, scoped-edit, and suggest-only workspace access. */
+  selectionActionsProjectId?: string;
   /** The page's workspace fetch (sidecar shim on local workspaces) for the
    *  code editor's LaTeX completion context. */
   apiFetch?: typeof fetch;
@@ -96,6 +107,12 @@ interface SplitEditorPaneBodyProps {
   toolbarReadOnly?: boolean;
   /** Receives this pane's live markdown editor (drives page-built chrome). */
   onMarkdownEditor?: (editor: Editor | null) => void;
+  /** ⋯ -> Raw markdown, per pane: swaps the rendered doc for the raw source
+   *  (the editor stays mounted and hidden, as on the primary). */
+  showRawView?: boolean;
+  /** ⋯ -> Show file title: the display-only H1 above the content, already
+   *  formatted by the page. Null keeps the title out of the document. */
+  inlineTitle?: string | null;
 }
 
 /**
@@ -112,6 +129,7 @@ export const SplitEditorPaneBody = memo(function SplitEditorPaneBody({
   isMarkdown,
   isBinary,
   workspaceId,
+  selectionActionsProjectId,
   apiFetch,
   user,
   readOnly,
@@ -130,6 +148,8 @@ export const SplitEditorPaneBody = memo(function SplitEditorPaneBody({
   toolbarFirst = false,
   toolbarReadOnly,
   onMarkdownEditor,
+  showRawView = false,
+  inlineTitle = null,
 }: SplitEditorPaneBodyProps) {
   const docAlignLeft = useDocAlignLeft();
   // Document ⋯ menu → "Google Docs style": 'docs' paints the gray desk behind
@@ -216,6 +236,9 @@ export const SplitEditorPaneBody = memo(function SplitEditorPaneBody({
         {toolbarFirst ? null : toolbarRow}
         <div className="min-h-0 flex-1 overflow-auto px-3 lg:px-6 pt-1 pb-4 lg:pb-8">
           <div className={`${docAlignLeft ? '' : 'mx-auto '}max-w-3xl`}>
+            {showRawView && markdownEditor ? (
+              <RawMarkdownEditor editor={markdownEditor} readOnly={readOnly} />
+            ) : null}
             <MarkdownEditorFrame
               editor={markdownEditor}
               showToolbar={false}
@@ -223,13 +246,23 @@ export const SplitEditorPaneBody = memo(function SplitEditorPaneBody({
               zoom={zoom}
               lineHeight={lineHeight}
               pageChrome={pageChrome}
+              // The raw view replaces the page card, but the collab editor
+              // underneath stays mounted (same rule as the primary) so the
+              // Yjs room never churns on a view toggle.
+              hidden={showRawView}
             >
+              {/* Inline title (⋯ → Show file title): the file name as the
+                  doc's H1, display-only — never written into the markdown. */}
+              {inlineTitle && !showRawView ? (
+                <h1 className="mb-3 text-[1.875rem] font-bold leading-[1.2]">{inlineTitle}</h1>
+              ) : null}
               <SplitPaneMarkdownEditor
                 key={file.id}
                 fileId={file.id}
                 filePath={file.path}
                 collabPath={collabPath ?? file.path}
                 workspaceId={workspaceId}
+                selectionActionsProjectId={selectionActionsProjectId}
                 user={user}
                 readOnly={readOnly}
                 canResolveSuggestions={canResolveSuggestions}
@@ -241,6 +274,7 @@ export const SplitEditorPaneBody = memo(function SplitEditorPaneBody({
                 onJumpToTurn={onJumpToTurn}
                 onReady={onReady}
                 onFocused={onFocused}
+                hidden={showRawView}
               />
             </MarkdownEditorFrame>
           </div>
@@ -258,6 +292,7 @@ export const SplitEditorPaneBody = memo(function SplitEditorPaneBody({
           filePath={file.path}
           collabPath={collabPath ?? file.path}
           workspaceId={workspaceId}
+          selectionActionsProjectId={selectionActionsProjectId}
           apiFetch={apiFetch}
           user={user}
           readOnly={readOnly}

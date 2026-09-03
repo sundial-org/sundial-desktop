@@ -21,7 +21,7 @@ import path from 'node:path';
 import { z } from 'zod';
 
 import { modelMessagesToClaudePrompt } from '../../agent-ts/src/harness/history.ts';
-import { appendThinkingRow, rowsUnseenByEngine, rowsToModelMessages, systemPrompt, topUpTurnEdits, turnEditsMetadata, writeTurnEditsMetadata } from './runner.mjs';
+import { appendThinkingRow, rowsUnseenByEngine, rowsToModelMessages, systemPrompt, topUpTurnEdits, turnEditsMetadata, turnMetaMetadata, writeTurnEditsMetadata } from './runner.mjs';
 
 const MCP_PREFIX = 'mcp__sundial__';
 
@@ -336,6 +336,13 @@ export async function runClaudeTurn({
   let finalText = '';
   let resultError = null;
   let continuedSessionId = null; // resume forks: the id the NEXT turn resumes
+  // Turn-details footer (model · tokens · duration). The SDK reports usage and
+  // its own wall clock on the terminal `result`; `system.init` names the model
+  // that actually ran, which is the only source when no model was configured.
+  const turnStartedAt = Date.now();
+  let resultUsage = null;
+  let resultDurationMs = null;
+  let engineModel = null;
   const toolNameById = new Map();
   const toolByIndex = new Map(); // content_block index → tool_use id, while its input streams
 
@@ -371,6 +378,7 @@ export async function runClaudeTurn({
   const onMessage = (msg) => {
     switch (msg.type) {
       case 'system': {
+        if (msg.subtype === 'init' && typeof msg.model === 'string' && msg.model) engineModel = msg.model;
         if (msg.subtype === 'init' && typeof msg.session_id === 'string') {
           continuedSessionId = msg.session_id;
           // The CLI is writing a transcript for this turn under ~/.claude.
@@ -485,6 +493,9 @@ export async function runClaudeTurn({
       case 'result': {
         if (msg.subtype === 'success') finalText = typeof msg.result === 'string' ? msg.result : '';
         else resultError = typeof msg.result === 'string' ? msg.result : msg.subtype;
+        // A failed turn reports usage too — the tokens were still spent.
+        if (msg.usage && typeof msg.usage === 'object') resultUsage = msg.usage;
+        if (typeof msg.duration_ms === 'number') resultDurationMs = msg.duration_ms;
         break;
       }
       default:
@@ -567,13 +578,21 @@ export async function runClaudeTurn({
       !text.trim() && !ranTools && !resultError
         ? { run_status: abort?.signal?.aborted ? 'aborted' : 'completed' }
         : {};
+    // `input_tokens` is Anthropic's FRESH input (cache excluded), the same
+    // number the cloud lane persists through anthropicToHarnessUsage.
+    const turnMeta = turnMetaMetadata({
+      model: model || engineModel,
+      inputTokens: resultUsage?.input_tokens,
+      outputTokens: resultUsage?.output_tokens,
+      durationMs: resultDurationMs ?? Date.now() - turnStartedAt,
+    });
     store.appendChatMessage(project.id, chatId, {
       id: assistantMessageId,
       role: 'assistant',
       content: text,
       metadata: resultError
-        ? { ...editsMeta, run_status: 'error', run_error: `Claude stopped before finishing (${resultError}).` }
-        : { ...editsMeta, ...terminal },
+        ? { ...editsMeta, ...turnMeta, run_status: 'error', run_error: `Claude stopped before finishing (${resultError}).` }
+        : { ...editsMeta, ...turnMeta, ...terminal },
     });
   }
   // A turn that died mid-edit still edited — stamp before the error frame.

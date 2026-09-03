@@ -3,7 +3,7 @@
   "type": "module",
   "dependencies": {
     "@supabase/supabase-js": "^2.49.0",
-    "ws": "^8.16.0",
+    "ws": "^8.21.3",
     "yjs": "^13.6.14"
   }
 }

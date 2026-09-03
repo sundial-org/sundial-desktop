@@ -104,6 +104,14 @@ export function isQueuedNotice(error: Error): boolean {
   return error.message.includes(QUEUED_PHRASE);
 }
 
+/** The out-of-credits gate copy's distinctive phrase — load-bearing: the chat
+ *  pane matches it to raise the reach-out modal in front of the plain banner. */
+const OUT_OF_CREDITS_PHRASE = 'out of AI credits';
+
+export function isOutOfCreditsFailure(error: Error): boolean {
+  return isSendStartFailure(error) && error.message.includes(OUT_OF_CREDITS_PHRASE);
+}
+
 function missingStreamFallback(): Error {
   return sendStartFailure(
     `Sundial Agent didn't reply (${MISSING_STREAM_PHRASE}) - try sending again.`,

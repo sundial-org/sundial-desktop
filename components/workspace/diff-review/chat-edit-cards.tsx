@@ -19,7 +19,7 @@ import { BlobFileNotice } from '@/components/workspace/diff-review/blob-file-not
 import { CopyLinkButton } from '@/components/workspace/copy-link-button';
 import { InlineDocDiff } from '@/components/workspace/diff-review/inline-doc-diff';
 import {
-  countFileChars,
+  countFileLines,
   formatCompactCount,
 } from '@/components/workspace/diff-review/turn-edit-helpers';
 import type { TurnEditFile } from '@/lib/workspace/turn-edits';
@@ -37,6 +37,7 @@ export function ChatEditCard({
   projectId,
   busy,
   defaultExpanded = false,
+  initialCollapsed = false,
   onKeepFile,
   onUndoFile,
   onOpenFile,
@@ -47,11 +48,14 @@ export function ChatEditCard({
   busy: boolean;
   /** ?diff= deep links land expanded — the link exists to reveal the changes. */
   defaultExpanded?: boolean;
+  /** Pile mode (big multi-file turns): start header-only, click to expand. */
+  initialCollapsed?: boolean;
   onKeepFile: (filePath: string) => void;
   onUndoFile: (filePath: string) => void;
   onOpenFile?: (filePath: string) => void;
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
+  const [collapsed, setCollapsed] = useState(initialCollapsed && !defaultExpanded);
   const [clipped, setClipped] = useState(false);
   const [scrolled, setScrolled] = useState(false);
   const bodyRef = useRef<HTMLDivElement>(null);
@@ -91,7 +95,7 @@ export function ChatEditCard({
   }, [file.chunks.length, expanded]);
 
   const name = baseName(file.filePath);
-  const counts = countFileChars(file);
+  const counts = countFileLines(file);
   // State machine (2026-08-01): pending chunks only exist for SUGGESTION files
   // (applied 'edit' files are born kept) — those are action items. In-doc
   // (kept/accepted) is the DEFAULT state: no label, hover reveals revert.
@@ -122,14 +126,21 @@ export function ChatEditCard({
       } ${busy ? 'pointer-events-none opacity-60' : ''}`}
       data-testid="chat-edit-card"
       data-file-path={file.filePath}
+      data-collapsed={collapsed || undefined}
     >
       {/* Single click ANYWHERE in the header opens the file — action buttons
-          excluded (2026-08-01 feedback; the old double-click is gone). */}
+          excluded (2026-08-01 feedback; the old double-click is gone). In pile
+          mode (collapsed) the row click expands instead, and the file NAME
+          keeps opening the file. */}
       <div
         className="flex h-8 cursor-pointer items-center gap-1.5 px-2.5"
-        title={sizeNote ?? `Open ${file.filePath}`}
+        title={sizeNote ?? (collapsed && !headerOnly ? `Expand ${file.filePath}` : `Open ${file.filePath}`)}
         onClick={(event) => {
           if ((event.target as HTMLElement | null)?.closest('button, a')) return;
+          if (collapsed && !headerOnly) {
+            setCollapsed(false);
+            return;
+          }
           open();
         }}
       >
@@ -138,6 +149,14 @@ export function ChatEditCard({
             className={`truncate font-medium ${
               file.isDeleted ? 'text-stone-400 line-through decoration-stone-300' : ''
             }`}
+            onClick={
+              collapsed && !headerOnly
+                ? (event) => {
+                    event.stopPropagation();
+                    open();
+                  }
+                : undefined
+            }
           >
             {name}
           </span>
@@ -153,7 +172,7 @@ export function ChatEditCard({
             {counts.deleted > 0 ? (
               <span className="text-red-400">−{formatCompactCount(counts.deleted)}</span>
             ) : null}
-            <IconTooltip label={counts.unit === 'lines' ? 'lines' : 'characters'} side="top" />
+            <IconTooltip label="lines" side="top" />
           </span>
         </span>
         <span className="ml-auto flex shrink-0 items-center gap-1 pl-3">
@@ -215,9 +234,20 @@ export function ChatEditCard({
               {mode === 'suggest' ? 'discarded' : 'reverted'}
             </span>
           ) : null}
+          {collapsed && !headerOnly ? (
+            <button
+              type="button"
+              aria-label="Expand diff"
+              data-testid="chat-edit-expand"
+              onClick={() => setCollapsed(false)}
+              className="flex h-6 w-6 items-center justify-center rounded text-stone-300 transition-colors hover:bg-stone-100 hover:text-stone-600"
+            >
+              <ChevronDownIcon className="size-3.5" />
+            </button>
+          ) : null}
         </span>
       </div>
-      {headerOnly ? null : file.blob ? (
+      {collapsed || headerOnly ? null : file.blob ? (
         <div className="border-t border-stone-100 px-2 py-1.5">
           <BlobFileNotice file={file} projectId={projectId} />
         </div>
@@ -273,6 +303,10 @@ export function ChatEditCard({
  *  line in the tool-row idiom. */
 const CARD_CAP = 6;
 
+/** Above this many files, cards start collapsed (header-only pile, Cursor
+ *  style) — a fully expanded stack of 4+ diffs is longer than the chat. */
+const PILE_THRESHOLD = 3;
+
 /** All of a turn's edits as per-file cards. Keep/undo is whole-file (one
  *  suggestion-mark group per file — same semantics as TurnEditsCard). */
 export function ChatEditCards({
@@ -298,6 +332,7 @@ export function ChatEditCards({
   const [showAll, setShowAll] = useState(false);
   const shown = showAll ? files : files.slice(0, CARD_CAP);
   const hidden = files.length - shown.length;
+  const pile = !defaultExpanded && files.length > PILE_THRESHOLD;
   return (
     <div data-testid="chat-edit-cards">
       {shown.map((file) => (
@@ -308,6 +343,7 @@ export function ChatEditCards({
           projectId={projectId}
           busy={activeUndoKey === '__all__' || activeUndoKey === `__file__:${file.filePath}`}
           defaultExpanded={defaultExpanded}
+          initialCollapsed={pile}
           onKeepFile={onKeepFile}
           onUndoFile={onUndoFile}
           onOpenFile={onOpenFile}

@@ -40,6 +40,8 @@ Resolution order at runtime (`lib.rs`): `SUNDIAL_SIDECAR_DIR` override → live 
 
 ## Auto-update & releases
 
+**Before you build:** cut a worktree from `origin/main` (never a feature branch, so parallel agents on the shared checkout aren't disturbed), and bump `version` in `tauri.conf.json` above the currently-live release (check `latest.json` / notary history) — shipping a stale version pushes a downgrade of unreleased code to all clients.
+
 Packaged builds check `https://www.sundial.md/api/desktop/update` hourly (plus App menu ▸ Check for Updates…), download in the background, and show a "ready to install — Relaunch" toast in the web UI (`components/desktop/update-toast.tsx`; the Relaunch button navigates to the `/desktop/relaunch-update` marker the shell intercepts).
 
 Updater artifacts are minisign-signed. `createUpdaterArtifacts` is on, so **`pnpm build` requires the signing key**:
@@ -59,6 +61,22 @@ If the updater-signature step still prompted and failed, sign the tarball manual
 Release builds must be signed as **Long Horizon Research, Inc. (8KBD332MV9)** — never the personal "Florent Tavernier (Q6323QWRP9)" cert, which is a legacy fallback only.
 
 The matching public key lives in `tauri.conf.json` (`plugins.updater.pubkey`). The update manifest and the `/download` page both read `latest.json` from the public `desktop-releases` Supabase Storage bucket — publishing a release never needs a web redeploy.
+
+### The other update channel: the headless sidecar
+
+The desktop app is not the only thing that downloads Sundial code. `serve.sh` / `serve.ps1` fetch `<origin>/serve.mjs` and run it, and a supervised headless daemon re-fetches it to update itself. That is a second arbitrary-code channel, so it gets its own ed25519 pair, verified in `local-server/update.mjs` and in both bootstraps.
+
+**Not provisioned yet.** `local-server/update-key.mjs` ships an empty `UPDATE_PUBLIC_KEY`, which leaves that channel on TLS-only trust exactly as before. To arm it, once:
+
+```bash
+openssl genpkey -algorithm ed25519 -out ~/.config/sundial-update.key
+openssl pkey -in ~/.config/sundial-update.key -pubout -outform DER | tail -c 32 | base64
+# paste that 44-char value into local-server/update-key.mjs, then add to
+# ~/.config/sundial-signing.env:
+echo 'export SUNDIAL_UPDATE_SIGNING_KEY_FILE="$HOME/.config/sundial-update.key"' >> ~/.config/sundial-signing.env
+```
+
+The private key never enters the repo. `pnpm build:serve-bundle` (part of every web build) then runs `scripts/sign-serve-bundle.mjs`, which publishes `public/serve.mjs.sig` beside the bundle and **fails the build** if the public key is set but the private half is missing — clients would already be refusing the unsigned bundle. The deploying environment therefore needs `SUNDIAL_UPDATE_SIGNING_KEY_FILE` or `SUNDIAL_UPDATE_SIGNING_KEY` (the PEM itself, as a CI/Vercel secret) from the moment the public key lands. Arm the build first, the client second.
 
 ## First-launch handshake
 

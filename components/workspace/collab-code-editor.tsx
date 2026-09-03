@@ -2,18 +2,23 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ChatTeardropTextIcon, LockSimpleIcon, SparkleIcon } from '@phosphor-icons/react';
+import { ChatTeardropTextIcon, LockSimpleIcon } from '@phosphor-icons/react';
 import { HocuspocusProvider } from '@hocuspocus/provider';
 import * as Y from 'yjs';
 import type { editor as MonacoEditorType } from 'monaco-editor';
 import { ensureCodeText } from '@/lib/collab/code-text';
 import { MonacoEditor, getCodeEditorOptions, getCodeLanguage, defineMonacoThemes, preloadMonaco, useMonacoTheme } from '@/components/workspace/code-viewer';
+import { SELECTION_SAMPLE_LIMIT } from '@/components/workspace/editor-bubble-menu';
+import { SelectionActionControls } from '@/components/workspace/selection-action-controls';
+import {
+  INVOKE_SELECTION_ACTION_EVENT,
+  MAX_SELECTION_ACTION_TEXT_CHARS,
+  type WorkspaceSelectionAction,
+} from '@/lib/assistants/selection-actions';
 import {
   BUBBLE_LABEL_ACCENT,
-  BUBBLE_LABEL_BUTTON,
   BUBBLE_SURFACE,
-  SELECTION_SAMPLE_LIMIT,
-} from '@/components/workspace/editor-bubble-menu';
+} from '@/components/workspace/selection-bubble-styles';
 import { EditorSkeleton } from '@/components/workspace/editor-skeleton';
 import {
   registerLatexCompletions,
@@ -48,6 +53,10 @@ import { track } from '@/lib/analytics/track';
 import { LATEX_IMAGE_EXT_RE, relativeToTexDir, texHasGraphicx } from '@/lib/workspace/latex-image';
 import { formatLatexSnippet, type LatexSnippet } from '@/lib/workspace/latex-snippets';
 import type { LatexMarker } from '@/lib/workspace/latex-log-navigation';
+import {
+  installLatexCompileMarkers,
+  LATEX_COMPILE_MARKER_OWNER,
+} from '@/lib/workspace/latex-monaco-markers';
 import { matchPendingHunks, type PendingHunkInput } from '@/lib/workspace/pending-hunks-match';
 import { setFreezeContext, fileTypeFromPath } from '@/lib/perf/freeze-monitor';
 import {
@@ -84,6 +93,7 @@ import {
   resolveCodeCommentAnchorRange,
   resolveCodeCommentRanges,
 } from '@/lib/workspace/code-comments';
+import { findWordNearLine } from '@/lib/latex/reveal-word';
 
 type CollabUser = {
   name: string;
@@ -113,7 +123,14 @@ function snippetOffsetToPosition(
 
 export type CodeEditorHandle = {
   getText: () => string;
-  revealLine?: (line: number) => void;
+  /** Reveal + flash a 1-based line. With `word`, snap to that word's own line
+   *  nearby (SyncTeX gives approximate lines; the double-clicked PDF word is
+   *  exact) and select it, so the highlight matches what was clicked. */
+  revealLine?: (line: number, word?: string) => void;
+  /** Continuous scroll sync: silently bring a line to the viewport top — no
+   *  focus, no flash, no cursor move — and hold this editor's own scroll
+   *  reports for a beat so the panes don't ping-pong. */
+  scrollToLineTop?: (line: number) => void;
   /** 1-based cursor line (SyncTeX forward search); null before Monaco mounts. */
   getCursorLine?: () => number | null;
   /** Anchor a comment on a character range of THIS file's Y.Text (the PDF
@@ -194,6 +211,9 @@ interface CollabCodeEditorProps {
   /** Workspace project id. When set the editor connects to the
    *  per-workspace warm host instead of the global Hocuspocus. */
   workspaceId?: string;
+  /** Cloud project id authorized for workspace-global assistant actions.
+   *  Omit for local workspaces and members without workspace-wide write. */
+  selectionActionsProjectId?: string;
   /** The page's workspace fetch — the sidecar shim on local workspaces, so
    *  the LaTeX completion context resolves there instead of 404ing on the
    *  real Next API. Defaults to global fetch. */
@@ -257,10 +277,11 @@ interface CollabCodeEditorProps {
     offsets: Record<string, number>;
     draftOffset: number | null;
     attempted?: boolean;
-    /** 1-based source start line per thread — the PDF comment markers map
-     *  these through SyncTeX forward search. Reported even when the lane row
-     *  is missing (`attempted: false`): line resolution doesn't need it. */
-    lines?: Record<string, number>;
+    /** 1-based [start, end] source lines per thread — the PDF comment pins
+     *  and highlights map these through SyncTeX forward search. Reported even
+     *  when the lane row is missing (`attempted: false`): line resolution
+     *  doesn't need it. */
+    lineSpans?: Record<string, [number, number]>;
   }) => void;
   /** Scroll to a remote collaborator's caret in this doc (bubble click).
    *  Same contract as CollabEditor's prop — y-monaco publishes the caret
@@ -277,9 +298,15 @@ interface CollabCodeEditorProps {
   /** Editor gained focus — presence uses this to broadcast which file the
    *  user is actually editing (split panes make "the selected file" wrong). */
   onFocused?: () => void;
+  /** Continuous scroll sync: debounced top visible line as the user scrolls
+   *  (quiet while a scrollToLineTop follow is landing). */
+  onScrollTopLine?: (line: number) => void;
   /** LaTeX compile problems for THIS file — rendered as Monaco markers +
    *  gutter bars (spec §1.9). Omit / empty clears them. */
   compileMarkers?: LatexMarker[];
+  /** Fires only after Monaco has installed a compile marker and its gutter for
+   *  this open file. Used by onboarding's diagnostic-visible milestone. */
+  onCompileMarkersVisible?: (filePath: string, markers: readonly LatexMarker[]) => void;
   /** Forward SyncTeX (.tex only): the "Show in PDF" context-menu action and
    *  its Ctrl/Cmd+Alt+J chord jump the PDF to the cursor line. */
   onShowInPdf?: () => void;
@@ -290,6 +317,7 @@ export function CollabCodeEditor({
   filePath,
   collabPath,
   workspaceId,
+  selectionActionsProjectId,
   apiFetch,
   user,
   onReady,
@@ -319,7 +347,9 @@ export function CollabCodeEditor({
   revealPeer,
   onRevealPeerDone,
   onFocused,
+  onScrollTopLine,
   compileMarkers,
+  onCompileMarkersVisible,
   onShowInPdf,
 }: CollabCodeEditorProps) {
   // Attribution stamped onto suggestions the local user stages in suggest mode.
@@ -342,12 +372,20 @@ export function CollabCodeEditor({
   onJumpToTurnRef.current = onJumpToTurn;
   const onSelectCommentRef = useRef(onSelectComment);
   onSelectCommentRef.current = onSelectComment;
+  // Scroll-sync: latest callback + a suppression window (a landed follow must
+  // not echo back as this editor's own scroll report).
+  const onScrollTopLineRef = useRef(onScrollTopLine);
+  onScrollTopLineRef.current = onScrollTopLine;
+  const scrollFollowSuppressUntilRef = useRef(0);
+  const scrollReportTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onStartCommentDraftRef = useRef(onStartCommentDraft);
   onStartCommentDraftRef.current = onStartCommentDraft;
   // A rename keeps the editor mounted (keyed by fileId) — onMount closures
   // must read the path through this ref or they'd pin the pre-rename path.
   const filePathRef = useRef(filePath);
   filePathRef.current = filePath;
+  const onCompileMarkersVisibleRef = useRef(onCompileMarkersVisible);
+  onCompileMarkersVisibleRef.current = onCompileMarkersVisible;
   const onReportCommentAnchorsRef = useRef(onReportCommentAnchors);
   onReportCommentAnchorsRef.current = onReportCommentAnchors;
   // Live resolved comment ranges (`[from, to)` char offsets) for click hit-testing.
@@ -597,10 +635,21 @@ export function CollabCodeEditor({
   useEffect(() => () => {
     if (revealFlashTimerRef.current) clearTimeout(revealFlashTimerRef.current);
   }, []);
+  // True while the current selection is programmatic (a SyncTeX word-snap
+  // jump) — the selection bubble stays hidden until the user selects.
+  const bubbleSuppressRef = useRef(false);
   const editorHandle = useMemo<CodeEditorHandle>(
     () => ({
       getText: () => modelRef.current?.getValue() ?? currentTextRef.current,
       getCursorLine: () => monacoEditorRef.current?.getPosition()?.lineNumber ?? null,
+      scrollToLineTop: (line: number) => {
+        const editor = monacoEditorRef.current;
+        const model = modelRef.current;
+        if (!editor || !model) return;
+        const lineNumber = Math.max(1, Math.min(line, model.getLineCount()));
+        scrollFollowSuppressUntilRef.current = Date.now() + 400;
+        editor.setScrollTop(Math.max(0, editor.getTopForLineNumber(lineNumber) - 12));
+      },
       buildCommentSelectionFromOffsets: (from: number, to: number) => {
         const ydoc = ydocRef.current;
         const model = modelRef.current;
@@ -611,14 +660,34 @@ export function CollabCodeEditor({
         if (lo >= hi) return null;
         return buildCodeCommentSelection(ydoc, lo, hi, text.slice(lo, hi));
       },
-      revealLine: (line: number) => {
+      revealLine: (line: number, word?: string) => {
         const editor = monacoEditorRef.current;
         const monaco = monacoNsRef.current;
         const model = modelRef.current;
         if (!editor || !monaco || !model) return;
-        const lineNumber = Math.max(1, Math.min(line, model.getLineCount()));
+        let lineNumber = Math.max(1, Math.min(line, model.getLineCount()));
+        // Snap to the double-clicked word when the caller has one: SyncTeX
+        // lines are approximate, the clicked word is exact — and selecting it
+        // makes the editor highlight match what was clicked in the PDF.
+        const wordHit = word
+          ? findWordNearLine(
+              (ln) => (ln >= 1 && ln <= model.getLineCount() ? model.getLineContent(ln) : null),
+              lineNumber,
+              word,
+            )
+          : null;
+        if (wordHit) {
+          lineNumber = wordHit.line;
+          // A programmatic selection must not pop the action bubble over the
+          // just-revealed code; the next real mouse/keyboard selection re-arms it.
+          bubbleSuppressRef.current = true;
+          editor.setSelection(
+            new monaco.Range(lineNumber, wordHit.column, lineNumber, wordHit.column + wordHit.length),
+          );
+        } else {
+          editor.setPosition({ lineNumber, column: 1 });
+        }
         editor.revealLineInCenter(lineNumber);
-        editor.setPosition({ lineNumber, column: 1 });
         editor.focus();
         // Flash the line so a SyncTeX inverse / search jump is visible even when
         // the target is already on screen (short docs don't scroll).
@@ -1390,7 +1459,12 @@ export function CollabCodeEditor({
         }
       }
 
+      // Before the empty early-return: resolving the LAST suggestion must
+      // drop the count to 0 or the Accept all / Reject all bar outlives the
+      // suggestions it reviews.
+      setPendingReviewCount(additions.length);
       if (additions.length === 0) {
+        chunkByKeyRef.current = new Map();
         teardownAll();
         decorationCollectionRef.current?.clear();
         decorationCollectionRef.current = null;
@@ -1424,7 +1498,6 @@ export function CollabCodeEditor({
       const hunkInputs: PendingHunkInput[] = [];
       const chunkByKey = new Map<string, CodePendingAddition>();
       chunkByKeyRef.current = chunkByKey;
-      setPendingReviewCount(additions.length);
       const legacyOnly: CodePendingAddition[] = [];
       for (const a of additions) {
         chunkByKey.set(a.key, a);
@@ -1972,7 +2045,7 @@ export function CollabCodeEditor({
     if ((commentThreads ?? []).length === 0 && !draftCommentSelection) {
       commentRangesRef.current = [];
       commentDecorationsRef.current?.set([]);
-      onReportCommentAnchorsRef.current?.({ offsets: {}, draftOffset: null, lines: {} });
+      onReportCommentAnchorsRef.current?.({ offsets: {}, draftOffset: null, lineSpans: {} });
       return;
     }
 
@@ -2029,14 +2102,19 @@ export function CollabCodeEditor({
       const ranges = commentRangesRef.current;
       const report = onReportCommentAnchorsRef.current;
       if (!report) return;
-      // Source line per thread — resolvable even when pixel offsets are not
-      // (the PDF markers consume these with no lane row on screen).
-      const lines: Record<string, number> = {};
-      for (const range of ranges) lines[range.id] = model.getPositionAt(range.from).lineNumber;
+      // Source line span per thread — resolvable even when pixel offsets are
+      // not (the PDF pins/highlights consume these with no lane row on screen).
+      const lineSpans: Record<string, [number, number]> = {};
+      for (const range of ranges) {
+        lineSpans[range.id] = [
+          model.getPositionAt(range.from).lineNumber,
+          model.getPositionAt(Math.max(range.from, range.to - 1)).lineNumber,
+        ];
+      }
       const laneRow = commentLaneRowRef?.current;
       const editorDom = editor.getDomNode();
       if (!laneRow || !editorDom) {
-        report({ offsets: {}, draftOffset: null, attempted: false, lines });
+        report({ offsets: {}, draftOffset: null, attempted: false, lineSpans });
         return;
       }
       const rowTop = laneRow.getBoundingClientRect().top;
@@ -2052,7 +2130,7 @@ export function CollabCodeEditor({
       };
       const offsets: Record<string, number> = {};
       for (const range of ranges) offsets[range.id] = centerOf(range.from, range.to);
-      report({ offsets, draftOffset: draft ? centerOf(draft.from, draft.to) : null, lines });
+      report({ offsets, draftOffset: draft ? centerOf(draft.from, draft.to) : null, lineSpans });
     };
 
     // Coalesce bursts (a scroll drag fires onDidScrollChange + onDidLayoutChange
@@ -2126,6 +2204,33 @@ export function CollabCodeEditor({
     });
     return () => sub.dispose();
   }, [activeCommentThreadId, bindingReady, commentThreads, ydoc]);
+
+  // Continuous scroll sync: report the top visible line (debounced) so the
+  // host can forward-map it into the PDF. Refs keep this subscription free of
+  // per-render churn; the suppression window mutes the echo of an applied
+  // follow. O(1) per scroll event — no document walks (keystroke-path rule).
+  useEffect(() => {
+    const editor = monacoEditorRef.current;
+    if (!editorMounted || !editor) return;
+    const sub = editor.onDidScrollChange(() => {
+      if (!onScrollTopLineRef.current) return;
+      if (Date.now() < scrollFollowSuppressUntilRef.current) return;
+      if (scrollReportTimerRef.current) clearTimeout(scrollReportTimerRef.current);
+      scrollReportTimerRef.current = setTimeout(() => {
+        scrollReportTimerRef.current = null;
+        const live = monacoEditorRef.current;
+        const report = onScrollTopLineRef.current;
+        if (!live || !report) return;
+        if (Date.now() < scrollFollowSuppressUntilRef.current) return;
+        const line = live.getVisibleRanges()[0]?.startLineNumber;
+        if (line) report(line);
+      }, 120);
+    });
+    return () => {
+      sub.dispose();
+      if (scrollReportTimerRef.current) clearTimeout(scrollReportTimerRef.current);
+    };
+  }, [editorMounted]);
 
   // "Comment" context-menu action + Cmd/Ctrl-Opt-M to comment on the selection.
   useEffect(() => {
@@ -2321,31 +2426,17 @@ export function CollabCodeEditor({
     const model = editor?.getModel();
     if (!bindingReady || !editor || !monaco || !model || model.isDisposed()) return;
     const markers = compileMarkers ?? [];
-    monaco.editor.setModelMarkers(
+    const gutter = installLatexCompileMarkers({
+      monaco,
+      editor,
       model,
-      'latex-compile',
-      markers.map((m) => ({
-        severity: m.severity === 'error' ? monaco.MarkerSeverity.Error : monaco.MarkerSeverity.Warning,
-        message: m.message,
-        startLineNumber: m.line,
-        startColumn: 1,
-        endLineNumber: m.line,
-        endColumn: model.getLineMaxColumn(Math.min(m.line, model.getLineCount())),
-      })),
-    );
-    const gutter = editor.createDecorationsCollection(
-      markers.map((m) => ({
-        range: new monaco.Range(m.line, 1, m.line, 1),
-        options: {
-          isWholeLine: true,
-          linesDecorationsClassName: `latex-compile-gutter latex-compile-gutter-${m.severity}`,
-          stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
-        },
-      })),
-    );
+      markers,
+      onVisible: (installedMarkers) =>
+        onCompileMarkersVisibleRef.current?.(filePathRef.current, installedMarkers),
+    });
     return () => {
       gutter.clear();
-      if (!model.isDisposed()) monaco.editor.setModelMarkers(model, 'latex-compile', []);
+      if (!model.isDisposed()) monaco.editor.setModelMarkers(model, LATEX_COMPILE_MARKER_OWNER, []);
     };
   }, [bindingReady, compileMarkers]);
 
@@ -2383,14 +2474,17 @@ export function CollabCodeEditor({
       {/* Comment-only visitors have readOnly=true but must still get the
           bubble — right-click Comment and ⌘⌥M work for them, so the
           emphasized affordance has to as well. */}
-      {editorMounted && !hidden && isLatexFile && (!readOnly || canComment) &&
+      {editorMounted && !hidden && isLatexFile &&
+        (!readOnly || canComment || Boolean(selectionActionsProjectId)) &&
         monacoEditorRef.current && (
           <CodeSelectionBubble
             editor={monacoEditorRef.current}
             filePath={filePath}
+            selectionActionsProjectId={selectionActionsProjectId}
             ydoc={ydoc}
             canComment={canComment}
             onStartCommentDraftRef={onStartCommentDraftRef}
+            suppressRef={bubbleSuppressRef}
           />
         )}
       {/* Flat: code renders directly on the white panel, like markdown (no card border). */}
@@ -2565,7 +2659,7 @@ export function CollabCodeEditor({
 }
 
 /* ── Code selection bubble (LaTeX prototype) ──────────────────────────
- *  Comment + Reference in chat floating above the selection, mirroring the
+ *  Custom assistant actions + Comment floating above the selection, mirroring the
  *  markdown editor's format bubble (shared class constants keep the two
  *  pixel-identical). A separate component so per-frame placement state
  *  re-renders this small portal, not the whole editor host. Body portal
@@ -2575,15 +2669,22 @@ export function CollabCodeEditor({
 function CodeSelectionBubble({
   editor,
   filePath,
+  selectionActionsProjectId,
   ydoc,
   canComment,
   onStartCommentDraftRef,
+  suppressRef,
 }: {
   editor: MonacoEditorType.IStandaloneCodeEditor;
   filePath: string;
+  selectionActionsProjectId?: string;
   ydoc: Y.Doc | null;
   canComment: boolean;
   onStartCommentDraftRef: { current: ((selection: DraftDocCommentSelection) => void) | undefined };
+  /** While true, the bubble stays hidden: the selection was made by code (a
+   *  SyncTeX word-snap jump), not the user. Cleared by the next mouse or
+   *  keyboard selection change. */
+  suppressRef: { current: boolean };
 }) {
   const [bubble, setBubble] = useState<{ top: number; left: number; below: boolean } | null>(null);
   const elRef = useRef<HTMLDivElement | null>(null);
@@ -2591,11 +2692,20 @@ function CodeSelectionBubble({
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let raf: number | undefined;
+    let blurRaf: number | undefined;
     const place = () => {
       const sel = editor.getSelection();
       const model = editor.getModel();
       const dom = editor.getDomNode();
-      if (!sel || !model || !dom || sel.isEmpty() || !editor.hasTextFocus()) {
+      const bubbleHasFocus = Boolean(elRef.current?.contains(document.activeElement));
+      if (
+        !sel ||
+        !model ||
+        !dom ||
+        sel.isEmpty() ||
+        (!editor.hasTextFocus() && !bubbleHasFocus) ||
+        suppressRef.current
+      ) {
         setBubble(null);
         return;
       }
@@ -2672,11 +2782,25 @@ function CodeSelectionBubble({
       timer = setTimeout(place, 150);
     };
     const subs = [
-      editor.onDidChangeCursorSelection(schedule),
+      editor.onDidChangeCursorSelection((event) => {
+        // A real user selection lifts the programmatic-selection suppression
+        // (a SyncTeX jump selects the clicked word without offering actions).
+        if (event.source === 'mouse' || event.source === 'keyboard') suppressRef.current = false;
+        schedule();
+      }),
       editor.onDidScrollChange(placeSoon),
       // Pane/window resizes move the editor without a scroll.
       editor.onDidLayoutChange(schedule),
-      editor.onDidBlurEditorText(() => setBubble(null)),
+      editor.onDidBlurEditorText(() => {
+        // Keyboard users may move focus into Customize. Monaco reports the
+        // blur before the browser commits that focus, so defer the check and
+        // keep the selection bubble alive while one of its controls owns it.
+        if (blurRaf !== undefined) cancelAnimationFrame(blurRaf);
+        blurRaf = requestAnimationFrame(() => {
+          blurRaf = undefined;
+          if (!elRef.current?.contains(document.activeElement)) setBubble(null);
+        });
+      }),
     ];
     // An OUTER scroller moves the editor without any Monaco event; scroll
     // doesn't bubble but does capture (same trick as useFollowEditorScroll).
@@ -2692,6 +2816,7 @@ function CodeSelectionBubble({
     return () => {
       if (timer) clearTimeout(timer);
       if (raf !== undefined) cancelAnimationFrame(raf);
+      if (blurRaf !== undefined) cancelAnimationFrame(blurRaf);
       for (const sub of subs) sub.dispose();
       window.removeEventListener('scroll', onOuterScroll, { capture: true });
       setBubble(null);
@@ -2700,14 +2825,15 @@ function CodeSelectionBubble({
 
   // Both actions collapse the selection to its end first — that hides the
   // bubble immediately (and the draft/chat UI takes focus anyway).
-  const collapseSelection = () => {
+  const collapseSelection = (maxChars?: number) => {
     const sel = editor.getSelection();
     const model = editor.getModel();
     if (!sel || !model || sel.isEmpty()) return null;
-    const text = model.getValueInRange(sel);
     const end = sel.getEndPosition();
     const from = model.getOffsetAt(sel.getStartPosition());
     const to = model.getOffsetAt(end);
+    const tooLong = typeof maxChars === 'number' && to - from > maxChars;
+    const text = tooLong ? '' : model.getValueInRange(sel);
     editor.setSelection({
       startLineNumber: end.lineNumber,
       startColumn: end.column,
@@ -2715,14 +2841,32 @@ function CodeSelectionBubble({
       endColumn: end.column,
     });
     setBubble(null);
-    return { text, from, to };
+    return { text, from, to, tooLong };
   };
-  const addToChat = () => {
-    const captured = collapseSelection();
-    const text = captured?.text.trim();
-    if (!text) return;
+  const invokeSelectionAction = (action: WorkspaceSelectionAction) => {
+    const captured = collapseSelection(MAX_SELECTION_ACTION_TEXT_CHARS);
+    const text = captured?.text.trim() ?? '';
+    const selection =
+      captured && !captured.tooLong && ydoc
+        ? buildCodeCommentSelection(ydoc, captured.from, captured.to, captured.text)
+        : null;
+    if ((!text || !selection) && !captured?.tooLong) return;
     window.dispatchEvent(
-      new CustomEvent('sundial:add-chat-context', { detail: { text, path: filePath } }),
+      new CustomEvent(INVOKE_SELECTION_ACTION_EVENT, {
+        detail: {
+          action: {
+            id: action.id,
+            label: action.label,
+            title: action.title,
+            assistant_slug: action.assistant_slug,
+            assistant_name: action.assistant_name,
+          },
+          text,
+          too_long: captured?.tooLong || undefined,
+          path: filePath,
+          selection: selection ?? undefined,
+        },
+      }),
     );
   };
   const comment = () => {
@@ -2747,15 +2891,12 @@ function CodeSelectionBubble({
       // Keep the editor's selection/focus alive for every control in here.
       onMouseDown={(event) => event.preventDefault()}
     >
-      <button
-        type="button"
-        aria-label="Reference selection in chat ⌘J"
-        onClick={addToChat}
-        className={BUBBLE_LABEL_BUTTON}
-      >
-        <SparkleIcon className="h-4 w-4" weight="fill" />
-        Reference in chat
-      </button>
+      {selectionActionsProjectId ? (
+        <SelectionActionControls
+          projectId={selectionActionsProjectId}
+          onInvoke={invokeSelectionAction}
+        />
+      ) : null}
       {canComment && ydoc && (
         <button
           type="button"

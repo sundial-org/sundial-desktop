@@ -546,7 +546,7 @@ export function EditorFactcheckPopup({
         {run.phase === 'results' && run.result && (
           <div className="p-2">
             {flagged.length === 0 && (
-              <div className="flex items-center gap-2 rounded-lg bg-emerald-50/60 px-3 py-2.5">
+              <div className="flex items-center gap-2 rounded-lg bg-emerald-50 px-3 py-2.5">
                 <CheckCircleIcon className="h-4 w-4 text-emerald-600" weight="fill" />
                 <p className="text-[14px] text-emerald-800">
                   Nothing inaccurate found
@@ -653,7 +653,7 @@ export function EditorFactcheckPopup({
                   <span
                     key={i}
                     title={claim.explanation}
-                    className="flex items-center gap-1 rounded-full bg-emerald-50/70 px-2 py-0.5 text-[11px] text-emerald-700"
+                    className="flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700"
                   >
                     <CheckCircleIcon className="h-3 w-3" weight="fill" />
                     {claim.quote.length > 48 ? `${claim.quote.slice(0, 48)}…` : claim.quote}

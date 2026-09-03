@@ -4,6 +4,12 @@ import { useCallback, useRef, useState } from 'react';
 import { SparkleIcon, UploadSimpleIcon, XIcon } from '@phosphor-icons/react';
 import { ModalShell } from '@/components/modal-shell';
 import { FEATURED_SKILLS, type FeaturedSkill } from '@/lib/skills/featured';
+import { RESEARCH_FEATURED_SKILLS } from '@/lib/skills/featured-research';
+import { productFlavor } from '@/lib/flags/product-flavor';
+
+// The scientific beta keeps its comp-bio one-click installs; the general
+// flavor (desktop/OSS) features the writing workflows.
+const featuredSkills = productFlavor() === 'general' ? FEATURED_SKILLS : RESEARCH_FEATURED_SKILLS;
 
 /**
  * Install a skill into `skills/<id>/SKILL.md` — from a GitHub/GitLab source or
@@ -236,11 +242,11 @@ export function AddSkillModal({
       ) : (
         <>
       <div className="space-y-4 px-6 py-5 text-sm">
-        {FEATURED_SKILLS.map((skill) => (
+        {featuredSkills.map((skill) => (
           <div
             key={skill.id}
             data-testid={`featured-skill-${skill.id}`}
-            className="rounded-xl border border-amber-200 bg-amber-50/60 p-3"
+            className="rounded-xl border border-amber-200 bg-amber-50 p-3"
           >
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">

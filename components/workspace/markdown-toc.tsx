@@ -16,6 +16,9 @@ export function MarkdownTOC({
   onSelect: (heading: TocHeading) => void;
 }) {
   if (headings.length === 0) return null;
+  // Indent relative to the doc's shallowest heading so an h4-only doc doesn't
+  // render every entry pushed 2.1rem to the right (belind, 2026-08-23).
+  const minLevel = Math.min(...headings.map((h) => h.level));
   return (
     <div
       data-testid="markdown-toc"
@@ -35,7 +38,7 @@ export function MarkdownTOC({
             onClick={() => onSelect(heading)}
             title={heading.text}
             className="block w-full truncate rounded px-2 py-1 text-left text-[12px] leading-4 text-stone-500 transition-colors hover:bg-stone-100 hover:text-stone-800"
-            style={{ paddingLeft: `${0.5 + (heading.level - 1) * 0.7}rem` }}
+            style={{ paddingLeft: `${0.5 + (heading.level - minLevel) * 0.7}rem` }}
           >
             {heading.text}
           </button>

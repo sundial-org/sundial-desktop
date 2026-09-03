@@ -18,7 +18,7 @@ import {
 } from '../../agent-ts/src/tools/descriptions.ts';
 import { globToRegExp } from '../../lib/workspace/glob-match.ts';
 import { MAX_TEXT_BYTES, readTextFile, safeResolveInRoot, writeTextFileAtomic } from '../disk.mjs';
-import { fileKind, isIgnoredPath, mimeFor, normalizeRelPath } from '../paths.mjs';
+import { fileKind, fileKindForFile, isIgnoredPath, mimeFor, normalizeRelPath } from '../paths.mjs';
 import { locateRel, projectRoots, virtualPath, walkAllRoots } from '../roots.mjs';
 
 const MAX_READ_LINES = 2000;
@@ -276,7 +276,7 @@ export function createLocalTools({
       async execute(input) {
         const rel = normalizeToolPath(roots(), input.file_path);
         if (!rel) return err('Invalid or ignored path');
-        if (fileKind(rel) !== 'text') return err('Only text files can be written locally for now');
+        if (fileKindForFile(rel) !== 'text') return err('Only text files can be written locally for now');
         await writeText(rel, String(input.content ?? ''), { messageId });
         return ok(`Wrote ${rel}`);
       },
@@ -299,7 +299,7 @@ export function createLocalTools({
         if (!rel) return err('Invalid or ignored path');
         // Same guard as Read/Write: decoding a binary as UTF-8 and writing
         // it back as text would corrupt the file on disk.
-        if (fileKind(rel) !== 'text') return err('Only text files can be edited locally for now');
+        if (fileKindForFile(rel) !== 'text') return err('Only text files can be edited locally for now');
         const text = await readCurrentText(rel);
         if (text === null) return err(`File does not exist: ${rel}`);
         const oldString = String(input.old_string ?? '');

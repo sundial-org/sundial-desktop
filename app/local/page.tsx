@@ -34,7 +34,7 @@ import { formatDriveDate } from '@/lib/format';
 import { lastOpenedAt, markProjectOpened } from '@/lib/local/recents';
 import { localProjectRowLabels } from '@/lib/local/project-label';
 import { useLocalProjects } from '@/lib/local/use-local-projects';
-import { STARTER_PACKS, type StarterPack } from '@/lib/local/starter-packs';
+import type { StarterPack } from '@/lib/local/starter-packs';
 import { getWorkspaceRouteId } from '@/lib/workspace/public-ids';
 import { buildWorkspaceChatPath } from '@/lib/workspace/paths';
 import { createPinToggleQueue } from '@/lib/workspace/pin-toggle-queue';
@@ -143,6 +143,7 @@ export default function LocalHomePage() {
   }, [opening]);
   const [error, setError] = useState<string | null>(null);
   const [dialog, setDialog] = useState<ProjectDialogIntent | null>(null);
+  const [showNewMenu, setShowNewMenu] = useState(false);
   const [view, setView] = useState<HomeView>('recent');
   useEffect(() => {
     setIsDesktop(isDesktopApp());
@@ -623,16 +624,69 @@ export default function LocalHomePage() {
           <div className="flex flex-col gap-8 sm:flex-row">
             {/* View switcher — same rail as the web dashboard. */}
             <aside className="w-full shrink-0 sm:w-48">
-              <button
-                type="button"
-                onClick={() => openPack(null)}
-                disabled={!ready}
-                className="mb-4 flex w-full items-center justify-center gap-1.5 rounded-xl border border-stone-200 bg-white px-4 py-2.5 text-sm font-medium text-stone-800 shadow-sm transition-colors hover:border-stone-300 hover:bg-stone-100/60 disabled:opacity-50 sm:justify-start"
-                data-testid="local-new-project"
-              >
-                <PlusIcon className="h-4 w-4" aria-hidden />
-                New project
-              </button>
+              {/* Same dropdown contract as the web dashboard's New project:
+                  the button offers every way in (folder, GitHub, blank)
+                  instead of silently creating a blank project. */}
+              <div className="relative mb-4">
+                <button
+                  type="button"
+                  onClick={() => setShowNewMenu((v) => !v)}
+                  disabled={!ready}
+                  className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-stone-200 bg-white px-4 py-2.5 text-sm font-medium text-stone-800 shadow-sm transition-colors hover:border-stone-300 hover:bg-stone-100/60 disabled:opacity-50 sm:justify-start"
+                  data-testid="local-new-project"
+                >
+                  <PlusIcon className="h-4 w-4" aria-hidden />
+                  New project
+                </button>
+                {showNewMenu ? (
+                  <>
+                    <button
+                      type="button"
+                      aria-label="Close menu"
+                      onClick={() => setShowNewMenu(false)}
+                      className="fixed inset-0 z-10 cursor-default"
+                    />
+                    <div className="absolute left-0 top-full z-20 mt-1 w-full min-w-48 overflow-hidden rounded-xl border border-stone-200 bg-white py-1 shadow-lg">
+                      <button
+                        type="button"
+                        data-testid="local-new-open-folder"
+                        onClick={() => {
+                          setShowNewMenu(false);
+                          pickFolder();
+                        }}
+                        className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
+                      >
+                        <FolderOpenIcon className="h-4 w-4 text-stone-500" aria-hidden />
+                        Open folder…
+                      </button>
+                      <button
+                        type="button"
+                        data-testid="local-new-from-repo"
+                        onClick={() => {
+                          setShowNewMenu(false);
+                          setDialog({ kind: 'clone' });
+                        }}
+                        className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
+                      >
+                        <GithubLogoIcon className="h-4 w-4 text-stone-700" weight="fill" aria-hidden />
+                        Clone from GitHub…
+                      </button>
+                      <button
+                        type="button"
+                        data-testid="local-new-blank"
+                        onClick={() => {
+                          setShowNewMenu(false);
+                          openPack(null);
+                        }}
+                        className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-stone-700 hover:bg-stone-50"
+                      >
+                        <FileIcon className="h-4 w-4 text-stone-500" aria-hidden />
+                        Blank project
+                      </button>
+                    </div>
+                  </>
+                ) : null}
+              </div>
               <nav className="flex flex-row flex-wrap gap-1 sm:flex-col">
                 {VIEWS.filter(({ id }) => id !== 'files' || (launcher?.sharedFiles.length ?? 0) > 0).map(({ id, label, icon: Icon }) => (
                   <button

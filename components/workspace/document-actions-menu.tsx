@@ -6,11 +6,13 @@ import { CheckIcon, DotsThreeIcon, DotsThreeVerticalIcon } from '@phosphor-icons
 import { IconTooltip } from '@/components/collab-bubbles';
 import { AnchoredDropdown, isInFloatingActionMenu } from '@/components/workspace/anchored-dropdown';
 import { FindReplacePanel } from './find-replace';
+import { foldAll, unfoldAll } from '@/lib/tiptap/fold';
 import { setDocStylePreference, useDocStyle } from '@/lib/doc-style';
 import { isMarkdownFile } from '@/lib/sync/policy';
 import { appendPathShareTokenToUrl } from '@/lib/workspace/path-share-token-client';
 import { useApiFetch } from '@/lib/workspace/api-fetch-context';
 import { EDIT_MODE_LABEL, type WorkspaceEditMode } from '@/lib/workspace/edit-mode';
+import { printPage } from '@/lib/desktop';
 
 type DocumentActionsFile = {
   id: string;
@@ -68,6 +70,16 @@ interface DocumentActionsMenuProps {
   onRename?: () => void;
   onDuplicate?: () => void;
   onDelete?: () => void;
+  /** Local (sidecar) projects only: reveal the file on disk in the OS file
+   *  manager (Finder / Explorer). The sidecar owns the disk path, so the
+   *  page wires this to POST /projects/:id/reveal. */
+  onRevealInFinder?: (() => void) | null;
+}
+
+/** "Show in Finder" reads wrong everywhere but macOS. */
+function revealLabel(): string {
+  if (typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform ?? '')) return 'Show in Finder';
+  return 'Show in file manager';
 }
 
 function Item({
@@ -120,6 +132,7 @@ export function DocumentActionsMenu({
   onRename,
   onDuplicate,
   onDelete,
+  onRevealInFinder,
   hidePrint = false,
   findShortcuts = true,
 }: DocumentActionsMenuProps) {
@@ -396,13 +409,23 @@ export function DocumentActionsMenu({
             {!hidePrint ? (
               <Item
                 label="Print"
-                onSelect={() => select(() => typeof window !== 'undefined' && window.print())}
+                onSelect={() => select(() => printPage())}
               />
             ) : null}
             <Item
               label="Find and replace"
               disabled={!liveEditor}
               onSelect={() => select(() => setFindOpen('replace'))}
+            />
+            <Item
+              label="Collapse all"
+              disabled={!liveEditor}
+              onSelect={() => select(() => liveEditor && foldAll(liveEditor))}
+            />
+            <Item
+              label="Expand all"
+              disabled={!liveEditor}
+              onSelect={() => select(() => liveEditor && unfoldAll(liveEditor))}
             />
             {fileUrl ? (
               // Share now opens the share modal directly, and that modal's
@@ -415,6 +438,9 @@ export function DocumentActionsMenu({
                   setOpen(false);
                 }}
               />
+            ) : null}
+            {onRevealInFinder ? (
+              <Item label={revealLabel()} onSelect={() => select(onRevealInFinder)} />
             ) : null}
             {canDuplicate || canRename || canDelete ? (
               <div className="my-1 border-t border-stone-200" />

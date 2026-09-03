@@ -220,6 +220,20 @@ export function openTab(panes: EditorPane[], paneId: string, path: string): Edit
   return replacePane(panes, index, { ...pane, tabs, active: path });
 }
 
+/** Open a temporary utility immediately before the pane's current tab. The
+ * close rule selects the tab that falls into the removed tab's index, so this
+ * preserves the exact surface the utility covered even when it was not last. */
+export function openOverlayTab(panes: EditorPane[], paneId: string, tab: string): EditorPane[] {
+  const index = panes.findIndex((pane) => pane.id === paneId);
+  if (index === -1 || !tab) return panes;
+  const pane = panes[index];
+  if (pane.active === tab) return panes;
+  const tabs = pane.tabs.filter((entry) => entry !== tab);
+  const activeIndex = tabs.indexOf(pane.active);
+  tabs.splice(activeIndex === -1 ? tabs.length : activeIndex, 0, tab);
+  return replacePane(panes, index, { ...pane, tabs, active: tab });
+}
+
 /**
  * Open a path in the pane beside the primary, creating the split when needed.
  * Reuses the first secondary pane so repeated "Open to the side" doesn't stack
@@ -459,6 +473,28 @@ export function remapPanePaths(panes: EditorPane[], from: string, to: string): E
     return { ...pane, tabs, active };
   });
   return changed ? next : panes;
+}
+
+/** Diff a fresh files list against the last known id→path map. Ids are stable
+ *  across renames/moves, so every id that resurfaced at a NEW path while its
+ *  old path is gone from the list is a remote rename the open surfaces should
+ *  follow (via remapPanePaths / remapPath) instead of dropping the view.
+ *  A path that still exists (copy-like refresh artifacts) is never a remap. */
+export function diffRemoteRenames(
+  prevPathById: ReadonlyMap<string, string>,
+  files: ReadonlyArray<{ id: string; path: string }>,
+): { remaps: Array<{ from: string; to: string }>; nextPathById: Map<string, string> } {
+  const nextPathById = new Map<string, string>();
+  const currentPaths = new Set(files.map((file) => file.path));
+  const remaps: Array<{ from: string; to: string }> = [];
+  for (const file of files) {
+    nextPathById.set(file.id, file.path);
+    const before = prevPathById.get(file.id);
+    if (before && before !== file.path && !currentPaths.has(before)) {
+      remaps.push({ from: before, to: file.path });
+    }
+  }
+  return { remaps, nextPathById };
 }
 
 export type RemovePathsResult = CloseTabResult;

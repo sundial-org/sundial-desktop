@@ -21,7 +21,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { generateReadableKey, isValidAnonId } from '../lib/auth/anon-identity.ts';
-import { fileKind, isIgnoredPath } from './paths.mjs';
+import { fileKindForFile, isIgnoredPath } from './paths.mjs';
 
 /** Seeded into a CREATE from a folder with nothing syncable, so the first
  *  compile (and the landing prompt's "compile the tex file") always has a
@@ -50,7 +50,7 @@ export function folderHasSyncableFile(root, rel = '') {
     if (isIgnoredPath(childRel)) continue;
     if (entry.isDirectory()) {
       if (folderHasSyncableFile(root, childRel)) return true;
-    } else if (entry.isFile() && fileKind(childRel)) {
+    } else if (entry.isFile() && fileKindForFile(childRel)) {
       return true;
     }
   }
@@ -147,7 +147,10 @@ export function parseWorkspaceRef(ref) {
 /**
  * Ensure `folder` is registered, shared (whole-project scope), and carrying a
  * fresh sync token. Idempotent: an existing share only gets its token
- * refreshed. Returns `{ url, workspaceId, projectId, anon }`. Token refresh is
+ * refreshed. Returns `{ url, workspaceId, projectId, anon, token }` — `token`
+ * is the share's edit-capable rail credential on the public HTTP rail. An MCP
+ * attach deliberately omits it so no durable credential enters the agent
+ * transcript. Token refresh is
  * owned by the daemon (refreshAnonShares), not by this call.
  *
  * `workspace` (optional) ATTACHES the folder to an EXISTING workspace instead
@@ -158,11 +161,27 @@ export function parseWorkspaceRef(ref) {
  * bridge's normal first-sync semantics produce the union of both sides —
  * local-only files upload, workspace-only files download, same-path
  * conflicts keep the local version (the cloud copy stays in the workspace's
- * history). No new modes, no flags.
+ * history).
+ *
+ * `mcpGrant` is the hosted connector's five-minute, one-use handoff. The
+ * cloud exchanges it directly for this one workspace's sync credentials;
+ * unlike a keyless `workspace` attach it never reads or changes this
+ * machine's account-wide agent credentials.
  */
-export async function runHeadlessShare({ localOrigin, localToken, app, folder, home, workspace = /** @type {string | null} */ (null) }) {
+export async function runHeadlessShare({
+  localOrigin,
+  localToken,
+  app,
+  folder,
+  home,
+  workspace = /** @type {string | null} */ (null),
+  mcpGrant = /** @type {string | null} */ (null),
+}) {
   const root = path.resolve(folder);
-  const anon = ensureAnonIdentity(home);
+  if (workspace && mcpGrant) throw new Error('use either --workspace or --mcp-grant, not both');
+  // MCP has its own workspace-scoped identity. Do not mint an unrelated anon
+  // owner merely because this install has never used the HTTP rail.
+  const anon = mcpGrant ? readAnonIdentity(home) : ensureAnonIdentity(home);
   const ref = workspace ? parseWorkspaceRef(workspace) : null;
   // The identity that owns the target workspace, a three-step ladder: the
   // ref's explicit key wins; a keyless attach uses the signed-in account;
@@ -187,6 +206,51 @@ export async function runHeadlessShare({ localOrigin, localToken, app, folder, h
   // `enabled`, so test truthiness, never `!== false`.
   const projectScope = shares.find((share) => share.scope_kind === 'project' && share.enabled);
   const reuseBacking = projectScope?.workspace_id ?? shares.find((share) => share.enabled)?.workspace_id ?? null;
+
+  if (mcpGrant) {
+    const claim = await api(app, '/api/workspace/local-agent/sync-attach', {
+      method: 'POST',
+      body: { grant: mcpGrant },
+    });
+    if (
+      typeof claim?.workspaceId !== 'string' ||
+      typeof claim?.workspaceUrl !== 'string' ||
+      typeof claim?.collabUrl !== 'string' ||
+      typeof claim?.token !== 'string' ||
+      typeof claim?.refreshCredential !== 'string'
+    ) {
+      throw new Error('MCP sync handoff returned incomplete workspace credentials');
+    }
+    // A local project has one cloud twin per deployment. Never let a fresh
+    // grant silently rewire an already-synced folder to another workspace.
+    if (reuseBacking && reuseBacking !== claim.workspaceId) {
+      throw new Error(
+        `this folder already syncs to workspace ${reuseBacking}. Stop that share first to attach it elsewhere.`,
+      );
+    }
+    await api(localOrigin, `/projects/${project.id}/shares`, {
+      method: 'POST',
+      token: localToken,
+      body: {
+        grants: true,
+        workspaceId: claim.workspaceId,
+        collabUrl: claim.collabUrl,
+        apiOrigin: app,
+        token: claim.token,
+        scopeKind: 'project',
+        scopePath: '',
+        mintKind: 'mcp',
+        refreshCredential: claim.refreshCredential,
+      },
+    });
+    return {
+      url: claim.workspaceUrl,
+      workspaceId: claim.workspaceId,
+      projectId: project.id,
+      anon: null,
+      mcp: true,
+    };
+  }
 
   if (projectScope) {
     // Already whole-project shared: just refresh its token, presenting the
@@ -226,6 +290,7 @@ export async function runHeadlessShare({ localOrigin, localToken, app, folder, h
       workspaceId: projectScope.workspace_id,
       projectId: project.id,
       anon: keptKey,
+      token: join.token,
     };
   }
 
@@ -284,6 +349,7 @@ export async function runHeadlessShare({ localOrigin, localToken, app, folder, h
     workspaceId: join.workspaceId ?? workspaceId,
     projectId: project.id,
     anon: shareKey,
+    token: join.token,
   };
 }
 
@@ -363,6 +429,27 @@ export async function refreshAnonShares({ localOrigin, localToken, app, home, lo
       // signed-in account for mint_kind 'user', an attached owner key for
       // mint_key. A share with none has no headless owner here.
       let auth = null;
+      if (share.mint_kind === 'mcp') {
+        try {
+          // The local server holds the durable credential and presents it
+          // directly to its issuing deployment; it is never returned here.
+          await api(localOrigin, `/projects/${project.id}/shares/${share.share_id ?? share.id}/token`, {
+            method: 'POST',
+            token: localToken,
+            body: { refresh: true },
+          });
+        } catch (error) {
+          if (error?.status === 401 || error?.status === 403) {
+            log(
+              `[sundial-local] refresh: access to ${share.workspace_id} was revoked; ` +
+                'this folder is parked until you reconnect it from Sundial',
+            );
+          } else {
+            log(`[sundial-local] refresh failed for ${share.workspace_id}: ${error?.message}`);
+          }
+        }
+        continue;
+      }
       if (share.mint_kind === 'user') {
         if (userToken === undefined) userToken = await readUserCredentials(localOrigin, localToken, app);
         if (!userToken) {

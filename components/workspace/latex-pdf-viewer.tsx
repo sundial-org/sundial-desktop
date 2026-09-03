@@ -5,6 +5,7 @@ import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/TextLayer.css';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import {
+  ArrowsDownUpIcon,
   CaretLeftIcon,
   CaretRightIcon,
   ArrowSquareOutIcon,
@@ -14,7 +15,7 @@ import {
 } from '@phosphor-icons/react';
 import { Spinner } from '@/components/ui/spinner';
 import { LATEX_ICON_BTN, LATEX_PANE_HEADER_CLASS } from '@/components/workspace/latex-workbench';
-import type { SyncTexForwardHit, SyncTexIndex } from '@/lib/latex/synctex';
+import type { SyncTexForwardHit, SyncTexIndex, SyncTexSpan } from '@/lib/latex/synctex';
 
 // PDF.js viewer that replaces the old browser <iframe> preview (spec W1.pdfjs).
 // A real text layer (selectable text + SyncTeX anchors), continuous page
@@ -47,8 +48,17 @@ export type PdfCommentSelection = {
   xPt: number;
   yPt: number;
 };
+/** A thread's rendered material, highlighted over the page (SyncTeX spans). */
+export type PdfCommentHighlight = {
+  id: string;
+  rects: SyncTexSpan[];
+  active?: boolean;
+};
 // Marker pins stacked on one line would cover each other — spread them.
 const MARKER_MIN_GAP_PX = 22;
+// Highlight box around a span's baseline: ascent above, a little descent below.
+const HIGHLIGHT_ASCENT_PT = 9;
+const HIGHLIGHT_HEIGHT_PT = 12;
 // Height (PDF pt) of the forward-search flash bar, roughly one text line.
 const FLASH_HEIGHT_PT = 14;
 const FLASH_MS = 1500;
@@ -108,8 +118,10 @@ interface LatexPdfViewerProps {
   stateKey?: string;
   /** Parsed SyncTeX index for click-to-source; null disables the gestures. */
   synctex?: SyncTexIndex | null;
-  /** Inverse search: a PDF double-click resolved to a source file + line. */
-  onInverseSearch?: (file: string, line: number) => void;
+  /** Inverse search: a PDF double-click resolved to a source file + line.
+   *  `word` is the text the double-click selected in the PDF's text layer —
+   *  the host uses it to snap the jump to the exact word in the source. */
+  onInverseSearch?: (file: string, line: number, word?: string) => void;
   /** Forward search: scroll to + flash this page point whenever it changes. */
   jumpTarget?: SyncTexJump | null;
   /** Leading header cluster (Overleaf-style: Recompile + view switcher). The
@@ -125,6 +137,17 @@ interface LatexPdfViewerProps {
   onViewerReady?: (ready: boolean) => void;
   /** Comment pins to project onto the pages (pdf_comments_enabled). */
   commentMarkers?: PdfCommentMarker[] | null;
+  /** Highlight rectangles over each thread's commented words. */
+  commentHighlights?: PdfCommentHighlight[] | null;
+  /** Continuous scroll sync: debounced report of the viewport-top position
+   *  (page + PDF pt) as the reader scrolls; silent while a follow lands. */
+  onViewportScroll?: (pos: { page: number; yPt: number }) => void;
+  /** The editor scrolled — put this page point near the viewport top, with no
+   *  flash and no smooth animation (it fires continuously). */
+  followTarget?: SyncTexJump | null;
+  /** Renders the scroll-sync toggle in the header when provided. */
+  scrollSyncEnabled?: boolean;
+  onToggleScrollSync?: () => void;
   /** A comment pin was clicked — the host selects that thread in the lane. */
   onMarkerClick?: (threadId: string) => void;
   /** Text was selected and "Comment" clicked — the host anchors it in source.
@@ -157,6 +180,7 @@ const PdfPageSlot = memo(function PdfPageSlot({
   painted,
   flashStyle,
   markers,
+  highlightRects,
   onDoubleClick,
   onMarkerClick,
   onPageLoad,
@@ -172,6 +196,7 @@ const PdfPageSlot = memo(function PdfPageSlot({
   painted: boolean;
   flashStyle: CSSProperties | null;
   markers: Array<{ id: string; top: number; active: boolean }> | null;
+  highlightRects: Array<{ key: string; active: boolean; left: number; top: number; width: number; height: number }> | null;
   onDoubleClick: ((page: number, event: React.MouseEvent<HTMLDivElement>) => void) | null;
   onMarkerClick: ((threadId: string) => void) | null;
   onPageLoad: (page: number, dims: { originalWidth: number; originalHeight: number }) => void;
@@ -244,6 +269,19 @@ const PdfPageSlot = memo(function PdfPageSlot({
           style={flashStyle}
         />
       ) : null}
+      {highlightRects?.map((rect) => (
+        // Commented material, tinted like the editor's comment ranges. Never
+        // intercepts the pointer: text selection under it keeps working.
+        <div
+          key={rect.key}
+          data-testid={`pdf-comment-highlight-${rect.key}`}
+          aria-hidden
+          className={`pointer-events-none absolute z-[5] rounded-[2px] ${
+            rect.active ? 'bg-amber-400/45' : 'bg-amber-300/30'
+          }`}
+          style={{ left: rect.left, top: rect.top, width: rect.width, height: rect.height }}
+        />
+      ))}
       {markers?.map((marker) => (
         // Comment pin at the page's right edge, level with its source line's
         // projected position (same pt→px basis as the flash bar).
@@ -279,8 +317,13 @@ export function LatexPdfViewer({
   headerCut = false,
   onViewerReady,
   commentMarkers,
+  commentHighlights,
   onMarkerClick,
   onCommentSelection,
+  onViewportScroll,
+  followTarget,
+  scrollSyncEnabled,
+  onToggleScrollSync,
 }: LatexPdfViewerProps) {
   const [savedState] = useState(() => (stateKey ? viewerStateCache.get(stateKey) : undefined));
   const [numPages, setNumPages] = useState(0);
@@ -437,6 +480,18 @@ export function LatexPdfViewer({
     el.scrollTop = (el.scrollTop + anchorY) * (baseWidth / prev) - anchorY;
   }, [baseWidth]);
 
+  // Continuous scroll sync plumbing: latest callback/geometry in refs so the
+  // stable scroll handler can read them; a suppression window so an applied
+  // follow (or one just sent) doesn't echo back and forth between panes.
+  const onViewportScrollRef = useRef(onViewportScroll);
+  onViewportScrollRef.current = onViewportScroll;
+  const pageWidthRef = useRef(0);
+  const followSuppressUntilRef = useRef(0);
+  const viewportReportTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (viewportReportTimerRef.current) clearTimeout(viewportReportTimerRef.current);
+  }, []);
+
   // Track which page is centered in the viewport so the page counter and
   // prev/next jumps stay in sync with free scrolling.
   const handleScroll = useCallback(() => {
@@ -468,6 +523,36 @@ export function LatexPdfViewer({
     // Only commit when a real page was measured — a scroll event that fires
     // before any page has mounted must not reset the counter to page 1.
     if (Number.isFinite(nearestDistance)) setCurrentPage(nearest);
+    // Scroll-sync report (debounced): the page point sitting at the viewport
+    // top, for the host to inverse-map into the editor. Quiet while a follow
+    // from the editor side is landing, or the panes would chase each other.
+    if (onViewportScrollRef.current && Date.now() >= followSuppressUntilRef.current) {
+      if (viewportReportTimerRef.current) clearTimeout(viewportReportTimerRef.current);
+      viewportReportTimerRef.current = setTimeout(() => {
+        viewportReportTimerRef.current = null;
+        const report = onViewportScrollRef.current;
+        const el = scrollRef.current;
+        const pw = pageWidthRef.current;
+        if (!report || !el || pw <= 0) return;
+        if (Date.now() < followSuppressUntilRef.current) return;
+        const preview = zoomPreviewRef.current;
+        const probe = el.scrollTop + 8;
+        let found: { page: number; yPx: number } | null = null;
+        for (let index = 0; index < pageRefs.current.length && !found; index++) {
+          const node = pageRefs.current[index];
+          if (!node) continue;
+          const top = node.offsetTop * preview;
+          const height = node.offsetHeight * preview;
+          if (probe >= top && probe < top + height) {
+            found = { page: index + 1, yPx: (probe - top) / preview - VERTICAL_PADDING / 2 };
+          }
+        }
+        if (!found) return;
+        const dims = pageDimsRef.current.get(found.page) ?? pageDimsRef.current.get(1);
+        if (!dims || dims.width <= 0) return;
+        report({ page: found.page, yPt: Math.max(0, (found.yPx * dims.width) / pw) });
+      }, 120);
+    }
   }, []);
 
   const onDocumentLoad = useCallback(({ numPages: count }: { numPages: number }) => {
@@ -551,7 +636,12 @@ export function LatexPdfViewer({
       const xPt = (event.clientX - rect.left) * ptPerPx;
       const yPt = (event.clientY - rect.top) * ptPerPx;
       const hit = synctex.inverse(page, xPt, yPt);
-      if (hit) onInverseSearch(hit.file, hit.line);
+      if (!hit) return;
+      // The double-click just word-selected in the text layer — that word is
+      // ground truth the SyncTeX line map doesn't have (e.g. the title's
+      // records all point at \maketitle, not \title{...}).
+      const word = window.getSelection()?.toString().trim() || undefined;
+      onInverseSearch(hit.file, hit.line, word);
     },
     [synctex, onInverseSearch],
   );
@@ -662,6 +752,27 @@ export function LatexPdfViewer({
     if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
   }, []);
 
+  // Continuous follow (editor scrolled): place the target near the viewport
+  // top instantly — no flash, no smooth animation (it fires per scroll pause),
+  // and no viewport report for a beat so the panes don't ping-pong.
+  const followConsumedRef = useRef<SyncTexJump | null>(null);
+  useEffect(() => {
+    const target = followTarget;
+    if (!target || target === followConsumedRef.current) return;
+    const container = scrollRef.current;
+    const inner = pageRefs.current[target.page - 1];
+    const dims = pageDimsRef.current.get(target.page) ?? pageDimsRef.current.get(1);
+    const pw = pageWidthRef.current;
+    if (!container || !inner || !dims || dims.width <= 0 || pw <= 0) return;
+    followConsumedRef.current = target;
+    const pxPerPt = pw / dims.width;
+    const top =
+      (inner.offsetTop + VERTICAL_PADDING / 2 + target.y * pxPerPt - 24) * zoomPreviewRef.current;
+    followSuppressUntilRef.current = Date.now() + 400;
+    cancelScrollRestore();
+    container.scrollTop = Math.max(0, top);
+  }, [followTarget, numPages, dimsVersion, cancelScrollRestore]);
+
   // Ctrl/Cmd + wheel zooms (Overleaf gesture); plain wheel scrolls natively.
   // Attached as a non-passive native listener so preventDefault actually
   // suppresses the browser's page-zoom — React's onWheel is passive.
@@ -749,6 +860,7 @@ export function LatexPdfViewer({
   }, [numPages, renderWidth]);
 
   const pageWidth = renderWidth > 0 ? renderWidth * renderScale : undefined;
+  pageWidthRef.current = pageWidth ?? 0;
   // Combined CSS preview: zoom gestures scale by scale/renderScale, resizes by
   // baseWidth/renderWidth — both collapse to 1 once the settle commits.
   const zoomPreview = (scale / renderScale) * (renderWidth > 0 ? baseWidth / renderWidth : 1);
@@ -822,6 +934,38 @@ export function LatexPdfViewer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [commentMarkers, pageWidth, dimsVersion]);
 
+  // Same pt→px projection for the highlight rectangles over commented words.
+  const highlightsByPage = useMemo(() => {
+    if (!commentHighlights?.length || !pageWidth) return null;
+    const byPage = new Map<
+      number,
+      Array<{ key: string; active: boolean; left: number; top: number; width: number; height: number }>
+    >();
+    for (const highlight of commentHighlights) {
+      for (let i = 0; i < highlight.rects.length; i++) {
+        const rect = highlight.rects[i];
+        const dims = pageDimsRef.current.get(rect.page) ?? pageDimsRef.current.get(1);
+        const pxPerPt = pageWidth / (dims?.width || 612);
+        let list = byPage.get(rect.page);
+        if (!list) {
+          list = [];
+          byPage.set(rect.page, list);
+        }
+        list.push({
+          key: `${highlight.id}:${i}`,
+          active: Boolean(highlight.active),
+          left: HORIZONTAL_PADDING / 2 + rect.x * pxPerPt,
+          top: VERTICAL_PADDING / 2 + (rect.y - HIGHLIGHT_ASCENT_PT) * pxPerPt,
+          width: rect.w * pxPerPt,
+          height: HIGHLIGHT_HEIGHT_PT * pxPerPt,
+        });
+      }
+    }
+    return byPage;
+    // dimsVersion re-derives once pages report real PDF-point dimensions.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [commentHighlights, pageWidth, dimsVersion]);
+
   const pages = useMemo(
     () =>
       Array.from({ length: numPages }, (_, index) => {
@@ -852,6 +996,7 @@ export function LatexPdfViewer({
                 : null
             }
             markers={markersByPage?.get(page) ?? null}
+            highlightRects={highlightsByPage?.get(page) ?? null}
             onDoubleClick={onInverseSearch ? handlePageDoubleClick : null}
             onMarkerClick={onMarkerClick ?? null}
             onPageLoad={reportPageDims}
@@ -863,7 +1008,7 @@ export function LatexPdfViewer({
     // dimsVersion re-derives the min-heights when a page reports new geometry;
     // currentPage slides the render window as the reader scrolls. Slots are
     // memoized, so only pages whose props actually changed re-render.
-    [numPages, pageWidth, fileUrl, onInverseSearch, handlePageDoubleClick, pageHeightPx, dimsVersion, currentPage, paintVersion, flash, markersByPage, onMarkerClick, reportPageDims, markPagePainted, registerPageRef],
+    [numPages, pageWidth, fileUrl, onInverseSearch, handlePageDoubleClick, pageHeightPx, dimsVersion, currentPage, paintVersion, flash, markersByPage, highlightsByPage, onMarkerClick, reportPageDims, markPagePainted, registerPageRef],
   );
 
   // While <Document> reloads after a recompile it renders this fallback instead
@@ -970,6 +1115,19 @@ export function LatexPdfViewer({
             <MagnifyingGlassPlusIcon className="h-4 w-4" weight="regular" aria-hidden />
           </button>
         );
+        const syncToggle = onToggleScrollSync ? (
+          <button
+            type="button"
+            data-testid="pdf-scroll-sync-toggle"
+            className={`${ICON_BTN} ${scrollSyncEnabled ? 'bg-stone-200/70 !text-stone-900' : ''}`}
+            onClick={onToggleScrollSync}
+            aria-pressed={scrollSyncEnabled}
+            title={scrollSyncEnabled ? 'Scroll sync on: panes follow each other' : 'Scroll sync off'}
+            aria-label="Toggle scroll sync with the source"
+          >
+            <ArrowsDownUpIcon className="h-4 w-4" weight="regular" aria-hidden />
+          </button>
+        ) : null;
         const openLink = (withLabel: boolean) => (
           <a
             href={`${fileUrl}#view=FitH&zoom=page-width`}
@@ -999,6 +1157,7 @@ export function LatexPdfViewer({
               <>
                 <div className="flex min-w-0 items-center">{resolvedHeaderLeft}</div>
                 <div className="ml-auto flex shrink-0 items-center gap-0.5">
+                  {wide(440) ? syncToggle : null}
                   {wide(400) ? pageNav : null}
                   {wide(520) ? zoomOut : null}
                   {wide(340) ? fitLabel : null}

@@ -35,6 +35,7 @@ export function ProjectSidebar({
   onNewSchedule,
   chatsCollapsed,
   onToggleChats,
+  assistants,
   syncPanel,
   support,
   openWith,
@@ -45,7 +46,7 @@ export function ProjectSidebar({
   filesPanel: ReactNode;
   chatRail: ReactNode;
   /** Starts a fresh chat — fired by the Chats header ＋ and the list's
-   *  "New chat" row. (Connect local agent moved to the ⌘T new-tab page.) */
+   *  "New chat" row. (External handoff lives in the unified Open with… flow.) */
   onNewChat?: () => void;
   canStartChat?: boolean;
   /** Opens the Schedules panel (list) — the calendar icon left of the Chats
@@ -59,6 +60,8 @@ export function ProjectSidebar({
    *  header row, so the list never disappears entirely. */
   chatsCollapsed?: boolean;
   onToggleChats?: () => void;
+  /** Assistants entry (flag-gated), docked directly above the chats box. */
+  assistants?: ReactNode;
   syncPanel?: ReactNode;
   /** Account-level support entry, docked immediately above Open with. */
   support?: ReactNode;
@@ -203,6 +206,15 @@ export function ProjectSidebar({
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="flex min-h-full flex-col">{filesPanel}</div>
       </div>
+
+      {/* Assistants (flag-gated) sit directly above the chats box: the
+          assistant serves the agent conversation, so its section lives with
+          it. Full-bleed: the section brings its own header, like Chats. */}
+      {assistants ? (
+        <div data-testid="assistants-slot" className="max-h-[45%] shrink-0 overflow-y-auto border-t border-stone-200 empty:hidden">
+          {assistants}
+        </div>
+      ) : null}
 
       {/* …and chats keep their OWN bounded box at the rail's bottom, scrolling
           internally. They used to share the files scroll region, which meant a

@@ -2,9 +2,27 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
-import { fileKind, isIgnoredPath, normalizeRelPath, resolveInRoot } from './paths.mjs';
+import { fileKindForFile, isIgnoredPath, normalizeRelPath, resolveInRoot } from './paths.mjs';
 
 export const MAX_TEXT_BYTES = 10 * 1024 * 1024;
+
+const versionForStat = (stat) => `${stat.mtimeNs}:${stat.ctimeNs}:${stat.size}`;
+const identityForStat = (stat) => `${stat.dev}:${stat.ino}:${stat.mtimeNs}:${stat.size}`;
+
+export function fileFingerprintSync(root, relPath) {
+  const abs = resolveInRoot(root, relPath);
+  if (!abs) return null;
+  try {
+    const stat = fs.statSync(abs, { bigint: true });
+    return { version: versionForStat(stat), identity: identityForStat(stat) };
+  } catch {
+    return null;
+  }
+}
+
+export function fileVersionSync(root, relPath) {
+  return fileFingerprintSync(root, relPath)?.version ?? null;
+}
 
 /** Symlink-safe resolution: `resolveInRoot` is lexical, so a symlink inside
  *  the project (`link -> ~/Documents`) would pass the prefix check while the
@@ -83,8 +101,7 @@ export async function walkProject(root, { onDir } = {}) {
         return;
       }
       if (!entry.isFile()) return;
-      const kind = fileKind(rel);
-      if (!kind) return;
+      const kind = fileKindForFile(rel);
       const stat = await fsp.stat(abs).catch(() => null);
       if (!stat) return;
       files.push({
@@ -173,6 +190,16 @@ export async function writeTextFileAtomic(root, relPath, text) {
   // scripts, restrictive perms) onto the new one.
   if (previous) await fsp.chmod(tmp, previous.mode & 0o7777).catch(() => {});
   await fsp.rename(tmp, abs);
+  return abs;
+}
+
+/** Materialize a cloud-side empty text file without replacing a local file
+ *  created after the caller's existence check. */
+export async function createEmptyTextFileExclusive(root, relPath) {
+  const abs = await safeResolveInRoot(root, relPath);
+  await fsp.mkdir(path.dirname(abs), { recursive: true });
+  const handle = await fsp.open(abs, 'wx');
+  await handle.close();
   return abs;
 }
 
@@ -281,19 +308,28 @@ export async function renameFile(root, fromRel, toRel) {
 /** Delete a file, or a folder's NON-IGNORED contents: nested repos/caches
  *  (.git, node_modules, …) survive a tree delete — the ignore policy exists
  *  precisely to keep sync/API operations away from them. The folder itself is
- *  removed only when nothing protected remains inside. */
+ *  removed only when nothing protected remains inside.
+ *
+ *  Returns the ignored entries that survived, root-relative. A folder holding
+ *  one is still on disk afterwards and comes straight back in the next
+ *  listing, so the caller must say so rather than report a clean delete
+ *  ("deleted a cloned repo, some files stayed" — Discord). */
 export async function deleteFile(root, relPath) {
   const abs = await safeResolveInRoot(root, relPath);
   const stat = await fsp.lstat(abs).catch(() => null);
-  if (!stat) return;
+  if (!stat) return { kept: [] };
   if (!stat.isDirectory()) {
     await fsp.rm(abs, { force: true });
-    return;
+    return { kept: [] };
   }
+  const kept = [];
   const prune = async (dirAbs, dirRel) => {
     for (const entry of await fsp.readdir(dirAbs, { withFileTypes: true })) {
       const rel = `${dirRel}/${entry.name}`;
-      if (isIgnoredPath(rel)) continue;
+      if (isIgnoredPath(rel)) {
+        kept.push(rel);
+        continue;
+      }
       const entryAbs = path.join(dirAbs, entry.name);
       if (entry.isDirectory() && !entry.isSymbolicLink()) await prune(entryAbs, rel);
       else await fsp.rm(entryAbs, { force: true });
@@ -301,10 +337,11 @@ export async function deleteFile(root, relPath) {
     await fsp.rmdir(dirAbs).catch(() => {}); // stays if protected content remains
   };
   await prune(abs, relPath);
+  return { kept };
 }
 
 /** True when deleting `relPath` would also remove content the file listing
- *  never showed — unknown-extension files (fileKind null) or symlinks.
+ *  never showed — symlinks only, now that every regular file classifies.
  *  Undo-delete can only rebuild tracked files, so such deletes must not be
  *  advertised as undoable. Ignored paths don't count: deleteFile preserves
  *  them. Never follows symlinks. */
@@ -314,7 +351,7 @@ export async function hasUntrackedContent(root, relPath) {
     const stat = await fsp.lstat(entryAbs).catch(() => null);
     if (!stat) return false;
     if (stat.isSymbolicLink()) return true;
-    if (!stat.isDirectory()) return fileKind(rel) === null;
+    if (!stat.isDirectory()) return false;
     for (const entry of await fsp.readdir(entryAbs, { withFileTypes: true }).catch(() => [])) {
       const childRel = `${rel}/${entry.name}`;
       if (isIgnoredPath(childRel)) continue;

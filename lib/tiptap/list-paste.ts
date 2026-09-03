@@ -7,28 +7,31 @@ import type { EditorView } from '@tiptap/pm/view';
 const LISTS = new Set(['bulletList', 'orderedList']);
 
 /**
- * Pasting several list lines at the END of a bullet that HAS a sub-list used to
- * hand that sub-list to the pasted content.
+ * Pasting list lines at the END of a bullet used to produce two wrong shapes,
+ * both from ProseMirror fitting a pasted list into a list caret on its own:
  *
- * ProseMirror splits the target item at the caret, and everything after the
- * caret inside the item — which is the whole sub-list — belongs to the second
- * half. The last pasted item becomes that second half, so `- parent` with
- * children `task`/`bullet` turned into `- parenttask`, then `- bullet` OWNING
- * the two children. Read as flat text the result is defensible; read as the
- * outline the user is looking at, a subtree silently moved under content that
- * was just pasted.
+ * 1. Handing the target's sub-list to the pasted content. ProseMirror splits
+ *    the target item at the caret, and everything after the caret inside the
+ *    item — the whole sub-list — belongs to the second half, which the last
+ *    pasted item becomes. `- parent` with children `task`/`bullet` turned into
+ *    `- parenttask`, then `- bullet` OWNING the two children: a subtree silently
+ *    moved under content that was just pasted.
+ * 2. Moving one bullet. Cutting a whole bullet line captures the line's item
+ *    plus a trailing EMPTY item (`<ul><li><p>cut</p></li><li></li></ul>`), so a
+ *    paste left a stray empty bullet, and the empty item's fitting could sink
+ *    the pasted line (and the sibling below it) into a new nested list under
+ *    that empty bullet — the "why did it nest?" report.
  *
  * So place it explicitly instead: the first pasted line merges into the caret's
- * line, and the rest become that line's following SIBLINGS. Nothing that was
- * already in the document moves, and it matches what already happens when the
- * target has no children — the case ProseMirror gets right — so the rule is the
- * same either way.
+ * line, and the rest become that line's following SIBLINGS at the SAME level.
+ * Nothing already in the document moves, and a trailing empty item — the
+ * drag-cut artifact — is dropped rather than pasted as an empty bullet.
  *
  * Deliberately narrow. It only fires for a collapsed caret at the end of a list
- * line whose item has a sub-list, when the clipboard is a plain list of lines.
- * Everything else — a range selection, a caret mid-line, a target with no
- * children, a nested-item paste, non-list content — returns false and takes
- * ProseMirror's normal path.
+ * line when the clipboard's top node is a plain list of textblock lines.
+ * Everything else — a range selection, a caret mid-line, a bare single-line
+ * copy (top node is a paragraph, which ProseMirror already merges inline),
+ * non-list content — returns false and takes ProseMirror's normal path.
  */
 export const ListPaste = Extension.create({
   name: 'listPaste',
@@ -66,12 +69,15 @@ export function pasteListBesideChildren(view: EditorView, slice: Slice): boolean
   if ($from.parent.type.name !== 'paragraph') return false;
   if ($from.parentOffset !== $from.parent.content.size) return false;
   const item = $from.node(-1);
-  // Only an item that owns something after its paragraph can have it stolen.
-  if (item.type.name !== 'listItem' || item.childCount < 2) return false;
+  if (item.type.name !== 'listItem') return false;
 
   const list = soleListNode(slice.content);
-  if (!list || list.childCount < 2) return false;
-  const [first, ...rest] = listItemsOf(list);
+  if (!list) return false;
+  // Drop a trailing empty line: cutting a whole bullet captures the line's item
+  // plus an empty one, and pasting that empty item is what left a stray bullet.
+  const items = withoutTrailingEmpty(listItemsOf(list));
+  if (items.length === 0) return false;
+  const [first, ...rest] = items;
   // A first line that carries its own sub-list is not "one line to merge".
   if (!first || first.childCount !== 1 || !first.firstChild?.isTextblock) return false;
 
@@ -105,4 +111,18 @@ function listItemsOf(list: ProseMirrorNode): ProseMirrorNode[] {
     if (child.type.name === 'listItem') items.push(child);
   });
   return items.length === list.childCount ? items : [];
+}
+
+/** An item with no content: no text and no sub-list. A whole-line cut appends
+ * one, and it can parse either as a bare item or as a single empty textblock. */
+function isEmptyLine(item: ProseMirrorNode): boolean {
+  if (item.childCount === 0) return true;
+  return item.childCount === 1 && !!item.firstChild?.isTextblock && item.firstChild.content.size === 0;
+}
+
+/** Trim empty trailing lines — the artifact a whole-line drag-cut appends. */
+function withoutTrailingEmpty(items: ProseMirrorNode[]): ProseMirrorNode[] {
+  let end = items.length;
+  while (end > 0 && isEmptyLine(items[end - 1])) end--;
+  return items.slice(0, end);
 }

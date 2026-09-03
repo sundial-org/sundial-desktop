@@ -12,7 +12,7 @@ export function buildMcpConnectUrl(origin: string, projectId?: string | null) {
 export function buildMcpCliCommands(mcpUrl: string) {
   // Quote the URL — the `?`/`&` trip up zsh/bash without it.
   return {
-    claudeCode: `claude mcp add --transport http sundial "${mcpUrl}"`,
+    claudeCode: `claude mcp add --transport http sundial "${mcpUrl}" && claude mcp login sundial`,
     codex: `codex mcp add sundial --url "${mcpUrl}" && codex mcp login sundial`,
   };
 }

@@ -3,6 +3,7 @@
 import { createContext, useContext } from 'react';
 import type { WorkspaceFileRow } from '@/lib/workspace/types';
 import type { WorkspaceKind } from '@/lib/workspace/kinds';
+import type { WorkspaceLocalSyncStatus } from '@/lib/workspace/local-sync-status';
 import type { ServerTimingEntry } from '@/lib/perf/server-timing';
 
 /** Files + access metadata preloaded during SSR so the client editor can
@@ -19,9 +20,17 @@ export type WorkspaceInitialFilesPayload = {
   canAccessSecrets: boolean;
   // Owner or member row — the roles whose @Agent summons actually start runs.
   isMember?: boolean;
+  /** True only for an owner/editor who may install and invoke assistants. */
+  canManageAssistantActions?: boolean;
   // Free anonymous runs left for this caller (null: signed in, not
   // anon-owned, or not the owner) — mirrors the files GET field.
   anonRunsRemaining?: number | null;
+  /** Whether the SERVER recognized an identity on this request (Clerk cookie
+   *  or `sd_` bearer / loopback sidecar). The only signal that separates a
+   *  server-authed caller from a genuinely anonymous one when
+   *  `anonRunsRemaining` is null — both look identical on that field alone.
+   *  Absent means "not reported": callers must treat it as unknown. */
+  serverAuthed?: boolean;
   /** Path-share grants (always present so the client can trust the field —
    *  an absent array must never CLEAR grants a fetch delivered). */
   pathGrants?: PathGrant[];
@@ -31,10 +40,16 @@ export type WorkspaceInitialFilesPayload = {
   projectTitle: string | null;
   projectStatus: 'active' | 'archived' | null;
   projectKind: WorkspaceKind | null;
+  /** Latest local-folder report for cloud mirrors; absent on older servers. */
+  localSyncStatus?: WorkspaceLocalSyncStatus | null;
   projectCreatedAt?: string | null;
   templateSlug: string | null;
   templateName: string | null;
   templateDefaultAddendum: string | null;
+  /** The assistant's CURRENT instructions (live from the store) — differs
+   *  from the frozen default when the assistant was updated since this
+   *  workspace snapshotted it; drives the settings card's upgrade banner. */
+  templateLatestAddendum: string | null;
   templateAddendumOverride: string | null;
   spaceInstructions: string | null;
 };

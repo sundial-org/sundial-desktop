@@ -1,6 +1,6 @@
 [package]
 name = "sundial-desktop"
-version = "0.1.12"
+version = "0.1.14"
 description = "Sundial desktop wrapper"
 authors = ["Sundial"]
 edition = "2021"
@@ -27,5 +27,8 @@ tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
 serde_json = "1"
 url = "2"
+# The sidecar token and the /redeem nonce: OS CSPRNG, not a hash seed. Already
+# in the tree transitively, so this pulls in nothing new.
+getrandom = "0.3"
 # Only the timer for the periodic update check — tauri's async runtime is tokio.
 tokio = { version = "1", features = ["time"] }

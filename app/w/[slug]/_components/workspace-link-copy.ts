@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { WorkspaceFileRow } from '@/lib/workspace/types';
 import { buildWorkspaceChatPath, buildWorkspaceFilePath } from '@/lib/workspace/paths';
 import { PATH_SHARE_TOKEN_PARAM } from '@/lib/workspace/path-grants';
+import { linkOriginFor } from './workspace-share';
 import { track } from '@/lib/analytics/track';
 
 import type { WorkspaceRouteInput } from '@/lib/workspace/public-ids';
@@ -37,7 +38,7 @@ export function useWorkspaceLinkCopy({
       const suffix = token
         ? `${path.includes('?') ? '&' : '?'}${PATH_SHARE_TOKEN_PARAM}=${token}`
         : '';
-      return `${window.location.origin}${path}${suffix}`;
+      return `${linkOriginFor(path)}${path}${suffix}`;
     },
     [getShareToken],
   );

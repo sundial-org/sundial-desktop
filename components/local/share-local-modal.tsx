@@ -69,8 +69,8 @@ const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /** One calm question before any stop, as a REAL in-app modal — never
  *  window.confirm/alert, which the desktop (Tauri) webview refuses
  *  ("dialog.confirm not allowed. Command not found"), silently skipping the
- *  warning. Copy stays calm: people lose access, no data-retention
- *  narration. */
+ *  warning. Copy stays calm and says what actually happens to the data:
+ *  conversations are deleted from the cloud, file history stays. */
 export function StopShareConfirmDialog({
   open,
   onCancel,
@@ -90,7 +90,10 @@ export function StopShareConfirmDialog({
     >
       <div className="px-5 pt-5 pb-4" data-testid="share-stop-confirm">
         <h2 className="text-base font-semibold text-stone-800">Stop sharing?</h2>
-        <p className="mt-1.5 text-sm text-stone-500">People with the link will lose access.</p>
+        <p className="mt-1.5 text-sm text-stone-500">
+          People with the link will lose access. Shared chats are removed from the cloud; your files and their
+          history are kept.
+        </p>
         <div className="mt-4 flex justify-end gap-2">
           <button
             type="button"

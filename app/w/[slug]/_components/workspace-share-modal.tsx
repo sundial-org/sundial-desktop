@@ -1,7 +1,7 @@
 'use client';
 
 import { useRef, type ReactNode } from 'react';
-import { CheckIcon, CaretDownIcon, GlobeSimpleIcon, LightningIcon, LinkIcon, LockSimpleIcon, XIcon } from '@phosphor-icons/react';
+import { ArrowSquareOutIcon, CheckIcon, CaretDownIcon, GlobeSimpleIcon, LinkIcon, LockSimpleIcon, XIcon } from '@phosphor-icons/react';
 import { IconTooltip, getInitials, pickColor } from '@/components/collab-bubbles';
 import { AnchoredDropdown } from '@/components/workspace/anchored-dropdown';
 import { ModalShell } from '@/components/modal-shell';
@@ -62,7 +62,7 @@ export function WorkspaceShareModal({
   onVisibilityChange,
   onPublicAccessChange,
   onOpenTeamPermissions,
-  onOpenLocalAgent,
+  onOpenWith,
   formatRelativeTime,
 }: {
   open: boolean;
@@ -98,7 +98,8 @@ export function WorkspaceShareModal({
   onVisibilityChange: (visibility: 'private' | 'public') => void | Promise<void>;
   onPublicAccessChange: (publicAccess: PublicAccess) => void | Promise<void>;
   onOpenTeamPermissions: () => void;
-  onOpenLocalAgent?: () => void | Promise<void>;
+  /** Opens the workspace's unified Open with… flow. */
+  onOpenWith?: () => void | Promise<void>;
   formatRelativeTime: (value?: string | null) => string;
 }) {
   // Link-shared = the workspace-root grant exists (tokened or tokenless).
@@ -487,14 +488,14 @@ export function WorkspaceShareModal({
             )}
             {shareBusyAction === 'link-copied' ? 'Copied' : 'Copy link'}
           </button>
-          {onOpenLocalAgent ? (
+          {onOpenWith ? (
             <button
               type="button"
-              onClick={() => void onOpenLocalAgent()}
+              onClick={() => void onOpenWith()}
               className="inline-flex items-center justify-center gap-2 rounded-lg border border-stone-200 px-3 py-2 text-sm text-stone-700 transition-colors hover:bg-stone-50"
             >
-              <LightningIcon className="h-4 w-4" weight="regular" aria-hidden />
-              Connect agent
+              <ArrowSquareOutIcon className="h-4 w-4" weight="regular" aria-hidden />
+              Share with other apps
             </button>
           ) : null}
           {onStopSharing ? (

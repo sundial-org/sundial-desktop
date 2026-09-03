@@ -7,13 +7,26 @@ import { applyContentTextIfChanged, readDocumentText } from '../lib/crdt-js/docu
 import fsp from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 
-import { fileKind, isEnvSecretPath, isIgnoredPath, mimeFor, resolveInRoot, scopeCoversPath, windowsUnwritableReason } from './paths.mjs';
+import { fileKindForFile, isEnvSecretPath, isIgnoredPath, mimeFor, resolveInRoot, scopeCoversPath, windowsUnwritableReason } from './paths.mjs';
 import { inExtraRoot } from './roots.mjs';
 import { syncShareLedger } from './ledger-sync.mjs';
 import { Readable } from 'node:stream';
-import { deleteFile, readTextFile, walkProject, writeBlobStreamAtomic, writeTextFileAtomic } from './disk.mjs';
+import {
+  createEmptyTextFileExclusive,
+  deleteFile,
+  fileFingerprintSync,
+  fileVersionSync,
+  readTextFile,
+  walkProject,
+  writeBlobStreamAtomic,
+} from './disk.mjs';
 import { BRIDGE_ORIGIN } from './doc-host.mjs';
-const MAX_BRIDGED_FILES = 500;
+import { buildSyncProgress, syncSkipReason, SYNC_SKIP_REASONS } from './sync-progress.mjs';
+// Production working-set bound; the override keeps rollover tests small.
+const MAX_BRIDGED_FILES = Math.max(
+  1,
+  Number.parseInt(process.env.SUNDIAL_BRIDGE_MAX_OPEN_FILES || '', 10) || 500,
+);
 const CLOUD_POLL_MS = Number(process.env.SUNDIAL_BRIDGE_POLL_MS || 10_000);
 // Every comment-mirror request is deadline-bounded: comment reads run on the
 // sidecar's /comments REQUEST path, so a wedged backing workspace must
@@ -34,6 +47,11 @@ const BLOB_UPLOAD_CHUNK_BYTES = Number(process.env.SUNDIAL_BRIDGE_BLOB_CHUNK_BYT
 // reopen on local edits, a local editor connecting, or a cloud updated_at
 // change seen by the poll.
 const BRIDGE_IDLE_MS = Number(process.env.SUNDIAL_BRIDGE_IDLE_MS || 60_000);
+const SYNC_PROGRESS_TIMEOUT_MS = Number(process.env.SUNDIAL_SYNC_PROGRESS_TIMEOUT_MS || 4_000);
+const SYNC_PROGRESS_UPDATE_MS = Number(process.env.SUNDIAL_SYNC_PROGRESS_UPDATE_MS || 500);
+const SYNC_PROGRESS_HEARTBEAT_MS = Number(
+  process.env.SUNDIAL_SYNC_PROGRESS_HEARTBEAT_MS || 10_000,
+);
 
 /** Live two-way sync of one local file with its cloud workspace doc.
  *
@@ -54,7 +72,11 @@ class FileBridge {
     this.provider = null;
     this.cloudDoc = null;
     this.cloudSeen = false; // file confirmed present in the cloud listing
+    this.cloudMissingAt = 0; // first absent listing; delete only after watcher settle
+    this.staleEmptyMaterialization = false;
+    this.staleEmptyVersion = null;
     this.stopped = false;
+    this.started = false;
     this.cancelSyncWait = null; // settles a pending waitForSync at stop()
     this.lastActivity = Date.now();
     this.onLocalUpdate = null;
@@ -65,18 +87,28 @@ class FileBridge {
     this.relayedToCloud = new Set(); // local client ids mirrored into the cloud doc
   }
 
-  async start() {
+  async start({ listingStillCurrent = null } = {}) {
     const { docHost, share, store, log } = this.engine;
+    const requireCurrentListing = () => {
+      if (listingStillCurrent && !listingStillCurrent()) {
+        throw Object.assign(new Error(`cloud listing superseded file=${this.localRel}`), {
+          listingSuperseded: true,
+        });
+      }
+    };
+    requireCurrentListing();
     this.direct = await docHost.hocuspocus.openDirectConnection(this.localDocName, {
       actor: 'remote',
       userId: 'cloud-bridge',
     });
+    requireCurrentListing();
     const localDoc = this.direct.document;
     // "Local wins" only applies when a local FILE exists — an empty string is
     // ambiguous between "intentionally empty file" (local wins, even empty)
     // and "no file yet" (a cloud-created file being pulled; cloud wins).
     const localAbs = resolveInRoot(this.engine.project.root, this.localRel);
     const localExists = localAbs ? Boolean(await fsp.stat(localAbs).catch(() => null)) : false;
+    requireCurrentListing();
 
     // stop() during the awaits above found nothing to tear down (provider and
     // sync waiter don't exist yet) — bail before creating them, or a stopped
@@ -96,6 +128,7 @@ class FileBridge {
     this.provider.attach();
     await this.waitForSync();
     if (this.stopped) return;
+    requireCurrentListing();
 
     // Snapshot both sides HERE, in the same synchronous task as the exchange
     // and the divergence reassert below. Reading localTextBefore any earlier
@@ -113,6 +146,8 @@ class FileBridge {
 
     this.onLocalUpdate = (update, origin) => {
       if (origin === BRIDGE_ORIGIN || this.stopped) return;
+      this.staleEmptyMaterialization = false;
+      this.staleEmptyVersion = null;
       this.lastActivity = Date.now();
       Y.applyUpdate(this.cloudDoc, update, BRIDGE_ORIGIN);
     };
@@ -166,7 +201,61 @@ class FileBridge {
       // An empty CLOUD file produces no updates either — materialize it on
       // disk explicitly or it never appears locally. The doc loaded without a
       // disk twin — now that one exists, delete events are live again.
-      await writeTextFileAtomic(this.engine.project.root, this.localRel, '').catch(() => {});
+      requireCurrentListing();
+      try {
+        await createEmptyTextFileExclusive(this.engine.project.root, this.localRel);
+      } catch (error) {
+        if (error?.code === 'EEXIST') {
+          // A local creation won the race after localExists was sampled. Never
+          // replace it with the cloud's empty bytes; restart as local intent so
+          // the new content follows the normal local-wins first-sync path.
+          this.engine.retainLocalIntent(this.localRel);
+          throw Object.assign(new Error(`local file appeared during bridge start file=${this.localRel}`), {
+            localAppearedDuringStart: true,
+          });
+        }
+        throw error;
+      }
+      docHost.watchers.get(this.engine.project.id)?.suppress(this.localRel);
+      await this.engine.refreshProgressLocalPath(this.localRel);
+      this.engine.scheduleProgressPublish();
+      try {
+        requireCurrentListing();
+      } catch (error) {
+        if (!error?.listingSuperseded) throw error;
+        const versionBeforeRead = this.engine.localFileVersion(this.localRel);
+        const disk = await readTextFile(this.engine.project.root, this.localRel).catch(() => null);
+        const versionAfterRead = this.engine.localFileVersion(this.localRel);
+        const ownsEmptyMaterialization =
+          versionBeforeRead !== null &&
+          versionBeforeRead === versionAfterRead &&
+          disk?.text === '' &&
+          !this.engine.pendingResumeOpens.has(this.localRel) &&
+          readDocumentText(this.localRel, localDoc) === '';
+        if (!ownsEmptyMaterialization) {
+          // A local writer filled or replaced the exclusive empty file before
+          // this stale listing was detected. Do not label those real bytes as
+          // bridge-owned: tear this opener down and retry with local intent.
+          this.engine.retainLocalIntent(this.localRel);
+          throw Object.assign(new Error(`local file changed during bridge start file=${this.localRel}`), {
+            localAppearedDuringStart: true,
+          });
+        }
+        // Never check-then-delete here: a local writer can always land after
+        // the check. Keep the live, durable bridge and let the normal two-pass
+        // absent-listing rail remove this unchanged empty materialization. If
+        // a local edit arrives first, the attached relay/persist guards make
+        // that edit win instead.
+        this.cloudSeen = true;
+        this.staleEmptyMaterialization = true;
+        this.staleEmptyVersion = versionAfterRead;
+        store.markBridgeFile(share.id, this.localRel);
+        docHost.loadedWithoutDisk.delete(this.localDocName);
+        docHost.schedulePersist(this.localDocName, localDoc, { actor: 'remote', userId: 'cloud-bridge' });
+        this.engine.manager.emitFilesChanged(this.engine.project.id, this.localRel);
+        log(`bridge stale empty materialization awaiting confirmation file=${this.localRel}`);
+        return;
+      }
       docHost.loadedWithoutDisk.delete(this.localDocName);
       this.engine.manager.emitFilesChanged(this.engine.project.id, this.localRel);
     }
@@ -193,8 +282,13 @@ class FileBridge {
       // since-typed content is how Recent.md got wiped on every surface.
       const createCloudTwin = async () => {
         const disk = await readTextFile(this.engine.project.root, this.localRel).catch(() => null);
-        const content =
-          this.engine.docHost.getLiveText(this.engine.project.id, this.localRel) ?? disk?.text ?? '';
+        const live = this.engine.docHost.getLiveText(this.engine.project.id, this.localRel);
+        // A connected editor can be ahead of disk while its persist is
+        // pending; otherwise disk is authoritative for an external/local-agent
+        // write whose debounced watcher may not have reached the Y.Doc yet.
+        const content = this.engine.docHost.hasPendingPersist(this.localDocName)
+          ? live ?? disk?.text ?? ''
+          : disk?.text ?? live ?? '';
         const res = await this.engine.cloudFetch('/api/workspace/local-agent/file', {
           method: 'PUT',
           body: JSON.stringify({
@@ -216,6 +310,7 @@ class FileBridge {
       docHost.schedulePersist(this.localDocName, localDoc, { actor: 'remote', userId: 'cloud-bridge' });
       return;
     }
+    requireCurrentListing();
     store.markBridgeFile(share.id, this.localRel);
 
     // Flush the merged state to disk + let the cloud persist its side.
@@ -312,6 +407,7 @@ export class ShareEngine {
     this.bridges = new Map(); // localRel -> FileBridge
     this.socket = null;
     this.pollTimer = null;
+    this.pollInFlight = null;
     this.status = 'starting';
     this.error = null;
     this.stopped = false;
@@ -331,15 +427,31 @@ export class ShareEngine {
     // watcher events can race its offline-delete reconciliation. Until that
     // finishes, previously-synced files must NOT open bridges (a bridge would
     // push local state and resurrect a cloud-deleted file) — they queue here
-    // and replay after reconciliation. Never-synced files bridge immediately.
+    // and replay after reconciliation. The same queue retains first-sync files
+    // when the live-bridge working set is full; a later poll rotates them in.
+    // Never-synced files bridge immediately while capacity remains.
     // Armed from construction: resumeAll registers engines before starting
     // them, so events can reach an engine whose start() hasn't run yet.
     this.resuming = true;
+    this.deferredResume = null;
     this.pendingResumeOpens = new Set();
+    // Subset of pendingResumeOpens whose raw disk bytes raced a cloud delete.
+    // Do not reopen them until DocHost has ingested a stable snapshot.
+    this.pendingDiskReconciles = new Set();
+    // Deduplicate the one on-demand listing refresh used when concurrent
+    // cap entrants find no closable bridge in the cached snapshot.
+    this.capacityListingRefresh = null;
     // localRel → cloud updated_at recorded when an idle bridge closed; a
     // different stamp on a later poll means cloud-side edits → reopen.
     this.syncedStamps = new Map();
+    // The matching local stat fingerprint. A disk edit can land before its
+    // debounced watcher callback; compare this before mirroring a cloud delete
+    // onto an idle-closed file so those new bytes are never erased.
+    this.syncedLocalVersions = new Map();
     this.lastCloudListing = null; // most recent fetchCloudPaths result
+    this.cloudListingRequestGeneration = 0;
+    this.cloudListingPublishedGeneration = 0;
+    this.cloudListingRequestsInFlight = new Set();
     this.blobBusy = new Set(); // localRel with a blob sync in flight
     // Blob syncs that failed (or arrived before any cloud listing) — each
     // poll retries them; syncBlob no-ops once both sides agree.
@@ -349,6 +461,33 @@ export class ShareEngine {
     // the 10s poll doesn't re-download the same huge blob forever. A new
     // cloud version (different sha) clears naturally by failing the compare.
     this.skippedBlobDownloads = new Map();
+    this.pendingOversizedUnbridges = new Set();
+    // Progress is a cached union of the latest complete disk walk + cloud
+    // listing. Maps key by local-relative path, so overlapping union scopes
+    // and paths present on both sides count exactly once.
+    this.progressLocalFiles = null;
+    this.progressCloudFiles = null;
+    this.progressDirtyPaths = new Set();
+    this.progressFailedPaths = new Set();
+    this.progressInitialSync = true;
+    this.progressNeedsFinalVerification = true;
+    this.progressUpdatedAt = new Date().toISOString();
+    this.progressFingerprint = null;
+    // The source is stable without exposing the install UUID; generation is
+    // a durable process/engine epoch and sequence orders reports within it.
+    this.progressSourceId = `local:${createHash('sha256')
+      .update(`${this.store.installId()}:${this.project.id}`)
+      .digest('hex')
+      .slice(0, 32)}`;
+    this.progressGeneration = this.store.nextSyncProgressGeneration(this.project.id);
+    this.progressSequence = 0;
+    this.progressReportInFlight = null;
+    this.progressQueuedReport = null;
+    this.progressReportErrorLogged = false;
+    this.progressPublishTimer = null;
+    this.progressHeartbeatTimer = null;
+    this.progressLastReport = null;
+    this.errorRevision = 0;
     // Scope-root moves whose cloud half hasn't landed (durable across
     // restarts): re-queue them, parking the engine until they drain — the
     // start()/poll guards then defer everything that would act on a cloud
@@ -515,7 +654,303 @@ export class ShareEngine {
     return this.isUnion && this.scopes.some((scope) => scope.scope_kind === 'chat');
   }
 
+  hasOpenBacklog() {
+    return (
+      this.resuming ||
+      this.deferredResume !== null ||
+      this.pendingResumeOpens.size > 0 ||
+      this.pendingBlobSyncs.size > 0
+    );
+  }
+
+  setProgressLocalFiles(files) {
+    this.progressLocalFiles = new Map(
+      files
+        .filter((file) => file.type !== 'folder' && this.scopeContains(file.path) && !isIgnoredPath(file.path))
+        .map((file) => [file.path, file]),
+    );
+  }
+
+  setProgressCloudFiles(files) {
+    const mapped = new Map();
+    for (const file of files) {
+      if (file.type === 'folder') continue;
+      const cloudPath = String(file.path);
+      const localRel = this.cloudToLocal(cloudPath);
+      if (this.share.scope_kind === 'file' && cloudPath !== this.localToCloud(this.share.scope_path)) continue;
+      if (!this.scopeContains(localRel) || isIgnoredPath(localRel)) continue;
+      mapped.set(localRel, {
+        path: localRel,
+        type: file.type === 'text' ? 'text' : 'blob',
+        size: Number(file.size ?? 0),
+      });
+    }
+    this.progressCloudFiles = mapped;
+  }
+
+  async refreshProgressLocalPath(localRel) {
+    if (!this.progressLocalFiles || !this.scopeContains(localRel) || isIgnoredPath(localRel)) return;
+    const abs = resolveInRoot(this.project.root, localRel);
+    const stat = abs ? await fsp.stat(abs).catch(() => null) : null;
+    // Directory mtime/watch events are not subtree deletes. Its descendants
+    // remain authoritative in the cached inventory; explicit missing-child
+    // rails below remove individual paths, and an absent directory removes
+    // the subtree here.
+    if (stat?.isDirectory()) return;
+    if (!stat?.isFile()) {
+      this.progressLocalFiles.delete(localRel);
+      for (const path of [...this.progressLocalFiles.keys()]) {
+        if (path.startsWith(`${localRel}/`)) this.progressLocalFiles.delete(path);
+      }
+      return;
+    }
+    this.progressLocalFiles.set(localRel, {
+      path: localRel,
+      type: fileKindForFile(localRel),
+      size: stat.size,
+    });
+  }
+
+  /** Close the startup watcher-registration gap before claiming completion.
+   *  The poll's published cloud listing is current; re-walk disk after all
+   *  of that pass's awaits, then queue any never-synced local path the first
+   *  walk missed. One-sided previously-synced paths stay for delete policy. */
+  async verifyProgressInventory() {
+    if (this.stopped || !this.progressCloudFiles || !this.progressNeedsFinalVerification) return;
+    const files = (await walkProject(this.project.root)).filter(
+      (file) => (file.type === 'text' || file.type === 'blob') && this.scopeContains(file.path),
+    );
+    this.setProgressLocalFiles(files);
+    for (const file of files) {
+      if (
+        !this.progressSkipReason(file.path) &&
+        !this.progressCloudFiles.has(file.path) &&
+        !this.store.hasBridgeFile(this.share.id, file.path) &&
+        !this.bridges.has(file.path)
+      ) this.pendingResumeOpens.add(file.path);
+    }
+    // One authoritative post-start pass closes the watcher-registration gap.
+    // From here the watcher and cloud listing update the cached maps
+    // incrementally; recursively statting a data-heavy project every 10s is
+    // not an acceptable telemetry cost for a small partial-folder share.
+    this.progressNeedsFinalVerification = false;
+  }
+
+  progressSkipReason(localRel) {
+    return (
+      syncSkipReason(this.progressLocalFiles?.get(localRel), { blobMaxBytes: BLOB_SYNC_MAX_BYTES }) ??
+      syncSkipReason(this.progressCloudFiles?.get(localRel), { blobMaxBytes: BLOB_SYNC_MAX_BYTES }) ??
+      (this.progressCloudFiles?.has(localRel) && process.platform === 'win32' && windowsUnwritableReason(localRel)
+        ? SYNC_SKIP_REASONS.unwritablePath
+        : null)
+    );
+  }
+
+  /** A path that used to sync but is now over policy must become wholly
+   *  local-only; retaining its old cloud row would silently expose stale
+   *  bytes. The retry queue keeps that transition visible and durable for
+   *  the life of this engine, including auth/network parks. */
+  async unbridgeOversized(localRel) {
+    if (!this.store.hasBridgeFile(this.share.id, localRel) || this.pendingOversizedUnbridges.has(localRel)) return;
+    await this.dropBridge(localRel).catch(() => {});
+    this.pendingOversizedUnbridges.add(localRel);
+    const cloudPath = this.localToCloud(localRel);
+    const run = async () => {
+      await this.cloudDelete(cloudPath);
+      this.store.forgetBridgeFile(this.share.id, localRel);
+      this.pendingOversizedUnbridges.delete(localRel);
+    };
+    if (this.opsParked) {
+      this.queueCloudOp(`delete oversized ${cloudPath}`, run);
+      return;
+    }
+    try {
+      await run();
+    } catch {
+      this.queueCloudOp(`delete oversized ${cloudPath}`, run);
+    }
+  }
+
+  async unbridgeOversizedFiles(files) {
+    for (const file of files) {
+      // Cleanup is driven by LOCAL growth only. An oversized/newer cloud twin
+      // is collaborator data: report/skip it, never delete it from restart.
+      if (
+        syncSkipReason(file, { blobMaxBytes: BLOB_SYNC_MAX_BYTES }) &&
+        this.store.hasBridgeFile(this.share.id, file.path)
+      ) {
+        await this.unbridgeOversized(file.path);
+      }
+    }
+  }
+
+  progressPendingPaths() {
+    const pending = new Set([
+      ...this.progressDirtyPaths,
+      ...this.progressFailedPaths,
+      ...this.pendingResumeOpens,
+      ...this.pendingBlobSyncs,
+      ...this.blobBusy,
+      ...(this.deferredResume ?? []).map((file) => file.path),
+    ]);
+    for (const [path, bridge] of this.bridges) {
+      if (
+        !bridge.started ||
+        !bridge.provider?.synced ||
+        bridge.provider.hasUnsyncedChanges ||
+        this.docHost.hasPendingPersist(bridge.localDocName)
+      ) pending.add(path);
+    }
+    // Idle-closed text paths retain the cloud stamp they last agreed with.
+    // A newer listing stamp means a collaborator edit is waiting to reopen;
+    // if the live cap refuses that reopen, it must remain visibly pending.
+    if (this.lastCloudListing) {
+      for (const [path, agreedStamp] of this.syncedStamps) {
+        const currentStamp = this.lastCloudListing.stamps.get(this.localToCloud(path));
+        if (currentStamp !== undefined && currentStamp !== agreedStamp) pending.add(path);
+      }
+    }
+    // A durable bridge row represents agreement, not merely discovery. A
+    // one-sided path still has a delete/download/upload decision outstanding.
+    if (this.progressLocalFiles && this.progressCloudFiles) {
+      for (const path of new Set([
+        ...this.progressLocalFiles.keys(),
+        ...this.progressCloudFiles.keys(),
+      ])) {
+        if (this.progressLocalFiles.has(path) !== this.progressCloudFiles.has(path)) pending.add(path);
+      }
+    }
+    return pending;
+  }
+
+  progressForScope(scope = null) {
+    const contains = scope
+      ? (path) => scope.scope_kind !== 'chat' && scopeCoversPath(scope, path)
+      : (path) => this.scopeContains(path);
+    return buildSyncProgress({
+      localFiles: this.progressLocalFiles,
+      cloudFiles: this.progressCloudFiles,
+      completedPaths: new Set(this.store.listBridgeFiles(this.share.id)),
+      pendingPaths: this.progressPendingPaths(),
+      contains,
+      blobMaxBytes: BLOB_SYNC_MAX_BYTES,
+      unwritable: (path) => process.platform === 'win32' && Boolean(windowsUnwritableReason(path)),
+      busy:
+        this.progressInitialSync ||
+        // Path-addressable queues are already in pendingPaths and get scoped
+        // by the builder. Only truly share-global work belongs here, or one
+        // slow union scope would make every settled sibling say "syncing".
+        this.pendingCloudOps.length > 0,
+      error: Boolean(this.error) || this.status === 'error',
+      updatedAt: this.progressUpdatedAt,
+    });
+  }
+
+  publishProgress({ force = false, heartbeat = false, scheduled = false } = {}) {
+    if (this.stopped || this.ledgerOnly) return;
+    if (!force && !heartbeat && !scheduled) {
+      this.scheduleProgressPublish();
+      return;
+    }
+    if (force && this.progressPublishTimer) {
+      clearTimeout(this.progressPublishTimer);
+      this.progressPublishTimer = null;
+    }
+    const progress = this.progressForScope();
+    const fingerprint = JSON.stringify({ ...progress, updatedAt: undefined });
+    if (!force && !heartbeat && fingerprint === this.progressFingerprint) return;
+    this.progressFingerprint = fingerprint;
+    this.progressUpdatedAt = new Date().toISOString();
+    const report = { ...progress, updatedAt: this.progressUpdatedAt };
+    this.progressLastReport = report;
+    this.manager.emitSharesChanged(this.project.id);
+    this.queueProgressReport(report);
+  }
+
+  scheduleProgressPublish(delay = SYNC_PROGRESS_UPDATE_MS) {
+    if (this.stopped || this.progressPublishTimer) return;
+    this.progressPublishTimer = setTimeout(() => {
+      this.progressPublishTimer = null;
+      this.publishProgress({ scheduled: true });
+    }, delay);
+    this.progressPublishTimer.unref?.();
+  }
+
+  sendProgressHeartbeat() {
+    if (this.stopped || !this.progressLastReport) return;
+    // A quick authoritative poll publishes its own fresh snapshot. If a poll
+    // hangs while the cached state says complete, do not keep laundering that
+    // stale up_to_date state into fresh cloud heartbeats; it will age offline.
+    // Known scanning/transfers keep heartbeating their non-final snapshot.
+    if (this.pollInFlight && this.progressLastReport.phase === 'up_to_date') return;
+    this.progressUpdatedAt = new Date().toISOString();
+    this.progressLastReport = { ...this.progressLastReport, updatedAt: this.progressUpdatedAt };
+    this.queueProgressReport(this.progressLastReport);
+  }
+
+  startProgressHeartbeat(delay = SYNC_PROGRESS_HEARTBEAT_MS) {
+    if (this.ledgerOnly || this.progressHeartbeatTimer || !this.share.api_origin || !this.share.token) return;
+    this.progressHeartbeatTimer = setInterval(() => this.sendProgressHeartbeat(), delay);
+    this.progressHeartbeatTimer.unref?.();
+  }
+
+  queueProgressReport(progress) {
+    if (this.ledgerOnly || !this.share.api_origin || !this.share.token || !this.share.workspace_id) return;
+    this.progressQueuedReport = progress;
+    if (this.progressReportInFlight) return;
+    this.progressReportInFlight = (async () => {
+      while (!this.stopped && this.progressQueuedReport) {
+        const next = this.progressQueuedReport;
+        this.progressQueuedReport = null;
+        const body = {
+          workspaceId: this.share.workspace_id,
+          sourceId: this.progressSourceId,
+          generation: this.progressGeneration,
+          sequence: this.progressSequence++,
+          ...next,
+          // Cloud-visible copy is intentionally generic: engine.error may
+          // contain an absolute local path or HTTP internals.
+          error: next.phase === 'error' ? 'Some files could not sync. Check the local service.' : null,
+        };
+        try {
+          const response = await fetch(`${this.share.api_origin}/api/workspace/local-agent/sync-status`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${this.share.token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(SYNC_PROGRESS_TIMEOUT_MS),
+          });
+          // Always release/reuse Undici's connection. Even a 409/error route
+          // has a small JSON body; leaving heartbeat bodies unread can exhaust
+          // the shared origin pool and contend with real file-sync fetches.
+          await response.arrayBuffer().catch(() => {});
+          // 409 means a newer process/report already owns the cursor. It is a
+          // successful terminal outcome for THIS superseded heartbeat.
+          if (!response.ok && response.status !== 409 && !this.progressReportErrorLogged) {
+            this.progressReportErrorLogged = true;
+            this.log(`share ${this.share.id} sync-progress report failed status=${response.status} (ignored)`);
+          } else if (response.ok) {
+            this.progressReportErrorLogged = false;
+          }
+        } catch (error) {
+          if (!this.progressReportErrorLogged) {
+            this.progressReportErrorLogged = true;
+            this.log(`share ${this.share.id} sync-progress report failed: ${error?.message || error} (ignored)`);
+          }
+        }
+      }
+    })().finally(() => {
+      this.progressReportInFlight = null;
+      // A report may have been queued between the loop condition and finally.
+      if (!this.stopped && this.progressQueuedReport) this.queueProgressReport(this.progressQueuedReport);
+    });
+  }
+
   async start() {
+    this.startProgressHeartbeat();
+    this.publishProgress({ force: true });
     if (this.ledgerOnly) {
       // Chat share: the ledger mirror (chat snapshot + its messages) IS the
       // whole sync — no file walk, no CRDT bridges, no cloud file polling,
@@ -523,28 +958,44 @@ export class ShareEngine {
       if (!this.share.api_origin || !this.share.token) {
         this.status = 'error';
         this.error = 'share is missing api_origin or token';
+        this.progressInitialSync = false;
+        this.publishProgress({ force: true });
         return;
       }
+      this.progressLocalFiles = new Map();
+      this.progressCloudFiles = new Map();
       this.resuming = false;
       this.status = 'active';
       await this.syncLedger();
+      this.progressInitialSync = false;
+      this.publishProgress({ force: true });
       if (this.stopped) return;
-      this.pollTimer = setInterval(() => void this.syncLedger(), CLOUD_POLL_MS);
+      this.pollTimer = setInterval(() => {
+        void this.syncLedger().finally(() => this.publishProgress({ heartbeat: true }));
+      }, CLOUD_POLL_MS);
       return;
     }
     if (!this.share.collab_url || !this.share.token) {
       this.status = 'error';
       this.error = 'share is missing collab_url or token';
+      this.progressInitialSync = false;
+      this.publishProgress({ force: true });
       return;
     }
+    if (this.stopped) return;
     // (`resuming` is already armed — the constructor sets it, and every
     // engine is constructed fresh immediately before its one start().)
     // Blobs ride along for delete-reconciliation (a synced blob absent from
     // this walk must read as a local delete, not get pulled back) and are
     // queued for sha-diffed sync below; only text files open CRDT bridges.
-    const local = (await walkProject(this.project.root)).filter(
+    const localAll = (await walkProject(this.project.root)).filter(
       (file) => (file.type === 'text' || file.type === 'blob') && this.scopeContains(file.path),
     );
+    this.setProgressLocalFiles(localAll);
+    this.publishProgress({ force: true });
+    // Oversized paths are local/cloud-visible skips, not an eternal open or
+    // transfer queue. Keep them in the progress inventory, not the work list.
+    const local = localAll.filter((file) => !this.progressSkipReason(file.path));
     // Reconcile cloud-side deletes that happened while this sidecar was
     // offline BEFORE opening bridges: a previously-synced file (bridge_files
     // row) now absent from the cloud listing was deleted remotely — bridging
@@ -563,45 +1014,72 @@ export class ShareEngine {
           return null;
         });
     // stop() can land while the listing was in flight — a stopped engine
-    // must not run the destructive reconciliation below during shutdown.
+    // must not run destructive cleanup during shutdown.
     if (this.stopped) return;
+    // A file may have crossed the size limit while the sidecar was stopped,
+    // so no watcher event exists to run the live unbridge transition. Remove
+    // stale cloud ownership now (or visibly queue it) before completion.
+    await this.unbridgeOversizedFiles(localAll);
     let toBridge;
-    if (cloudPaths) {
-      toBridge = await this.reconcileOfflineDeletes(local, cloudPaths);
-      // The symmetric case: a previously-synced file deleted/renamed ON DISK
-      // while the sidecar was stopped. Without this, the first poll would see
-      // its cloud twin as a "new cloud file" and pull it back, undoing the
-      // user's offline delete — propagate the delete instead.
-      const localSet = new Set(local.map((file) => file.path));
-      for (const rel of this.store.listBridgeFiles(this.share.id)) {
-        if (this.stopped) return; // shutdown mid-loop: no cloud deletes on a stopped engine
-        if (localSet.has(rel) || !this.scopeContains(rel)) continue;
-        // The walk is a snapshot: a file created and event-bridged while the
-        // listing fetch was in flight has a fresh row but isn't in localSet.
-        // "Offline local delete" means absent from disk NOW — re-stat before
-        // condemning, or this sweep would delete the just-created file.
-        const abs = resolveInRoot(this.project.root, rel);
-        const existsNow = abs ? await fsp.stat(abs).then((stat) => stat.isFile()).catch(() => false) : false;
-        if (existsNow) continue;
-        if (cloudPaths.all.has(this.localToCloud(rel))) {
-          const cloudPath = this.localToCloud(rel);
-          const run = async () => {
-            await this.cloudDelete(cloudPath);
-            this.store.forgetBridgeFile(this.share.id, rel);
-          };
-          try {
-            await run();
-            this.log(`bridge offline local-delete file=${rel}`);
-          } catch {
-            this.queueCloudOp(`delete ${cloudPath}`, run);
+    let listingStillCurrent = null;
+    const deferPreviouslySynced = () => {
+      listingStillCurrent = null;
+      toBridge = local.filter((file) => !this.store.hasBridgeFile(this.share.id, file.path));
+      this.deferredResume = local.filter((file) => this.store.hasBridgeFile(this.share.id, file.path));
+    };
+    if (cloudPaths && this.cloudListingIsCurrent(cloudPaths)) {
+      listingStillCurrent = () => this.cloudListingIsCurrent(cloudPaths);
+      const reconciled = await this.reconcileOfflineDeletes(local, cloudPaths, listingStillCurrent);
+      if (reconciled === null) {
+        deferPreviouslySynced();
+      } else {
+        toBridge = reconciled;
+        // The symmetric case: a previously-synced file deleted/renamed ON DISK
+        // while the sidecar was stopped. Without this, the first poll would see
+        // its cloud twin as a "new cloud file" and pull it back, undoing the
+        // user's offline delete — propagate the delete instead.
+        const localSet = new Set(localAll.map((file) => file.path));
+        for (const rel of this.store.listBridgeFiles(this.share.id)) {
+          if (this.stopped) return; // shutdown mid-loop: no cloud deletes on a stopped engine
+          if (!listingStillCurrent()) {
+            deferPreviouslySynced();
+            break;
           }
-        } else {
-          this.store.forgetBridgeFile(this.share.id, rel); // gone on both sides
+          if (localSet.has(rel) || !this.scopeContains(rel) || this.progressSkipReason(rel)) continue;
+          // The walk is a snapshot: a file created and event-bridged while the
+          // listing fetch was in flight has a fresh row but isn't in localSet.
+          // "Offline local delete" means absent from disk NOW — re-stat before
+          // condemning, or this sweep would delete the just-created file.
+          const abs = resolveInRoot(this.project.root, rel);
+          const existsNow = abs ? await fsp.stat(abs).then((stat) => stat.isFile()).catch(() => false) : false;
+          if (!listingStillCurrent()) {
+            deferPreviouslySynced();
+            break;
+          }
+          if (existsNow) continue;
+          if (cloudPaths.all.has(this.localToCloud(rel))) {
+            const cloudPath = this.localToCloud(rel);
+            const run = async () => {
+              await this.cloudDelete(cloudPath);
+              this.store.forgetBridgeFile(this.share.id, rel);
+            };
+            try {
+              await run();
+              this.log(`bridge offline local-delete file=${rel}`);
+            } catch {
+              this.queueCloudOp(`delete ${cloudPath}`, run);
+            }
+          } else {
+            this.store.forgetBridgeFile(this.share.id, rel); // gone on both sides
+          }
+          if (!listingStillCurrent()) {
+            deferPreviouslySynced();
+            break;
+          }
         }
       }
     } else {
-      toBridge = local.filter((file) => !this.store.hasBridgeFile(this.share.id, file.path));
-      this.deferredResume = local.filter((file) => this.store.hasBridgeFile(this.share.id, file.path));
+      deferPreviouslySynced();
     }
     // Reconciliation done — replay files queued while it ran (editor-opens
     // and rescued cloud-deletes). With no cloud listing there was NO
@@ -609,11 +1087,18 @@ export class ShareEngine {
     // queueing instead of bridging blind (a cloud-deleted file would be
     // pushed back); the deferred pass in pollCloud() reconciles, drains,
     // and lifts the latch on the first successful listing.
-    if (cloudPaths) {
-      this.resuming = false;
-      await this.drainPendingResumeOpens();
+    if (listingStillCurrent) {
+      const deferred = await this.bridgeAll(toBridge, { listingStillCurrent });
+      if (deferred.length > 0) {
+        this.deferredResume = deferred;
+      } else {
+        this.deferredResume = null;
+        this.resuming = false;
+        await this.drainPendingResumeOpens();
+      }
+    } else {
+      await this.bridgeAll(toBridge);
     }
-    await this.bridgeAll(toBridge);
     await this.pollCloud().catch((error) => this.noteError('cloud-poll', error));
     // stop() can land while the awaits above are in flight (background resume
     // cancelled at shutdown) — a stopped engine must not arm a poll interval
@@ -622,16 +1107,32 @@ export class ShareEngine {
     this.pollTimer = setInterval(() => {
       void this.pollCloud().catch((error) => this.noteError('cloud-poll', error));
     }, CLOUD_POLL_MS);
-    if (this.status !== 'error') this.status = 'active';
+    if (this.status !== 'error') {
+      this.status = this.hasOpenBacklog() ? 'starting' : 'active';
+    }
+    this.progressInitialSync = false;
+    this.publishProgress({ force: true });
   }
 
   /** Bounded concurrency: files are independent, and serial waitForSync would
    *  make a large first share take minutes. Blob paths route to the sha-diffed
-   *  transfer instead of a CRDT bridge. */
-  async bridgeAll(files) {
+   *  transfer instead of a CRDT bridge. When a resume listing is supplied,
+   *  previously-synced paths only reopen while that listing remains current;
+   *  skipped paths return to the deferred reconciliation queue. */
+  async bridgeAll(files, { listingStillCurrent = null } = {}) {
+    const deferred = [];
     for (let i = 0; i < files.length; i += 8) {
       await Promise.all(
         files.slice(i, i + 8).map(async (file) => {
+          if (this.progressSkipReason(file.path)) return;
+          const guardedByListing = Boolean(
+            listingStillCurrent && this.store.hasBridgeFile(this.share.id, file.path),
+          );
+          const current = guardedByListing ? listingStillCurrent : null;
+          if (current && !current()) {
+            deferred.push(file);
+            return;
+          }
           // The list can be a stale snapshot (resume runs in the background
           // after the port binds) — a file deleted since the walk must not
           // be bridged: the delete rails own it, and a bridge would push it
@@ -639,16 +1140,35 @@ export class ShareEngine {
           const abs = resolveInRoot(this.project.root, file.path);
           const exists = abs ? await fsp.stat(abs).then((stat) => stat.isFile()).catch(() => false) : false;
           if (!exists) return;
+          if (current && !current()) {
+            deferred.push(file);
+            return;
+          }
           // Blobs get the first-sync snapshot's sha explicitly — syncBlob's
           // undefined fallback fetches a fresh listing PER PATH, which a
           // large first share must not do.
-          await (fileKind(file.path) === 'blob'
-            ? this.syncBlob(file.path, this.cachedCloudSha(file.path))
-            : this.ensureBridge(file.path)
-          ).catch((error) => this.noteError(file.path, error));
+          try {
+            await (fileKindForFile(file.path) === 'blob'
+              ? this.syncBlob(file.path, this.cachedCloudSha(file.path), { listingStillCurrent: current })
+              : this.ensureBridge(file.path, {
+                  retainOnFailure: !current,
+                  listingStillCurrent: current,
+                })
+            );
+          } catch (error) {
+            this.noteError(file.path, error);
+          }
+          if (
+            current &&
+            (!current() || (fileKindForFile(file.path) === 'text' && !this.bridges.has(file.path)))
+          ) {
+            deferred.push(file);
+          }
         }),
       );
+      this.scheduleProgressPublish();
     }
+    return deferred;
   }
 
   /** Cloud sha for a path from the current listing snapshot ('' = row without
@@ -662,9 +1182,11 @@ export class ShareEngine {
 
   /** Drop local files whose cloud twin vanished while we were offline; returns
    *  the files that should still be bridged. */
-  async reconcileOfflineDeletes(files, cloudPaths) {
+  async reconcileOfflineDeletes(files, cloudPaths, listingStillCurrent = null) {
     const kept = [];
     for (const file of files) {
+      if (this.progressSkipReason(file.path)) continue;
+      if (listingStillCurrent && !listingStillCurrent()) return null;
       if (this.stopped) return kept; // shutdown mid-loop: no deletes on a stopped engine
       const previouslySynced = this.store.hasBridgeFile(this.share.id, file.path);
       if (!previouslySynced || cloudPaths.all.has(this.localToCloud(file.path))) {
@@ -684,6 +1206,7 @@ export class ShareEngine {
       // bridge during resume, the replay in start() re-shares it (local wins),
       // otherwise it stays a plain local file until the next edit event.
       const statNow = await fsp.stat(resolveInRoot(this.project.root, file.path)).catch(() => null);
+      if (listingStillCurrent && !listingStillCurrent()) return null;
       // Measured against the moment the SERVER became interactive, not this
       // engine's walk: shares resume sequentially, so an edit can land before
       // a late engine exists. Strictly after — no slack: mtime and Date.now()
@@ -701,6 +1224,7 @@ export class ShareEngine {
         // opened a live bridge for this path — drop it too, or it would keep
         // relaying before reconciliation finishes.
         await this.dropBridge(file.path).catch(() => {});
+        if (listingStillCurrent && !listingStillCurrent()) return null;
         this.store.forgetBridgeFile(this.share.id, file.path);
         // Queue it for the post-reconciliation replay: the live edit wins and
         // the file re-shares. Without this, an edit made before this engine
@@ -711,8 +1235,10 @@ export class ShareEngine {
         );
         continue;
       }
-      this.store.forgetBridgeFile(this.share.id, file.path);
+      if (listingStillCurrent && !listingStillCurrent()) return null;
       await deleteFile(this.project.root, file.path).catch(() => {});
+      await this.refreshProgressLocalPath(file.path);
+      this.store.forgetBridgeFile(this.share.id, file.path);
       // Record the cloud-delete tombstone BEFORE the disk-change sweep so the
       // doc host's own tombstone guard sees it and doesn't double-record.
       this.store.recordEdit({ projectId: this.project.id, path: file.path, actor: 'remote', contentText: null });
@@ -728,7 +1254,12 @@ export class ShareEngine {
     // purpose — that's teardown, not a sync failure the UI should flash.
     if (this.stopped || error?.bridgeStopped) return;
     const hadError = Boolean(this.error);
+    this.errorRevision += 1;
     this.error = `${where}: ${error?.message || error}`;
+    if (
+      typeof where === 'string' &&
+      (this.progressLocalFiles?.has(where) || this.progressCloudFiles?.has(where) || this.bridges.has(where))
+    ) this.progressFailedPaths.add(where);
     this.log(`share ${this.share.id} ${this.error}`);
     if (/auth|401|403/i.test(String(error?.message))) {
       this.status = 'error';
@@ -737,26 +1268,105 @@ export class ShareEngine {
     // Sync health is trust-critical UI (the user believes edits are syncing) —
     // push EVERY first error (auth park or not) instead of waiting for a
     // share create/remove to refetch.
-    if (!hadError) this.manager.emitSharesChanged(this.project.id);
+    if (!hadError) {
+      this.manager.emitSharesChanged(this.project.id);
+      this.publishProgress({ force: true });
+    } else {
+      this.scheduleProgressPublish();
+    }
   }
 
-  async ensureBridge(localRel) {
+  retainLocalIntent(localRel) {
+    const bridge = this.bridges.get(localRel);
+    if (bridge) {
+      bridge.staleEmptyMaterialization = false;
+      bridge.staleEmptyVersion = null;
+    }
+    this.pendingResumeOpens.add(localRel);
+    if (this.status === 'active') this.status = 'starting';
+  }
+
+  async ensureBridge(localRel, { retainOnFailure = true, listingStillCurrent = null } = {}) {
     // A parked share ('error': rejected token, or a file-share whose cloud
     // path vanished) must not silently resurrect bridges — a fresh token or
     // re-share resets the status.
-    if (this.stopped || this.status === 'error' || this.bridges.has(localRel)) return;
-    if (!this.scopeContains(localRel) || isIgnoredPath(localRel) || fileKind(localRel) !== 'text') return;
+    if (this.stopped || this.bridges.has(localRel)) return;
+    if (
+      !this.scopeContains(localRel) ||
+      isIgnoredPath(localRel) ||
+      fileKindForFile(localRel) !== 'text' ||
+      this.progressSkipReason(localRel)
+    ) return;
+    if (listingStillCurrent && !listingStillCurrent()) return;
+    // A local edit/open owns this path until the provider has synced and the
+    // bridge is fully installed. The marker prevents a concurrent absent
+    // cloud listing from deleting those bytes while start() is still waiting.
+    if (retainOnFailure) {
+      this.retainLocalIntent(localRel);
+    }
+    if (this.status === 'error') {
+      // Token refresh revives auth-parked engines without a disk re-walk, so
+      // retain the local signal that arrived while credentials were stale.
+      if (this.authError) {
+        if (retainOnFailure) this.pendingResumeOpens.add(localRel);
+      } else if (retainOnFailure) {
+        this.pendingResumeOpens.delete(localRel);
+      }
+      return;
+    }
     // Mid-resume, a previously-synced file may be a cloud-delete awaiting
     // reconciliation — bridging it now would push local state and resurrect
     // it. Queue instead; start() replays survivors. New files bridge freely.
-    if (this.resuming && this.store.hasBridgeFile(this.share.id, localRel)) {
-      this.pendingResumeOpens.add(localRel);
+    if (this.resuming && !listingStillCurrent && this.store.hasBridgeFile(this.share.id, localRel)) {
+      if (retainOnFailure) this.pendingResumeOpens.add(localRel);
       return;
     }
-    if (this.bridges.size >= MAX_BRIDGED_FILES && !(await this.closeIdlestBridge())) {
-      this.noteError(localRel, new Error(`open bridge cap (${MAX_BRIDGED_FILES}) reached`));
+    if (this.bridges.size >= MAX_BRIDGED_FILES) {
+      // Queue BEFORE the listing refresh: a 401/403 parks the engine inside
+      // that await, and a later token refresh must still know what to open.
+      if (retainOnFailure) this.pendingResumeOpens.add(localRel);
+      await this.closeIdlestBridge({ refreshIfNeeded: retainOnFailure });
+    }
+    // Several files start concurrently in bridgeAll(). Another opener can
+    // claim the slot while closeIdlestBridge awaits teardown, so recheck the
+    // gates and capacity immediately before the synchronous map reservation.
+    if (this.stopped) {
+      if (retainOnFailure) this.pendingResumeOpens.delete(localRel);
       return;
     }
+    if (listingStillCurrent && !listingStillCurrent()) return;
+    // Another concurrent opener owns this bridge and removes the pending
+    // marker only after start succeeds. Keeping it meanwhile prevents an
+    // overlapping poll from reporting healthy or applying a cloud delete.
+    if (this.bridges.has(localRel)) return;
+    if (this.status === 'error') {
+      if (!this.authError && retainOnFailure) this.pendingResumeOpens.delete(localRel);
+      return;
+    }
+    if (
+      !this.scopeContains(localRel) ||
+      isIgnoredPath(localRel) ||
+      fileKindForFile(localRel) !== 'text' ||
+      this.progressSkipReason(localRel)
+    ) {
+      if (retainOnFailure) this.pendingResumeOpens.delete(localRel);
+      return;
+    }
+    if (this.bridges.size >= MAX_BRIDGED_FILES) {
+      // The cap bounds the LIVE working set, not the shared tree. Cloud rows
+      // can lag their first Y.Doc update, leaving no bridge safe to close yet;
+      // retain this path for the next poll instead of silently truncating the
+      // initial sync at MAX_BRIDGED_FILES.
+      // Cloud-driven opens need no durable queue: the next listing discovers
+      // them again. Only local/resume intent gets local-wins delete protection.
+      if (retainOnFailure || this.pendingResumeOpens.has(localRel)) {
+        this.pendingResumeOpens.add(localRel);
+        if (this.status === 'active') this.status = 'starting';
+        this.noteError(localRel, new Error(`open bridge cap (${MAX_BRIDGED_FILES}) reached`));
+      }
+      return;
+    }
+    if (listingStillCurrent && !listingStillCurrent()) return;
     const bridge = new FileBridge({
       engine: this,
       localRel,
@@ -764,13 +1374,48 @@ export class ShareEngine {
     });
     this.bridges.set(localRel, bridge);
     try {
-      await bridge.start();
+      await bridge.start({ listingStillCurrent });
     } catch (error) {
-      this.bridges.delete(localRel);
+      // This opener may have been displaced while start awaited. Never tear
+      // down or overwrite the retry state of a replacement bridge.
+      if (this.bridges.get(localRel) === bridge) this.bridges.delete(localRel);
       await bridge.stop().catch(() => {});
+      // A replacement owns this path now. Its own start result is
+      // authoritative; surfacing this displaced opener's stale failure could
+      // re-park an otherwise healthy share (notably after token refresh).
+      if (this.bridges.has(localRel)) return;
+      // A failed WebSocket/auth start has no disk re-walk after recovery.
+      // Retain the path until a later poll starts it successfully.
+      if (
+        (retainOnFailure || this.pendingResumeOpens.has(localRel)) &&
+        !this.stopped &&
+        !this.bridges.has(localRel) &&
+        this.scopeContains(localRel) &&
+        !isIgnoredPath(localRel) &&
+        fileKindForFile(localRel) === 'text'
+      ) {
+        this.pendingResumeOpens.add(localRel);
+        if (this.status === 'active') this.status = 'starting';
+      }
+      if (error?.listingSuperseded || error?.localAppearedDuringStart) return;
       throw error;
     }
-    if (this.lastCloudListing?.all.has(bridge.cloudPath)) bridge.cloudSeen = true;
+    if (this.bridges.get(localRel) !== bridge) return;
+    bridge.started = true;
+    if (
+      this.lastCloudListing &&
+      this.cloudListingIsCurrent(this.lastCloudListing) &&
+      this.lastCloudListing.all.has(bridge.cloudPath)
+    ) {
+      bridge.cloudSeen = true;
+      bridge.cloudMissingAt = 0;
+      bridge.staleEmptyMaterialization = false;
+      bridge.staleEmptyVersion = null;
+    }
+    this.syncedStamps.delete(localRel);
+    this.syncedLocalVersions.delete(localRel);
+    this.pendingResumeOpens.delete(localRel);
+    this.progressFailedPaths.delete(localRel);
   }
 
   /** Re-share files rescued from an offline cloud-delete or opened during
@@ -780,28 +1425,81 @@ export class ShareEngine {
    *  ANY reconciliation pass — start()'s, or the deferred one in pollCloud. */
   async drainPendingResumeOpens() {
     const pending = [...this.pendingResumeOpens];
-    this.pendingResumeOpens.clear();
     for (const rel of pending) {
       if (this.stopped) return;
       const abs = resolveInRoot(this.project.root, rel);
       const exists = abs ? await fsp.stat(abs).then((stat) => stat.isFile()).catch(() => false) : false;
-      if (!exists) continue;
+      if (!exists) {
+        this.pendingResumeOpens.delete(rel);
+        this.pendingDiskReconciles.delete(rel);
+        continue;
+      }
+      await this.refreshProgressLocalPath(rel);
+      if (this.progressSkipReason(rel)) {
+        this.pendingResumeOpens.delete(rel);
+        this.pendingDiskReconciles.delete(rel);
+        continue;
+      }
       if (this.isBlobPath(rel)) {
-        await this.syncBlob(rel).catch((error) => this.noteError(rel, error));
-      } else {
-        // A rescued file has no bridge row and no cloud row — dropping it
-        // here would orphan it (nothing else retries it). ensureBridge can
-        // fail with a throw OR decline silently (parked share, bridge cap):
-        // requeue unless a bridge actually opened; pollCloud re-drains once
-        // per poll until it sticks.
-        await this.ensureBridge(rel).catch((error) => this.noteError(rel, error));
-        // Requeue only what ensureBridge could EVER accept (mirror its gates,
-        // fileKind included) — a permanently-declined rel would retry forever.
-        if (!this.stopped && !this.bridges.has(rel) && this.scopeContains(rel) && !isIgnoredPath(rel) && fileKind(rel) === 'text') {
-          this.pendingResumeOpens.add(rel);
+        try {
+          await this.syncBlob(rel);
+          // syncBlob retains its own retry marker on failure or an in-flight
+          // collision. Remove this queue's marker only once that rail agrees.
+          if (!this.pendingBlobSyncs.has(rel) && this.status !== 'error') {
+            this.pendingResumeOpens.delete(rel);
+          }
+        } catch (error) {
+          this.noteError(rel, error);
         }
+      } else {
+        // Keep unprocessed entries marked while this drain awaits: pollCloud
+        // calls may overlap, and the marker protects local edits from their
+        // cloud-delete sweep. ensureBridge removes it only after start wins.
+        if (!this.scopeContains(rel) || isIgnoredPath(rel) || fileKindForFile(rel) !== 'text') {
+          this.pendingResumeOpens.delete(rel);
+          this.pendingDiskReconciles.delete(rel);
+          continue;
+        }
+        if (this.pendingDiskReconciles.has(rel)) {
+          const confirmedVersion = await this.reconcilePendingDisk(rel);
+          if (confirmedVersion === null) continue;
+          if (this.bridges.has(rel)) await this.dropBridge(rel);
+          // bridge.stop() awaits socket/direct teardown. A raw local-agent
+          // write can land in that window before its watcher callback; never
+          // reopen from the just-verified (now stale) Y.Doc in that case.
+          if (this.localFileVersion(rel) !== confirmedVersion) continue;
+          this.pendingDiskReconciles.delete(rel);
+          this.syncedStamps.delete(rel);
+          this.syncedLocalVersions.delete(rel);
+        }
+        await this.ensureBridge(rel).catch((error) => this.noteError(rel, error));
       }
     }
+  }
+
+  async reconcilePendingDisk(localRel) {
+    const documentName = `${this.project.id}/${localRel}`;
+    const versionBefore = this.localFileVersion(localRel);
+    const disk = await readTextFile(this.project.root, localRel).catch(() => null);
+    const versionAfter = this.localFileVersion(localRel);
+    if (versionBefore === null || versionBefore !== versionAfter || disk === null) return null;
+    try {
+      await this.docHost.handleDiskChange(this.project.id, localRel);
+    } catch (error) {
+      this.noteError(`disk-reconcile ${localRel}`, error);
+      return null;
+    }
+    const confirmedBefore = this.localFileVersion(localRel);
+    const confirmed = await readTextFile(this.project.root, localRel).catch(() => null);
+    const confirmedAfter = this.localFileVersion(localRel);
+    const liveText = this.docHost.getLiveText(this.project.id, localRel);
+    if (
+      confirmedBefore === null ||
+      confirmedBefore !== confirmedAfter ||
+      confirmed === null ||
+      (liveText !== null && !this.docHost.hasObservedDiskText(documentName, confirmed.text))
+    ) return null;
+    return confirmedAfter;
   }
 
   /** A bridge may close only when losing it can't lose data or misread state:
@@ -810,31 +1508,87 @@ export class ShareEngine {
    *  editor holds the doc open (live typing must relay instantly). */
   closableStamp(localRel, bridge) {
     if (!bridge.cloudSeen || !this.store.hasBridgeFile(this.share.id, localRel)) return null;
+    if (this.pendingResumeOpens.has(localRel)) return null;
+    if (!bridge.provider?.synced || bridge.provider.hasUnsyncedChanges) return null;
+    if (this.docHost.hasPendingPersist(bridge.localDocName)) return null;
     if ((bridge.direct?.document?.connections?.size ?? 0) > 0) return null;
     return this.lastCloudListing?.stamps.get(bridge.cloudPath) ?? null;
   }
 
-  async closeBridgeKeepingSynced(localRel, stamp) {
+  localFileVersion(localRel) {
+    return fileVersionSync(this.project.root, localRel);
+  }
+
+  localFileFingerprint(localRel) {
+    return fileFingerprintSync(this.project.root, localRel);
+  }
+
+  async closeBridgeKeepingSynced(localRel, _stamp, expectedBridge = this.bridges.get(localRel)) {
+    if (!expectedBridge || this.bridges.get(localRel) !== expectedBridge) return false;
+    const versionBeforeRead = this.localFileVersion(localRel);
+    const disk = await readTextFile(this.project.root, localRel).catch(() => null);
+    const versionAfterRead = this.localFileVersion(localRel);
+    if (this.bridges.get(localRel) !== expectedBridge) return false;
+    if (
+      versionBeforeRead === null ||
+      versionBeforeRead !== versionAfterRead ||
+      disk === null ||
+      !this.docHost.hasObservedDiskText(expectedBridge.localDocName, disk.text)
+    ) {
+      // Raw disk bytes can arrive up to one watcher debounce before the live
+      // Y.Doc sees them. Reconcile that source while the bridge is still open;
+      // closing first would snapshot the unsynced edit as an agreed baseline.
+      // Compare with DocHost's last observed raw bytes, not the serialized
+      // Y.Doc: equivalent Markdown spellings intentionally remain noncanonical
+      // on disk and can differ forever without representing an unsynced edit.
+      if (disk !== null) {
+        await this.docHost.handleDiskChange(this.project.id, localRel).catch(() => {});
+      }
+      return false;
+    }
+    const stamp = this.closableStamp(localRel, expectedBridge);
+    if (stamp === null || this.bridges.get(localRel) !== expectedBridge) return false;
     this.syncedStamps.set(localRel, stamp);
+    this.syncedLocalVersions.set(localRel, versionAfterRead);
     await this.dropBridge(localRel);
+    return true;
   }
 
   /** Cap relief during large first shares: close the least-recently-active
    *  closable bridge (refreshing the listing so just-persisted cloud rows
    *  qualify) instead of erroring the share. */
-  async closeIdlestBridge() {
-    if (!this.lastCloudListing || Date.now() - this.lastCloudListing.fetchedAt > CLOUD_POLL_MS) {
-      await this.fetchCloudPaths().catch(() => {});
-    }
-    let victim = null;
-    for (const [localRel, bridge] of this.bridges.entries()) {
-      const stamp = this.closableStamp(localRel, bridge);
-      if (stamp === null) continue;
-      if (!victim || bridge.lastActivity < victim.bridge.lastActivity) victim = { localRel, bridge, stamp };
+  async closeIdlestBridge({ refreshIfNeeded = true } = {}) {
+    let refreshed = false;
+    const refresh = async () => {
+      refreshed = true;
+      this.capacityListingRefresh ??= this.fetchCloudPaths().finally(() => {
+        this.capacityListingRefresh = null;
+      });
+      await this.capacityListingRefresh.catch(() => {});
+    };
+    if (
+      refreshIfNeeded &&
+      (!this.lastCloudListing || Date.now() - this.lastCloudListing.fetchedAt > CLOUD_POLL_MS)
+    ) await refresh();
+    const findVictim = () => {
+      let victim = null;
+      for (const [localRel, bridge] of this.bridges.entries()) {
+        const stamp = this.closableStamp(localRel, bridge);
+        if (stamp === null) continue;
+        if (!victim || bridge.lastActivity < victim.bridge.lastActivity) victim = { localRel, bridge, stamp };
+      }
+      return victim;
+    };
+    let victim = findVictim();
+    // The cached listing commonly predates first-upload rows. One fresh,
+    // single-flight snapshot makes them immediately closable; if persistence
+    // still lags, the pending-open queue safely retries on a later poll.
+    if (!victim && !refreshed && refreshIfNeeded) {
+      await refresh();
+      victim = findVictim();
     }
     if (!victim) return false;
-    await this.closeBridgeKeepingSynced(victim.localRel, victim.stamp);
-    return true;
+    return this.closeBridgeKeepingSynced(victim.localRel, victim.stamp, victim.bridge);
   }
 
   async dropBridge(localRel) {
@@ -845,7 +1599,7 @@ export class ShareEngine {
     if (this.bridges.size === 0) this.destroySocket();
   }
 
-  async cloudFetch(pathname, init = {}) {
+  async cloudFetch(pathname, init = {}, { deferAuth = false } = {}) {
     const response = await fetch(`${this.share.api_origin}${pathname}`, {
       ...init,
       signal: init.signal ?? this.stopAbort.signal,
@@ -859,37 +1613,86 @@ export class ShareEngine {
       },
     });
     if (response.status === 401 || response.status === 403) {
-      this.status = 'error';
-      this.authError = true;
-      this.error = `cloud token rejected (${response.status})`;
-      throw new Error(this.error);
+      const message = `cloud token rejected (${response.status})`;
+      if (!deferAuth) {
+        this.status = 'error';
+        this.authError = true;
+        this.error = message;
+      }
+      throw Object.assign(new Error(message), { authRejected: true, status: response.status });
     }
     return response;
   }
 
   async fetchCloudPaths() {
-    const response = await this.cloudFetch(
-      `/api/workspace/local-agent/files?workspaceId=${this.share.workspace_id}`,
+    const generation = ++this.cloudListingRequestGeneration;
+    this.cloudListingRequestsInFlight.add(generation);
+    try {
+      const response = await this.cloudFetch(
+        `/api/workspace/local-agent/files?workspaceId=${this.share.workspace_id}`,
+        {},
+        { deferAuth: true },
+      );
+      if (!response.ok) throw new Error(`cloud files list failed status=${response.status}`);
+      const body = await response.json();
+      const cloudFiles = Array.isArray(body.files) ? body.files : [];
+      const listing = {
+        text: new Set(cloudFiles.filter((file) => file.type === 'text').map((file) => String(file.path))),
+        // Deletion checks ALL cloud paths, not just text ones — a cloud-side
+        // rename to a blob/other type is not a delete of the local file.
+        all: new Set(cloudFiles.map((file) => String(file.path))),
+        stamps: new Map(cloudFiles.map((file) => [String(file.path), String(file.updated_at ?? '')])),
+        // Binary rows, content-addressed: '' = row without a blob_sha (legacy
+        // storage_key upload) — present but not diffable.
+        blobShas: new Map(
+          cloudFiles
+            .filter((file) => file.type !== 'text' && file.type !== 'folder')
+            .map((file) => [String(file.path), String(file.blob_sha ?? '')]),
+        ),
+        fetchedAt: Date.now(),
+        generation,
+        files: cloudFiles,
+      };
+      // Completion order may differ from issue order. Publish the newest
+      // COMPLETED response, never overwrite it with an older late arrival.
+      if (generation < this.cloudListingPublishedGeneration) return this.lastCloudListing;
+      for (const bridge of this.bridges.values()) {
+        if (listing.all.has(bridge.cloudPath)) {
+          bridge.cloudSeen = true;
+          bridge.cloudMissingAt = 0;
+          bridge.staleEmptyMaterialization = false;
+          bridge.staleEmptyVersion = null;
+        }
+      }
+      this.cloudListingPublishedGeneration = generation;
+      this.lastCloudListing = listing;
+      this.setProgressCloudFiles(cloudFiles);
+      this.publishProgress();
+      return listing;
+    } catch (error) {
+      if (generation < this.cloudListingPublishedGeneration) {
+        if (this.lastCloudListing) return this.lastCloudListing;
+        throw Object.assign(new Error('cloud listing request superseded'), { cause: error });
+      }
+      // A merely in-flight newer request is not authoritative yet. Abort this
+      // caller instead of handing it cached paths that could drive a reopen or
+      // delete after that newer request also fails.
+      if (Array.from(this.cloudListingRequestsInFlight).some((candidate) => candidate > generation)) {
+        throw Object.assign(new Error('cloud listing request superseded'), { cause: error });
+      }
+      if (error?.authRejected) this.noteError('cloud-list', error);
+      throw error;
+    } finally {
+      this.cloudListingRequestsInFlight.delete(generation);
+    }
+  }
+
+  cloudListingIsCurrent(listing) {
+    return (
+      this.lastCloudListing === listing &&
+      listing.generation === this.cloudListingPublishedGeneration &&
+      listing.generation === this.cloudListingRequestGeneration
     );
-    if (!response.ok) throw new Error(`cloud files list failed status=${response.status}`);
-    const body = await response.json();
-    const cloudFiles = Array.isArray(body.files) ? body.files : [];
-    this.lastCloudListing = {
-      text: new Set(cloudFiles.filter((file) => file.type === 'text').map((file) => String(file.path))),
-      // Deletion checks ALL cloud paths, not just text ones — a cloud-side
-      // rename to a blob/other type is not a delete of the local file.
-      all: new Set(cloudFiles.map((file) => String(file.path))),
-      stamps: new Map(cloudFiles.map((file) => [String(file.path), String(file.updated_at ?? '')])),
-      // Binary rows, content-addressed: '' = row without a blob_sha (legacy
-      // storage_key upload) — present but not diffable.
-      blobShas: new Map(
-        cloudFiles
-          .filter((file) => file.type !== 'text' && file.type !== 'folder')
-          .map((file) => [String(file.path), String(file.blob_sha ?? '')]),
-      ),
-      fetchedAt: Date.now(),
-    };
-    return this.lastCloudListing;
   }
 
   // ---- Doc comments (cloud backing store) ---------------------------------
@@ -1131,7 +1934,7 @@ export class ShareEngine {
   // on, which is what turns "different" into a direction (upload vs download).
 
   isBlobPath(rel) {
-    return this.scopeContains(rel) && !isIgnoredPath(rel) && fileKind(rel) === 'blob';
+    return this.scopeContains(rel) && !isIgnoredPath(rel) && fileKindForFile(rel) === 'blob';
   }
 
   /** Disk state of a local blob. Idle polls trust the recorded mtime+size and
@@ -1154,17 +1957,24 @@ export class ShareEngine {
    *  latest listing; '' = cloud row without a sha; null = no cloud row;
    *  undefined = look it up. Conflict policy matches the text bridges: when
    *  both sides changed since the last agreed state, local wins. */
-  async syncBlob(localRel, cloudSha = undefined, { rehash = false } = {}) {
-    if (this.stopped || this.status === 'error' || !this.isBlobPath(localRel)) return;
+  async syncBlob(localRel, cloudSha = undefined, { rehash = false, listingStillCurrent = null } = {}) {
+    if (
+      this.stopped ||
+      this.status === 'error' ||
+      !this.isBlobPath(localRel)
+    ) return;
+    if (listingStillCurrent && !listingStillCurrent()) return;
     if (this.blobBusy.has(localRel)) {
       // A transfer is mid-flight — don't drop this trigger's intent (e.g. a
       // local edit during a download); the next poll re-reconciles it.
       this.pendingBlobSyncs.add(localRel);
+      if (this.status === 'active') this.status = 'starting';
       return;
     }
     this.blobBusy.add(localRel);
     // Queued until proven in sync — any throw below leaves it for the next poll.
     this.pendingBlobSyncs.add(localRel);
+    if (this.status === 'active') this.status = 'starting';
     try {
       if (cloudSha === undefined) {
         // Local-event path (watcher edit, rename, deferred retry): never
@@ -1173,11 +1983,13 @@ export class ShareEngine {
         // deleted file. A FRESH listing lets delete-wins see the absence.
         // (Poll/first-sync callers pass their own snapshot's sha explicitly.)
         const listing = await this.fetchCloudPaths();
+        if (listingStillCurrent && !listingStillCurrent()) return;
         const cloudPath = this.localToCloud(localRel);
         cloudSha = listing.blobShas.get(cloudPath) ?? (listing.all.has(cloudPath) ? '' : null);
       }
       const synced = this.store.getBlobSync(this.share.id, localRel)?.sha ?? null;
       const local = await this.localBlobState(localRel, { rehash });
+      if (listingStillCurrent && !listingStillCurrent()) return;
       if (local.tooLarge) {
         if (!this.loggedBlobSkips.has(localRel)) {
           this.loggedBlobSkips.add(localRel);
@@ -1190,8 +2002,7 @@ export class ShareEngine {
         // would resurrect a later local delete. A failed cloud delete throws,
         // leaving this queued for the next poll.
         if (this.store.hasBridgeFile(this.share.id, localRel)) {
-          await this.cloudDelete(this.localToCloud(localRel));
-          this.store.forgetBridgeFile(this.share.id, localRel);
+          await this.unbridgeOversized(localRel);
           this.log(`blob unbridged (grew over cap, now local-only) file=${localRel}`);
         }
         this.pendingBlobSyncs.delete(localRel);
@@ -1240,6 +2051,7 @@ export class ShareEngine {
       this.pendingBlobSyncs.delete(localRel);
     } finally {
       this.blobBusy.delete(localRel);
+      if (!this.pendingBlobSyncs.has(localRel)) this.progressFailedPaths.delete(localRel);
     }
   }
 
@@ -1425,6 +2237,8 @@ export class ShareEngine {
       mtimeMs: Math.trunc(stat.mtimeMs),
       size: stat.size,
     });
+    await this.refreshProgressLocalPath(localRel);
+    this.scheduleProgressPublish();
     this.manager.emitFilesChanged(this.project.id, localRel);
     this.log(`blob down file=${localRel} sha=${sha.slice(0, 8)}${expectedSha && sha !== expectedSha ? ' (listing was stale)' : ''}`);
   }
@@ -1435,6 +2249,7 @@ export class ShareEngine {
     this.status = 'error';
     this.error = `cloud sync operation failed: ${label} (retrying)`;
     this.log(`share ${this.share.id} queued retry: ${label}`);
+    this.publishProgress({ force: true });
   }
 
   async flushPendingCloudOps() {
@@ -1461,7 +2276,7 @@ export class ShareEngine {
     }
     if (this.pendingCloudOps.length === 0 && this.opsParked && !this.authError) {
       this.opsParked = false;
-      this.status = 'active';
+      this.status = this.hasOpenBacklog() ? 'starting' : 'active';
       this.error = null;
       // Bridging was blocked while parked — pick up local scope files now.
       const local = (await walkProject(this.project.root)).filter(
@@ -1472,14 +2287,52 @@ export class ShareEngine {
   }
 
   async pollCloud() {
+    if (this.pollInFlight) return this.pollInFlight;
+    const poll = this.pollCloudPass();
+    this.pollInFlight = poll;
+    try {
+      return await poll;
+    } catch (error) {
+      // Record the failure BEFORE the finally heartbeat. Otherwise a cached
+      // successful inventory can publish up_to_date while every new listing
+      // is failing; cloud-report failure itself never enters this method.
+      this.noteError('cloud-poll', error);
+      return undefined;
+    } finally {
+      if (this.pollInFlight === poll) this.pollInFlight = null;
+      this.publishProgress({ heartbeat: true });
+    }
+  }
+
+  async pollCloudPass() {
     if (this.stopped || !this.share.api_origin) return;
-    await this.flushPendingCloudOps();
+    const errorRevisionAtStart = this.errorRevision;
+    // A failed cloud mutation intentionally parks the share as `error`, but
+    // its retry queue must still run; auth/recovery errors without queued
+    // operations remain parked.
+    if (this.opsParked) await this.flushPendingCloudOps();
+    if (this.stopped) return;
+    if (this.status === 'error') {
+      // Parked share: file sync must not act on a cloud it can't trust, but
+      // the side channels stay live — a doc-level auth park must not stop
+      // ledger shipping or comment mirroring (each has its own park logic).
+      await this.syncLedger();
+      await this.pollCloudComments().catch((error) => {
+        this.log(`share ${this.share.id} comments-poll: ${error?.message || error}`);
+      });
+      return;
+    }
     // Still parked (a queued delete/move hasn't landed): the cloud is in a
     // state the queued ops haven't caught up with — pulling files or sweeping
     // deletes against it would act on exactly the paths those ops own.
     if (this.opsParked) return;
     const cloudPaths = await this.fetchCloudPaths();
+    // A later-issued listing may already be in flight. This response can be
+    // useful as a cache, but must not drive cloud-positive opens/downloads:
+    // the newer response may be observing a deletion of one of these rows.
+    if (!this.cloudListingIsCurrent(cloudPaths)) return;
     const { text: cloudTextPaths, stamps: cloudStamps } = cloudPaths;
+    let deletionListing = cloudPaths;
     let cloudAllPaths = cloudPaths.all;
     // Set by any stage that can UPLOAD paths the poll-start listing predates;
     // the delete sweeps at the bottom refetch before trusting the listing.
@@ -1491,7 +2344,21 @@ export class ShareEngine {
       // file synced after start() would queue resume-opens forever.
       const pending = this.deferredResume;
       this.deferredResume = null;
-      await this.bridgeAll(await this.reconcileOfflineDeletes(pending, cloudPaths));
+      const listingStillCurrent = () => this.cloudListingIsCurrent(cloudPaths);
+      const reconciled = await this.reconcileOfflineDeletes(
+        pending,
+        cloudPaths,
+        listingStillCurrent,
+      );
+      if (reconciled === null) {
+        this.deferredResume = pending;
+        return;
+      }
+      const deferred = await this.bridgeAll(reconciled, { listingStillCurrent });
+      if (deferred.length > 0) {
+        this.deferredResume = deferred;
+        return;
+      }
       // First successful listing after a start()-time outage: reconciliation
       // has now really run, so lift the resume latch and replay everything
       // queued since bind (start() only drains after an immediate one).
@@ -1500,23 +2367,32 @@ export class ShareEngine {
       listingStale = true;
     }
     for (const cloudPath of cloudTextPaths) {
+      if (!this.cloudListingIsCurrent(cloudPaths)) return;
       const localRel = this.cloudToLocal(cloudPath);
       if (this.share.scope_kind === 'file' && cloudPath !== this.localToCloud(this.share.scope_path)) continue;
       // Union shares: cloud files outside every scope (e.g. under a since-
       // removed scope) never materialize locally.
       if (!this.scopeContains(localRel)) continue;
-      if (isIgnoredPath(localRel) || fileKind(localRel) !== 'text') continue;
+      if (isIgnoredPath(localRel) || fileKindForFile(localRel) !== 'text') continue;
+      if (this.progressSkipReason(localRel)) continue;
       if (this.skipUnwritableLocally(localRel)) continue;
       const bridge = this.bridges.get(localRel);
       if (bridge) {
         bridge.cloudSeen = true;
+        bridge.cloudMissingAt = 0;
+        bridge.staleEmptyMaterialization = false;
+        bridge.staleEmptyVersion = null;
         continue;
       }
       const synced = this.store.hasBridgeFile(this.share.id, localRel);
       // Synced file with a closed idle bridge: reopen only when the cloud row
       // moved past the stamp recorded at close (a collaborator edited it).
       if (synced && this.syncedStamps.get(localRel) === cloudStamps.get(cloudPath)) continue;
-      await this.ensureBridge(localRel).catch((error) => this.noteError(localRel, error));
+      await this.ensureBridge(localRel, {
+        retainOnFailure: false,
+        listingStillCurrent: () => this.cloudListingIsCurrent(cloudPaths),
+      }).catch((error) => this.noteError(localRel, error));
+      if (!this.cloudListingIsCurrent(cloudPaths)) return;
       const created = this.bridges.get(localRel);
       if (created) created.cloudSeen = true;
       if (synced) continue;
@@ -1535,10 +2411,15 @@ export class ShareEngine {
     // retry any queued blob syncs (failed transfers, local changes seen while
     // the listing was unavailable). syncBlob no-ops once the shas agree.
     for (const [cloudPath, sha] of cloudPaths.blobShas) {
+      if (!this.cloudListingIsCurrent(cloudPaths)) return;
       const localRel = this.cloudToLocal(cloudPath);
       if (this.share.scope_kind === 'file' && cloudPath !== this.localToCloud(this.share.scope_path)) continue;
       if (!this.isBlobPath(localRel)) continue;
-      await this.syncBlob(localRel, sha).catch((error) => this.noteError(localRel, error));
+      if (this.progressSkipReason(localRel)) continue;
+      await this.syncBlob(localRel, sha, {
+        listingStillCurrent: () => this.cloudListingIsCurrent(cloudPaths),
+      }).catch((error) => this.noteError(localRel, error));
+      if (!this.cloudListingIsCurrent(cloudPaths)) return;
     }
     if (this.pendingBlobSyncs.size > 0) {
       // ONE fresh snapshot for the whole drain: entries were queued by local
@@ -1547,9 +2428,14 @@ export class ShareEngine {
       // file) — while the undefined fallback would fan out a listing fetch
       // per path. Refetch failure falls back to the poll snapshot; the
       // transfer itself would fail on such a network anyway and requeue.
-      await this.fetchCloudPaths().catch(() => null);
+      const retryListing = await this.fetchCloudPaths().catch(() => null);
+      if (!retryListing || !this.cloudListingIsCurrent(retryListing)) return;
       for (const localRel of Array.from(this.pendingBlobSyncs)) {
-        await this.syncBlob(localRel, this.cachedCloudSha(localRel)).catch((error) => this.noteError(localRel, error));
+        if (!this.cloudListingIsCurrent(retryListing)) return;
+        await this.syncBlob(localRel, this.cachedCloudSha(localRel), {
+          listingStillCurrent: () => this.cloudListingIsCurrent(retryListing),
+        }).catch((error) => this.noteError(localRel, error));
+        if (!this.cloudListingIsCurrent(retryListing)) return;
       }
       listingStale = true;
     }
@@ -1560,17 +2446,102 @@ export class ShareEngine {
       // local files. One refetch, or no sweeps at all this poll: falling
       // back to the stale listing reaps them just the same.
       const refreshed = await this.fetchCloudPaths().catch(() => null);
-      if (!refreshed) return;
+      if (!refreshed || !this.cloudListingIsCurrent(refreshed)) return;
+      deletionListing = refreshed;
       cloudAllPaths = refreshed.all;
     }
+
+    // Listing fetches also happen outside pollCloud (blob edits and cap
+    // relief). If one completes while this pass is working, absence in this
+    // older snapshot is no longer authoritative enough to delete local data.
+    // Re-check after every awaited bridge teardown as well.
+    const deletionListingIsCurrent = () => this.cloudListingIsCurrent(deletionListing);
+    let deletionListingSuperseded = !deletionListingIsCurrent();
 
     // A bridged file that HAD been seen in the cloud and is now absent from
     // the ENTIRE cloud listing was deleted by a collaborator → mirror locally.
     for (const [localRel, bridge] of Array.from(this.bridges.entries())) {
       if (this.stopped) return; // stop() mid-poll: no disk deletes during shutdown
-      if (!bridge.cloudSeen || cloudAllPaths.has(bridge.cloudPath)) continue;
+      if (deletionListingSuperseded || !deletionListingIsCurrent()) {
+        deletionListingSuperseded = true;
+        break;
+      }
+      if (this.progressSkipReason(localRel)) continue;
+      if (!bridge.cloudSeen || cloudAllPaths.has(bridge.cloudPath)) {
+        if (cloudAllPaths.has(bridge.cloudPath)) bridge.cloudMissingAt = 0;
+        continue;
+      }
+      // First-sync bridges are not deletable until start() records a durable
+      // agreement. Otherwise a listing that predates their cloud persist can
+      // erase the local source file while the provider is still starting.
+      if (!this.store.hasBridgeFile(this.share.id, localRel)) continue;
+      // A cloud absence racing an update that has not reached Hocuspocus yet
+      // is not authoritative enough to erase the local edit.
+      if (!bridge.cloudMissingAt) {
+        bridge.cloudMissingAt = Date.now();
+        continue;
+      }
+      // Give the disk watcher + local DocHost time to ingest bytes written just
+      // before this listing. `synced=false` can be the expected result of a
+      // real cloud delete closing the provider, so the durable safety signals
+      // are an acknowledged provider, a quiescent local persist, and a second
+      // absent listing after the watcher debounce window.
+      if (Date.now() - bridge.cloudMissingAt < Math.max(1_000, this.docHost.persistDebounceMs * 2)) continue;
+      if (bridge.provider?.hasUnsyncedChanges || this.docHost.hasPendingPersist(bridge.localDocName)) continue;
+      if (this.pendingResumeOpens.has(localRel)) continue;
+      // The loop is a bridge-map snapshot. A prior await may have rotated
+      // this path already; never tear down the replacement by key.
+      if (this.bridges.get(localRel) !== bridge) continue;
+      const versionBeforeRead = this.localFileVersion(localRel);
+      const disk = await readTextFile(this.project.root, localRel).catch(() => null);
+      const versionAfterRead = this.localFileVersion(localRel);
+      if (
+        versionAfterRead !== null &&
+        (
+          versionBeforeRead !== versionAfterRead ||
+          disk === null ||
+          !this.docHost.hasObservedDiskText(bridge.localDocName, disk.text)
+        )
+      ) {
+        // Raw bytes can precede the debounced watcher callback. The active
+        // delete rail must not snapshot those bytes as an agreed baseline and
+        // unlink them; ingest/re-share them as explicit local intent instead.
+        this.retainLocalIntent(localRel);
+        this.pendingDiskReconciles.add(localRel);
+        bridge.cloudMissingAt = 0;
+        continue;
+      }
+      const versionBeforeDrop = this.localFileVersion(localRel);
       await this.dropBridge(localRel);
-      if (this.share.scope_kind === 'file') {
+      if (this.stopped) return;
+      const fingerprintAfterDrop = this.localFileFingerprint(localRel);
+      const versionAfterDrop = fingerprintAfterDrop?.version ?? null;
+      const editedDuringDrop = versionAfterDrop !== null && versionAfterDrop !== versionBeforeDrop;
+      const hasReplacement = this.bridges.has(localRel);
+      const unchangedStaleEmpty =
+        bridge.staleEmptyMaterialization &&
+        bridge.staleEmptyVersion !== null &&
+        versionBeforeDrop === bridge.staleEmptyVersion &&
+        versionAfterDrop === bridge.staleEmptyVersion;
+      if (editedDuringDrop && !hasReplacement) {
+        // The watcher/open callback may still be queued behind this promise
+        // continuation. Preserve the bytes now and make the local edit win.
+        this.pendingResumeOpens.add(localRel);
+        if (this.status === 'active') this.status = 'starting';
+      }
+      const locallyReopened = editedDuringDrop || this.pendingResumeOpens.has(localRel) || hasReplacement;
+      if (!deletionListingIsCurrent() || locallyReopened) {
+        // Leave the durable bridge row + local file intact. The next current
+        // poll will reopen it if present or apply the confirmed delete.
+        this.syncedStamps.delete(localRel);
+        this.syncedLocalVersions.delete(localRel);
+        if (!deletionListingIsCurrent()) {
+          deletionListingSuperseded = true;
+          break;
+        }
+        continue;
+      }
+      if (this.share.scope_kind === 'file' && !unchangedStaleEmpty) {
         // A single-file share can't distinguish a cloud delete from a cloud
         // RENAME (the share is pinned to one basename) — deleting the local
         // file on absence would turn a rename into data loss. Keep the file
@@ -1580,8 +2551,9 @@ export class ShareEngine {
         this.log(`file-share cloud path gone file=${localRel}; share parked`);
         continue;
       }
-      this.store.forgetBridgeFile(this.share.id, localRel);
       await deleteFile(this.project.root, localRel).catch(() => {});
+      await this.refreshProgressLocalPath(localRel);
+      this.store.forgetBridgeFile(this.share.id, localRel);
       this.store.recordEdit({ projectId: this.project.id, path: localRel, actor: 'remote', contentText: null });
       await this.docHost.handleDiskChange(this.project.id, localRel).catch(() => {});
       this.manager.emitFilesChanged(this.project.id, localRel);
@@ -1591,9 +2563,11 @@ export class ShareEngine {
     // Synced files whose idle bridges CLOSED see collaborator deletes here:
     // bridges only close after their cloud row was confirmed in a listing, so
     // absence from the whole listing is a genuine cloud-side delete.
-    for (const localRel of this.store.listBridgeFiles(this.share.id)) {
+    for (const localRel of deletionListingSuperseded ? [] : this.store.listBridgeFiles(this.share.id)) {
       if (this.stopped) return; // stop() mid-poll: no disk deletes during shutdown
+      if (!deletionListingIsCurrent()) break;
       if (this.bridges.has(localRel) || !this.scopeContains(localRel)) continue;
+      if (this.progressSkipReason(localRel)) continue;
       if (cloudAllPaths.has(this.localToCloud(localRel))) continue;
       if (this.share.scope_kind === 'file') {
         this.status = 'error';
@@ -1601,9 +2575,28 @@ export class ShareEngine {
         this.log(`file-share cloud path gone file=${localRel}; share parked`);
         continue;
       }
-      this.syncedStamps.delete(localRel);
-      this.store.forgetBridgeFile(this.share.id, localRel);
+      // A local edit/open that could not get a live slot is queued to
+      // re-share. It wins over a concurrent cloud delete, just like the
+      // startup reconciliation rescue path above; deleting here would erase
+      // the edit before the queue can drain.
+      if (this.pendingResumeOpens.has(localRel)) {
+        this.log(`bridge cloud-delete skipped (local file queued to re-share) file=${localRel}`);
+        continue;
+      }
+      const closedVersion = this.syncedLocalVersions.get(localRel);
+      const currentFingerprint = this.localFileFingerprint(localRel);
+      const currentVersion = currentFingerprint?.version ?? null;
+      if (closedVersion !== undefined && currentVersion !== null && currentVersion !== closedVersion) {
+        this.pendingResumeOpens.add(localRel);
+        if (this.status === 'active') this.status = 'starting';
+        this.log(`bridge cloud-delete skipped (idle local file changed, re-sharing) file=${localRel}`);
+        continue;
+      }
       await deleteFile(this.project.root, localRel).catch(() => {});
+      await this.refreshProgressLocalPath(localRel);
+      this.syncedStamps.delete(localRel);
+      this.syncedLocalVersions.delete(localRel);
+      this.store.forgetBridgeFile(this.share.id, localRel);
       this.store.recordEdit({ projectId: this.project.id, path: localRel, actor: 'remote', contentText: null });
       await this.docHost.handleDiskChange(this.project.id, localRel).catch(() => {});
       this.manager.emitFilesChanged(this.project.id, localRel);
@@ -1619,20 +2612,37 @@ export class ShareEngine {
     // edit/editor connect via events, cloud edit via the stamp check above).
     const now = Date.now();
     for (const [localRel, bridge] of Array.from(this.bridges.entries())) {
+      if (this.bridges.get(localRel) !== bridge) continue;
       if (now - bridge.lastActivity < BRIDGE_IDLE_MS) continue;
       const stamp = this.closableStamp(localRel, bridge);
-      if (stamp !== null) await this.closeBridgeKeepingSynced(localRel, stamp);
+      if (stamp !== null) await this.closeBridgeKeepingSynced(localRel, stamp, bridge);
     }
+
+    // The startup walk and watcher activation overlap. Verify disk again only
+    // after a complete cloud pass so an event that arrived before the progress
+    // inventory existed cannot make the first report claim up_to_date.
+    await this.verifyProgressInventory();
 
     // A full poll pass succeeded: a lingering transient error (cloud-list
     // outage, per-file timeout) is over — clear it so the UI stops warning.
     // Parked states (status 'error') stay until a token refresh / re-share,
     // and ledger errors are owned by syncLedger below (clearing here would
     // flick a still-broken ledger's error off and on every poll).
-    if (this.error && this.status === 'active' && !this.error.startsWith('ledger-sync')) {
-      this.error = null;
-      this.manager.emitSharesChanged(this.project.id);
+    let shareHealthChanged = false;
+    if (!this.hasOpenBacklog() && this.status === 'starting') {
+      this.status = 'active';
+      shareHealthChanged = true;
     }
+    if (
+      this.error &&
+      this.status === 'active' &&
+      !this.error.startsWith('ledger-sync') &&
+      this.errorRevision === errorRevisionAtStart
+    ) {
+      this.error = null;
+      shareHealthChanged = true;
+    }
+    if (shareHealthChanged) this.manager.emitSharesChanged(this.project.id);
 
     // Ship new granular ledger rows (edit attribution, chats, decisions) to
     // the cloud mirror — LAST: it's a side channel, and a large retained
@@ -1716,28 +2726,72 @@ export class ShareEngine {
       }
       return;
     }
-    const abs = resolveInRoot(this.project.root, localRel);
-    const stat = abs ? await fsp.stat(abs).catch(() => null) : null;
-    if (stat?.isFile()) {
-      if (fileKind(localRel) === 'blob') {
-        // A watcher event means the bytes really moved — bypass the stat cache
-        // (same-size rewrites can share its mtime bucket).
-        await this.syncBlob(localRel, undefined, { rehash: true }).catch((error) => this.noteError(localRel, error));
+    const trackProgress = this.scopeContains(localRel) && !isIgnoredPath(localRel);
+    if (trackProgress) {
+      this.progressDirtyPaths.add(localRel);
+      await this.refreshProgressLocalPath(localRel);
+      this.scheduleProgressPublish();
+    }
+    try {
+      const abs = resolveInRoot(this.project.root, localRel);
+      const stat = abs ? await fsp.stat(abs).catch(() => null) : null;
+      if (stat?.isFile()) {
+        if (syncSkipReason(this.progressLocalFiles?.get(localRel), { blobMaxBytes: BLOB_SYNC_MAX_BYTES })) {
+          await this.unbridgeOversized(localRel);
+          this.pendingResumeOpens.delete(localRel);
+          this.pendingBlobSyncs.delete(localRel);
+          if (!this.loggedProgressSkips) this.loggedProgressSkips = new Set();
+          if (!this.loggedProgressSkips.has(localRel)) {
+            this.loggedProgressSkips.add(localRel);
+            this.log(`share ${this.share.id} sync skipped by size policy file=${localRel}`);
+          }
+          return;
+        }
+        if (fileKindForFile(localRel) === 'blob') {
+          // A watcher event means the bytes really moved — bypass the stat cache
+          // (same-size rewrites can share its mtime bucket).
+          await this.syncBlob(localRel, undefined, { rehash: true }).catch((error) => this.noteError(localRel, error));
+          return;
+        }
+        if (this.scopeContains(localRel)) {
+          const bridge = this.bridges.get(localRel);
+          if (bridge && !bridge.started) {
+            this.retainLocalIntent(localRel);
+          } else if (!bridge) {
+            await this.ensureBridge(localRel).catch((error) => this.noteError(localRel, error));
+          }
+        }
         return;
       }
-      if (this.scopeContains(localRel) && !this.bridges.has(localRel)) {
-        await this.ensureBridge(localRel).catch((error) => this.noteError(localRel, error));
+      if (stat?.isDirectory()) {
+        // A tree delete can preserve the folder (protected children stay) —
+        // sweep bridged descendants whose own files are gone.
+        for (const rel of this.bridgedUnder(localRel)) {
+          if (rel === localRel) continue;
+          const relAbs = resolveInRoot(this.project.root, rel);
+          const relStat = relAbs ? await fsp.stat(relAbs).catch(() => null) : null;
+          if (relStat) continue;
+          await this.refreshProgressLocalPath(rel);
+          await this.dropBridge(rel);
+          const cloudPath = this.localToCloud(rel);
+          const run = async () => {
+            await this.cloudDelete(cloudPath);
+            this.store.forgetBridgeFile(this.share.id, rel);
+          };
+          try {
+            await run();
+          } catch {
+            this.queueCloudOp(`delete ${cloudPath}`, run);
+          }
+        }
+        return;
       }
-      return;
-    }
-    if (stat?.isDirectory()) {
-      // A tree delete can preserve the folder (protected children stay) —
-      // sweep bridged descendants whose own files are gone.
+      if (stat) return; // other non-file — nothing to bridge
+      // Gone from disk: tear down this path AND any bridged descendants (a
+      // folder delete fires one event for the folder), then mirror to the cloud.
+      // A failed cloud delete keeps the bridge_files row (and the share error)
+      // so the orphan is visible instead of silently forgotten.
       for (const rel of this.bridgedUnder(localRel)) {
-        if (rel === localRel) continue;
-        const relAbs = resolveInRoot(this.project.root, rel);
-        const relStat = relAbs ? await fsp.stat(relAbs).catch(() => null) : null;
-        if (relStat) continue;
         await this.dropBridge(rel);
         const cloudPath = this.localToCloud(rel);
         const run = async () => {
@@ -1750,24 +2804,11 @@ export class ShareEngine {
           this.queueCloudOp(`delete ${cloudPath}`, run);
         }
       }
-      return;
-    }
-    if (stat) return; // other non-file — nothing to bridge
-    // Gone from disk: tear down this path AND any bridged descendants (a
-    // folder delete fires one event for the folder), then mirror to the cloud.
-    // A failed cloud delete keeps the bridge_files row (and the share error)
-    // so the orphan is visible instead of silently forgotten.
-    for (const rel of this.bridgedUnder(localRel)) {
-      await this.dropBridge(rel);
-      const cloudPath = this.localToCloud(rel);
-      const run = async () => {
-        await this.cloudDelete(cloudPath);
-        this.store.forgetBridgeFile(this.share.id, rel);
-      };
-      try {
-        await run();
-      } catch {
-        this.queueCloudOp(`delete ${cloudPath}`, run);
+    } finally {
+      if (trackProgress) {
+        await this.refreshProgressLocalPath(localRel);
+        this.progressDirtyPaths.delete(localRel);
+        this.scheduleProgressPublish();
       }
     }
   }
@@ -1776,7 +2817,13 @@ export class ShareEngine {
     const fromIn = this.scopeContains(fromRel);
     const toIn = this.scopeContains(toRel);
     if (!fromIn && !toIn) return;
-    if (fromIn) {
+    const progressPaths = [fromIn ? fromRel : null, toIn ? toRel : null].filter(Boolean);
+    for (const path of progressPaths) this.progressDirtyPaths.add(path);
+    await this.refreshProgressLocalPath(fromRel);
+    await this.refreshProgressLocalPath(toRel);
+    this.scheduleProgressPublish();
+    try {
+      if (fromIn) {
       // Tear down the old-path bridges (exact file or folder subtree) and move
       // or remove the cloud side. The cloud move is attempted even when no
       // bridge is live yet (e.g. renamed before the first sync finished) so no
@@ -1822,29 +2869,41 @@ export class ShareEngine {
           }
         }
       }
-    }
-    if (!toIn) return;
-    // Re-bridge whatever now exists at the new path (file or folder subtree);
-    // deterministic seeds make the re-attach a no-op merge.
-    const toAbs = resolveInRoot(this.project.root, toRel);
-    const toStat = toAbs ? await fsp.stat(toAbs).catch(() => null) : null;
-    if (toStat?.isFile()) {
-      await (fileKind(toRel) === 'blob' ? this.syncBlob(toRel) : this.ensureBridge(toRel)).catch(
-        (error) => this.noteError(toRel, error),
-      );
-    } else if (toStat?.isDirectory()) {
-      const files = (await walkProject(this.project.root)).filter(
-        (file) =>
-          (file.type === 'text' || file.type === 'blob') &&
-          (file.path === toRel || file.path.startsWith(`${toRel}/`)),
-      );
-      await this.bridgeAll(files);
+      }
+      if (!toIn) return;
+      // Re-bridge whatever now exists at the new path (file or folder subtree);
+      // deterministic seeds make the re-attach a no-op merge.
+      const toAbs = resolveInRoot(this.project.root, toRel);
+      const toStat = toAbs ? await fsp.stat(toAbs).catch(() => null) : null;
+      if (toStat?.isFile()) {
+        await this.refreshProgressLocalPath(toRel);
+        if (!this.progressSkipReason(toRel)) {
+          await (fileKindForFile(toRel) === 'blob' ? this.syncBlob(toRel) : this.ensureBridge(toRel)).catch(
+            (error) => this.noteError(toRel, error),
+          );
+        }
+      } else if (toStat?.isDirectory()) {
+        const files = (await walkProject(this.project.root)).filter(
+          (file) =>
+            (file.type === 'text' || file.type === 'blob') &&
+            (file.path === toRel || file.path.startsWith(`${toRel}/`)),
+        );
+        if (this.progressLocalFiles) {
+          for (const file of files) this.progressLocalFiles.set(file.path, file);
+        }
+        await this.bridgeAll(files);
+      }
+    } finally {
+      for (const path of progressPaths) this.progressDirtyPaths.delete(path);
+      this.scheduleProgressPublish();
     }
   }
 
   async stop() {
     this.stopped = true;
     if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.progressPublishTimer) clearTimeout(this.progressPublishTimer);
+    if (this.progressHeartbeatTimer) clearInterval(this.progressHeartbeatTimer);
     await Promise.all(Array.from(this.bridges.keys()).map((rel) => this.dropBridge(rel)));
     // After the bridges' final drops: rejects any still-hung cloud fetch so a
     // background resume blocked on it settles and shutdown's join returns.
@@ -2107,21 +3166,45 @@ export class SyncBridgeManager {
       await this.removeShareLocked(projectId, share.id);
       share = null;
     }
+    const mintKey = typeof body.mintKey === 'string' && body.mintKey.trim() ? body.mintKey.trim() : null;
+    const mintKind = body.mintKind === 'user' || body.mintKind === 'mcp' ? body.mintKind : null;
+    const refreshCredential =
+      typeof body.refreshCredential === 'string' && body.refreshCredential.trim()
+        ? body.refreshCredential.trim()
+        : null;
+    if (mintKind === 'mcp' && !refreshCredential) {
+      throw Object.assign(new Error('refreshCredential is required for MCP folder sync'), { status: 400 });
+    }
     if (!share) {
       // mintKey: the identity that owns an ATTACHED workspace (serve.sh
       // --workspace), when it differs from the install's own — the daemon's
       // daily re-mint presents it instead of the install identity.
       // mintKind 'user': re-mint with the signed-in account's credentials
       // (settings.agent_credentials) instead of any anon key.
-      const mintKey = typeof body.mintKey === 'string' && body.mintKey.trim() ? body.mintKey.trim() : null;
-      const mintKind = body.mintKind === 'user' ? 'user' : null;
-      share = this.store.addShare({ projectId, workspaceId, scopePath: '', scopeKind: 'union', collabUrl, apiOrigin, token, mintKey, mintKind });
+      share = this.store.addShare({
+        projectId,
+        workspaceId,
+        scopePath: '',
+        scopeKind: 'union',
+        collabUrl,
+        apiOrigin,
+        token,
+        mintKey,
+        mintKind,
+        refreshCredential,
+      });
     } else {
       this.store.updateShareConnection(share.id, {
         collabUrl: collabUrl || share.collab_url,
         apiOrigin,
         token,
       });
+      // A fresh one-time MCP handoff rotates the workspace-scoped renewal
+      // credential. Other existing-share refreshes omit mint metadata and
+      // therefore keep the identity already bound to the row.
+      if ('mintKind' in body || 'mintKey' in body || 'refreshCredential' in body) {
+        this.store.updateShareMint(share.id, { mintKey, mintKind, refreshCredential });
+      }
     }
     // Fresh scopes get the next per-project GENERATION; a re-add of a live
     // scope keeps its existing one (conflict no-op).
@@ -2291,12 +3374,45 @@ export class SyncBridgeManager {
         this.store.forgetBridgeFile(share.id, rel);
       }
     }
+    // Conversations, unlike files, do NOT stay behind as history. Strictly
+    // best-effort and strictly after the audience revoke above: a failure here
+    // leaves orphan mirror chats in a private workspace, never a live share,
+    // and must not block the stop the user asked for.
+    await this.purgeCloudChats(share, scope, remaining, freshToken).catch((error) => {
+      this.log(`chat mirror purge failed share=${share.id} error=${error?.message}`);
+    });
     const next = await this.restartUnionEngine(projectId, share.id);
     if (next) {
       await next.start().catch((error) => {
         this.log(`union share restart failed id=${share.id} error=${error?.message}`);
       });
     }
+  }
+
+  /** Drop the cloud twins of the chats a stopped scope mirrored: the route
+   *  deletes those `chats`/`messages` and their ledger events, and nothing
+   *  else. Only chat-bearing scopes have anything to purge: a folder/file
+   *  stop never mirrored a conversation. A remaining scope that still mirrors
+   *  a chat keeps it (a project scope covers every chat; a chat scope covers
+   *  its own), so a partial stop can't take a live share's mirror with it.
+   *  Clearing the version state is paired with the whole-workspace purge: it
+   *  is what lets a re-share mirror from v1 into an empty workspace. */
+  async purgeCloudChats(share, scope, remaining, freshToken) {
+    if (scope.scope_kind !== 'project' && scope.scope_kind !== 'chat') return;
+    if (scope.scope_kind === 'chat' && remaining.some((entry) => entry.scope_kind === 'project')) return;
+    const kept = remaining.filter((entry) => entry.scope_kind === 'chat').map((entry) => entry.scope_path);
+    let chatIds = scope.scope_kind === 'chat' ? [scope.scope_path] : null;
+    if (chatIds === null && kept.length > 0) {
+      chatIds = this.store.listChats(share.project_id).map((chat) => chat.id).filter((id) => !kept.includes(id));
+      if (chatIds.length === 0) return;
+    }
+    const res = await fetch(`${share.api_origin}/api/workspace/local-ledger`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${freshToken || share.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workspaceId: share.workspace_id, ...(chatIds ? { chatIds } : {}) }),
+    });
+    if (!res.ok) throw new Error(`status=${res.status}`);
+    if (!chatIds) this.store.clearLedgerChatState(share.project_id, share.workspace_id);
   }
 
   /** Stop + re-create the union engine from current store state. Returns the
@@ -2341,13 +3457,14 @@ export class SyncBridgeManager {
       error: engine?.error ?? null,
       bridgedFiles: engine?.bridges.size ?? 0,
       syncedFiles: synced.filter((rel) => scopeCoversPath(scope, rel)).length,
+      progress: scope.scope_kind === 'chat' ? null : engine?.progressForScope(scope) ?? null,
     };
   }
 
   describeShare(share) {
     const engine = this.engines.get(share.id);
-    // Never echo the token back out.
-    const { token, ...safe } = share;
+    // Never echo either cloud credential back out.
+    const { token, refresh_credential, ...safe } = share;
     return {
       ...safe,
       status: engine?.status ?? (share.enabled ? 'inactive' : 'disabled'),
@@ -2356,6 +3473,7 @@ export class SyncBridgeManager {
       // Durable "n files shared" count (text + blobs ever synced) — open
       // bridges idle-close, so bridges.size reads 0 on a fully shared project.
       syncedFiles: this.store.listBridgeFiles(share.id).length,
+      progress: share.scope_kind === 'chat' || engine?.ledgerOnly ? null : engine?.progressForScope() ?? null,
     };
   }
 
@@ -2438,12 +3556,52 @@ export class SyncBridgeManager {
       // (e.g. a file-share whose cloud path vanished) are safety stops that a
       // routine token refresh must not undo.
       if (engine.status === 'error' && engine.authError) {
-        engine.status = 'active';
+        engine.status = engine.hasOpenBacklog() ? 'starting' : 'active';
         engine.error = null;
         engine.authError = false;
         this.emitSharesChanged(projectId);
       }
     }
+  }
+
+  /** Refresh an MCP-attached share without ever returning its long-lived
+   *  credential through localhost. The caller asks this token-gated endpoint
+   *  to refresh the row; the sidecar presents the stored workspace-scoped
+   *  credential directly to the deployment that minted it. */
+  async refreshMcpShare(projectId, shareId) {
+    const share = this.store.getShare(shareId);
+    if (
+      !share ||
+      share.project_id !== projectId ||
+      share.mint_kind !== 'mcp' ||
+      !share.refresh_credential ||
+      !share.api_origin
+    ) {
+      throw Object.assign(new Error('unknown MCP share'), { status: 400 });
+    }
+    const response = await fetch(`${share.api_origin}/api/workspace/local-agent/sync-refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshCredential: share.refresh_credential }),
+    }).catch((cause) => {
+      throw Object.assign(new Error(`sync refresh unavailable: ${cause?.message || cause}`), { status: 502 });
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = Object.assign(
+        new Error(payload?.error || `sync refresh rejected (${response.status})`),
+        { status: response.status },
+      );
+      if (response.status === 401 || response.status === 403) {
+        this.engines.get(shareId)?.noteError('token-refresh', new Error(`auth ${response.status}: ${error.message}`));
+      }
+      throw error;
+    }
+    if (payload?.workspaceId !== share.workspace_id || typeof payload?.token !== 'string' || !payload.token) {
+      throw Object.assign(new Error('sync refresh returned invalid workspace credentials'), { status: 502 });
+    }
+    this.refreshShareToken(projectId, shareId, payload.token);
+    return { ok: true };
   }
 
   async removeShareLocked(projectId, shareId) {
@@ -2471,12 +3629,38 @@ export class SyncBridgeManager {
     }
   }
 
+  /** A cloud-origin write can finish after its idle bridge closes. Advance the
+   *  closed-file fingerprint only for that source-aware completion; a later
+   *  external disk edit must still differ and win over a cloud delete. */
+  handleRemotePersist(projectId, relPath) {
+    for (const engine of this.engines.values()) {
+      if (engine.project.id !== projectId || engine.stopped) continue;
+      if (engine.scopeContains(relPath) && !isIgnoredPath(relPath)) {
+        void engine.refreshProgressLocalPath(relPath).then(() => engine.scheduleProgressPublish());
+      }
+      if (engine.bridges.has(relPath) || !engine.syncedStamps.has(relPath)) continue;
+      const version = engine.localFileVersion(relPath);
+      if (version === null) engine.syncedLocalVersions.delete(relPath);
+      else engine.syncedLocalVersions.set(relPath, version);
+    }
+  }
+
   /** An editor connected to a local doc: revive its idle-closed bridge so
    *  typing and cursors relay live instead of waiting on the cloud poll. */
   handleLocalDocOpened(projectId, relPath) {
     if (inExtraRoot(this.store, projectId, relPath)) return;
     for (const engine of this.engines.values()) {
-      if (engine.project.id !== projectId || engine.stopped || engine.bridges.has(relPath)) continue;
+      if (engine.project.id !== projectId || engine.stopped) continue;
+      const bridge = engine.bridges.get(relPath);
+      if (bridge) {
+        if (!bridge.started) {
+          engine.retainLocalIntent(relPath);
+        } else {
+          bridge.staleEmptyMaterialization = false;
+          bridge.staleEmptyVersion = null;
+        }
+        continue;
+      }
       void engine.ensureBridge(relPath).catch((error) => {
         this.log(`bridge editor-open failed path=${relPath} error=${error?.message}`);
       });

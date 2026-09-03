@@ -178,6 +178,58 @@ async function syncChatSnapshots(engine, namespace, chatIds) {
   }
 }
 
+/** Post-share chat activation, for PROJECT scopes only. Sharing a project must
+ *  not ship conversations the user never returns to: the unit's message cursor
+ *  is frozen at the ledger head when the scope is created (addShareScope), and
+ *  a chat mirrors only once a message lands ABOVE that watermark: one sent
+ *  after the share, or one written by a session import. When that happens the
+ *  chat's FULL retained history replays from row zero, pre-share turns
+ *  included: that context is what makes the shared conversation readable.
+ *  Units with no watermark predate the rule and keep mirroring every chat. */
+function loadActivation(store, projectId, unit) {
+  const state = store.chatActivation(unit.cursorKey);
+  if (!state) return null;
+  const seed = state.seed ?? 0;
+  const replayed = new Set(state.replayed ?? []);
+  // Scan only what the cursor has not consumed yet: a row at or below it can
+  // only belong to a chat already activated (the pass stops short of any
+  // other), so `replayed` carries the rest of the set. A months-old share must
+  // not re-scan its whole message history every poll.
+  const scanned = store.ledgerCursor(unit.cursorKey, 'message');
+  const active = new Set([...replayed, ...store.chatsWithMessagesSince(projectId, Math.max(seed, scanned))]);
+  return { seed, replayed, active, pending: [...active].filter((id) => !replayed.has(id)) };
+}
+
+/** Ship newly activated chats' retained history: everything at or below the
+ *  watermark (the cursor pass carries the rest). The replayed set is persisted
+ *  only after the uploads land, so a failure simply retries next pass. */
+async function replayActivatedChats(engine, namespace, unit, activation) {
+  const { store, project } = engine;
+  const spec = KINDS[1];
+  const wanted = new Set(activation.pending);
+  let cursor = 0;
+  while (cursor < activation.seed) {
+    const rows = store.listLedgerRowsSince(spec.table, project.id, cursor, BATCH_ROWS);
+    if (rows.length === 0) break;
+    const events = [];
+    let bytes = 0;
+    for (const row of rows) {
+      cursor = row.rid;
+      if (row.rid > activation.seed) break;
+      if (!wanted.has(row.chat_id)) continue;
+      const payload = spec.payload(row);
+      bytes += Buffer.byteLength(JSON.stringify(payload), 'utf8');
+      events.push({ kind: spec.kind, localId: `${namespace}:${row.id}`, createdAt: row.created_at ?? null, payload });
+      if (bytes >= BATCH_BYTES) break;
+    }
+    if (events.length > 0) await ledgerPost(engine, events);
+    if (rows.length < BATCH_ROWS && cursor >= rows[rows.length - 1].rid) break;
+  }
+  for (const chatId of activation.pending) activation.replayed.add(chatId);
+  activation.pending = [];
+  store.setChatActivation(unit.cursorKey, { seed: activation.seed, replayed: [...activation.replayed] });
+}
+
 /** One-time (per unit) deploy-transition backfill of retained rows below the
  *  current edit cursor, for the two contract upgrades the cursor already
  *  advanced past: bridged CLOUD rows (actor 'remote') were skipped entirely —
@@ -185,7 +237,8 @@ async function syncChatSnapshots(engine, namespace, chatIds) {
  *  and agent rows uploaded without their message_id turn linkage. The cloud
  *  upsert MERGES on (workspace, kind, local_id), so re-sent rows are enriched
  *  in place and never duplicated. The flag is set only after the pass
- *  survives, so a lost ack retries (idempotently) next sync. */
+ *  survives, so a lost ack retries (idempotently) next sync. EDIT rows only:
+ *  it must never re-walk messages, which would defeat chat activation. */
 async function backfillLedgerContract(engine, namespace, unit, spec) {
   const { store, project } = engine;
   const flagKey = `ledger_backfill_v1:${unit.cursorKey}`;
@@ -276,7 +329,8 @@ function ledgerUnits(engine) {
 }
 
 /** One upload pass for one share engine. Path-scoped kinds respect each
- *  unit's scope; chats/messages upload only for whole-project units. A CHAT
+ *  unit's scope; chats/messages upload only for whole-project units, and only
+ *  for the conversations active since the share (see loadActivation). A CHAT
  *  unit inverts that: only its one chat's snapshot + messages upload — no
  *  edits, no decisions, no files. Rows outside scope still advance the
  *  cursor — they are deliberately not shared, not pending. */
@@ -284,9 +338,16 @@ export async function syncShareLedger(engine) {
   const { store, project } = engine;
   const namespace = store.installId();
   for (const unit of ledgerUnits(engine)) {
+    // A project unit ships only chats that saw activity after the share (null
+    // = a pre-rule unit: every project chat, as before).
+    const activation = unit.chatIds === null ? loadActivation(store, project.id, unit) : null;
     // chatIds: null = all project chats (project scope), a set = that chat
-    // (chat scope), undefined = no chat snapshots (folder/file scope).
-    if (unit.chatIds !== undefined) await syncChatSnapshots(engine, namespace, unit.chatIds);
+    // (chat scope) or the active ones, undefined = no chat snapshots
+    // (folder/file scope).
+    if (unit.chatIds !== undefined) {
+      await syncChatSnapshots(engine, namespace, activation ? activation.active : unit.chatIds);
+    }
+    if (activation?.pending.length) await replayActivatedChats(engine, namespace, unit, activation);
     if (unit.kinds.includes('edit')) await backfillLedgerContract(engine, namespace, unit, KINDS[0]);
     for (const spec of KINDS) {
       if (!unit.kinds.includes(spec.kind)) continue;
@@ -297,7 +358,17 @@ export async function syncShareLedger(engine) {
         const events = [];
         let bytes = 0;
         let lastRid = cursor;
+        let blocked = false;
         for (const row of rows) {
+          // A chat that activates DURING this pass has not replayed its
+          // history yet: stop short of its first message rather than advance
+          // the cursor past it, and the next pass ships the conversation
+          // whole. (Every row above the watermark belongs to an active chat,
+          // so this only fires on rows appended mid-pass.)
+          if (activation && spec.kind === 'message' && !activation.active.has(row.chat_id)) {
+            blocked = true;
+            break;
+          }
           lastRid = row.rid;
           // Chat unit: other conversations advance the cursor, never upload.
           if (unit.chatId && row.chat_id !== unit.chatId) continue;
@@ -331,6 +402,7 @@ export async function syncShareLedger(engine) {
           await ledgerPost(engine, events);
         }
         store.setLedgerCursor(unit.cursorKey, spec.kind, lastRid);
+        if (blocked) break;
         if (lastRid === rows[rows.length - 1].rid && rows.length < BATCH_ROWS) break;
       }
     }

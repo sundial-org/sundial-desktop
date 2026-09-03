@@ -72,6 +72,7 @@ export function UserApiKeysTab() {
           <Spinner label="Loading…" />
         ) : (
           <div className="space-y-3">
+            <ClaudeSubscriptionCard requireSignIn={requireSignIn} />
             {BYOK_PROVIDERS.map((provider) => (
               <ProviderKeyCard
                 key={provider.id}
@@ -91,6 +92,184 @@ export function UserApiKeysTab() {
         ) : null}
       </div>
     </div>
+  );
+}
+
+/** "Connect your Claude Code": OAuth PKCE against the user's own Claude
+ *  account (manual-paste variant, no localhost callback on the web). Once
+ *  connected, chats on the Claude Code harness run on their subscription and
+ *  consume no Sundial credits (agent-ts harness/claude.ts prefers it over
+ *  BYOK keys). */
+function ClaudeSubscriptionCard({ requireSignIn }: { requireSignIn: () => boolean }) {
+  const [status, setStatus] = useState<{ connected: boolean; updatedAt: string | null } | null>(null);
+  const [pending, setPending] = useState<{ verifier: string; state: string; authorizeUrl: string } | null>(null);
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState<'start' | 'exchange' | 'disconnect' | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const refreshStatus = useCallback(async () => {
+    try {
+      const response = await fetch('/api/user/claude-oauth', { cache: 'no-store', credentials: 'include' });
+      if (response.ok) setStatus((await response.json()) as { connected: boolean; updatedAt: string | null });
+    } catch {
+      /* card stays in its last state; actions surface their own errors */
+    }
+  }, []);
+  useEffect(() => {
+    void refreshStatus();
+  }, [refreshStatus]);
+
+  const startConnect = useCallback(async () => {
+    if (!requireSignIn()) return;
+    setBusy('start');
+    setError(null);
+    // Open the tab SYNCHRONOUSLY, inside the click's user gesture — a
+    // window.open after the awaited fetch is popup-blocked and the button
+    // silently does nothing (the dev bug report). The blank tab gets pointed
+    // at the authorize URL once the server mints it; the paste step also
+    // renders the URL as a plain link for browsers that block even this.
+    const popup = window.open('about:blank', '_blank');
+    try {
+      const response = await fetch('/api/user/claude-oauth', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ action: 'start' }),
+      });
+      const body = (await response.json().catch(() => null)) as
+        | { authorizeUrl?: string; verifier?: string; state?: string; error?: string }
+        | null;
+      if (!response.ok || !body?.authorizeUrl || !body.verifier || !body.state) {
+        throw new Error(body?.error ?? `Failed (${response.status})`);
+      }
+      setPending({ verifier: body.verifier, state: body.state, authorizeUrl: body.authorizeUrl });
+      if (popup) popup.location.href = body.authorizeUrl;
+    } catch (caught) {
+      popup?.close();
+      setError(caught instanceof Error ? caught.message : 'Could not start the connection');
+    } finally {
+      setBusy(null);
+    }
+  }, [requireSignIn]);
+
+  const exchange = useCallback(async () => {
+    if (!pending || !code.trim()) return;
+    setBusy('exchange');
+    setError(null);
+    try {
+      const response = await fetch('/api/user/claude-oauth', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ action: 'exchange', code: code.trim(), ...pending }),
+      });
+      const body = (await response.json().catch(() => null)) as
+        | { connected?: boolean; error?: string }
+        | null;
+      if (!response.ok) throw new Error(body?.error ?? `Failed (${response.status})`);
+      setPending(null);
+      setCode('');
+      await refreshStatus();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Connection failed');
+    } finally {
+      setBusy(null);
+    }
+  }, [code, pending, refreshStatus]);
+
+  const disconnect = useCallback(async () => {
+    setBusy('disconnect');
+    setError(null);
+    try {
+      await fetch('/api/user/claude-oauth', { method: 'DELETE', credentials: 'include' });
+      await refreshStatus();
+    } finally {
+      setBusy(null);
+    }
+  }, [refreshStatus]);
+
+  return (
+    <section
+      data-testid="claude-subscription-card"
+      className="rounded-xl border border-stone-200 bg-white p-4"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="flex items-center gap-2 text-sm font-semibold text-stone-800">
+            Claude Code subscription
+            {status?.connected ? (
+              <CheckCircleIcon className="h-4 w-4 text-green-600" weight="fill" aria-hidden />
+            ) : null}
+          </h3>
+          <p className="mt-1 text-xs text-stone-500">
+            {status?.connected
+              ? 'Connected. Chats on the Claude Code agent run on your Claude plan and use no Sundial credits.'
+              : 'Sign in with your own Claude account (Pro or Max). Chats on the Claude Code agent then run on your plan instead of Sundial credits.'}
+          </p>
+        </div>
+        {status?.connected ? (
+          <button
+            type="button"
+            data-testid="claude-subscription-disconnect"
+            onClick={() => void disconnect()}
+            disabled={busy === 'disconnect'}
+            className="shrink-0 rounded-lg border border-stone-200 px-3 py-1.5 text-xs text-stone-600 hover:bg-stone-50 disabled:opacity-50"
+          >
+            {busy === 'disconnect' ? 'Disconnecting…' : 'Disconnect'}
+          </button>
+        ) : (
+          <button
+            type="button"
+            data-testid="claude-subscription-connect"
+            onClick={() => void startConnect()}
+            disabled={busy === 'start'}
+            className="shrink-0 rounded-lg bg-stone-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-stone-800 disabled:opacity-50"
+          >
+            {busy === 'start' ? 'Opening…' : 'Connect Claude Code'}
+          </button>
+        )}
+      </div>
+      {pending && !status?.connected ? (
+        <div className="mt-3 border-t border-stone-100 pt-3">
+          <p className="text-xs text-stone-500">
+            A Claude sign-in page opened in a new tab (
+            <a
+              href={pending.authorizeUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              data-testid="claude-subscription-authorize-link"
+              className="font-medium text-stone-700 underline underline-offset-2"
+            >
+              open it again
+            </a>
+            {' '}if it didn&apos;t). Approve access, copy the code it shows, and paste it here:
+          </p>
+          <div className="mt-2 flex items-center gap-2">
+            <input
+              type="text"
+              value={code}
+              onChange={(event) => {
+                setCode(event.target.value);
+                setError(null);
+              }}
+              placeholder="Paste the code"
+              data-testid="claude-subscription-code"
+              className="min-w-0 flex-1 rounded-lg border border-stone-200 px-3 py-1.5 font-mono text-xs text-stone-700"
+            />
+            <button
+              type="button"
+              data-testid="claude-subscription-exchange"
+              onClick={() => void exchange()}
+              disabled={busy === 'exchange' || !code.trim()}
+              className="shrink-0 rounded-lg bg-stone-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-stone-800 disabled:opacity-50"
+            >
+              {busy === 'exchange' ? 'Connecting…' : 'Finish connecting'}
+            </button>
+          </div>
+        </div>
+      ) : null}
+      {error ? <p className="mt-2 text-xs text-rose-600">{error}</p> : null}
+    </section>
   );
 }
 

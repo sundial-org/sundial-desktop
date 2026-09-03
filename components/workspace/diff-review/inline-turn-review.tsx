@@ -8,7 +8,7 @@ import { BlobFileNotice } from '@/components/workspace/diff-review/blob-file-not
 import {
   OversizedFileNotice,
   StaticChunk,
-  countFileWords,
+  countFileLines,
   formatTurnFileSummary,
 } from '@/components/workspace/diff-review/turn-edit-helpers';
 import type { TurnEditChunk, TurnEditFile } from '@/lib/workspace/turn-edits';
@@ -45,11 +45,11 @@ function countPending(files: TurnEditFile[]) {
   return count;
 }
 
-function countTotalWords(files: TurnEditFile[]) {
+function countTotalLines(files: TurnEditFile[]) {
   let added = 0;
   let deleted = 0;
   for (const file of files) {
-    const w = countFileWords(file);
+    const w = countFileLines(file);
     added += w.added;
     deleted += w.deleted;
   }
@@ -272,7 +272,7 @@ export function InlineTurnReview({
 }: InlineTurnReviewProps) {
   const pendingCount = useMemo(() => countPending(files), [files]);
   const { added: totalAdded, deleted: totalDeleted } = useMemo(
-    () => countTotalWords(files),
+    () => countTotalLines(files),
     [files],
   );
   const allActive = activeUndoKey === '__all__';

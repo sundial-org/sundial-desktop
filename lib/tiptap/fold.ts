@@ -1,4 +1,4 @@
-import { Extension } from '@tiptap/core';
+import { Extension, type Editor } from '@tiptap/core';
 import {
   Plugin,
   PluginKey,
@@ -138,6 +138,54 @@ function build(doc: ProseMirrorNode, folded: number[]): DecorationSet {
  *  right (assoc +1): content inserted exactly at the boundary (a block dropped
  *  in just above the fold, incl. at position 0) then stays before the block and
  *  the anchor rides along with it, instead of being stranded on the new node. */
+/** Fold every foldable heading / list item; the caret is walked backwards out
+ *  of the content about to be hidden (ranges nest — a bullet's line can also
+ *  sit under a folded ancestor heading), same contract as the single-fold
+ *  mousedown guard. Bound to ⌘⌥[ and the View menu. */
+export function foldAll(editor: Editor): boolean {
+  const { state } = editor;
+  const folded: number[] = [];
+  const hidden: FoldRange[] = [];
+  state.doc.descendants((node, pos) => {
+    const name = node.type.name;
+    if (name !== 'heading' && name !== 'listItem') return true;
+    const info = foldInfoAt(state.doc, pos);
+    if (info) {
+      folded.push(pos);
+      hidden.push(...info.hidden);
+    }
+    return true;
+  });
+  if (!folded.length) return false;
+  let tr = state.tr.setMeta(foldPluginKey, { setFolded: folded });
+  let { from, to } = tr.selection;
+  for (;;) {
+    const containing = hidden.filter((r) => selectionInHidden(from, to, [r]));
+    if (!containing.length) break;
+    const sel = TextSelection.near(
+      state.doc.resolve(Math.min(...containing.map((r) => r.from))),
+      -1,
+    );
+    // Each round must move the caret strictly backwards (a hidden range never
+    // starts the doc, so there is always a visible line before it) — bail
+    // instead of looping if `near` couldn't.
+    if (sel.from >= from) break;
+    tr = tr.setSelection(sel);
+    from = sel.from;
+    to = sel.to;
+  }
+  editor.view.dispatch(tr);
+  return true;
+}
+
+/** Expand every fold. Bound to ⌘⌥] and the View menu. */
+export function unfoldAll(editor: Editor): boolean {
+  const { state } = editor;
+  if (!foldPluginKey.getState(state)?.folded.length) return false;
+  editor.view.dispatch(state.tr.setMeta(foldPluginKey, { setFolded: [] }));
+  return true;
+}
+
 function remap(tr: Transaction, folded: number[], doc: ProseMirrorNode): number[] {
   const next: number[] = [];
   for (const pos of folded) {
@@ -161,6 +209,13 @@ function remap(tr: Transaction, folded: number[], doc: ProseMirrorNode): number[
 export const FoldGutter = Extension.create({
   name: 'foldGutter',
 
+  addKeyboardShortcuts() {
+    return {
+      'Mod-Alt-[': ({ editor }) => foldAll(editor),
+      'Mod-Alt-]': ({ editor }) => unfoldAll(editor),
+    };
+  },
+
   addProseMirrorPlugins() {
     return [
       new Plugin<FoldPluginState>({
@@ -171,21 +226,39 @@ export const FoldGutter = Extension.create({
             decorations: build(state.doc, []),
           }),
           apply: (tr, value, _oldState, newState): FoldPluginState => {
-            const toggle = tr.getMeta(foldPluginKey) as { toggle?: number } | undefined;
-            if (toggle?.toggle != null) {
-              const pos = toggle.toggle;
+            const meta = tr.getMeta(foldPluginKey) as
+              | { toggle?: number; setFolded?: number[] }
+              | undefined;
+            if (meta?.setFolded) {
+              return { folded: meta.setFolded, decorations: build(newState.doc, meta.setFolded) };
+            }
+            if (meta?.toggle != null) {
+              const pos = meta.toggle;
               const folded = value.folded.includes(pos)
                 ? value.folded.filter((p) => p !== pos)
                 : [...value.folded, pos];
               return { folded, decorations: build(newState.doc, folded) };
             }
             if (tr.docChanged) {
+              const ySync = tr.getMeta(ySyncPluginKey) as { binding?: unknown } | undefined;
+              // A plugin-set change (⌘F find bar, slash menu, popups — anything
+              // that registerPlugin/unregisterPlugins) makes the view recreate
+              // its plugin views, and the recreated y-sync binding re-renders by
+              // replacing the ENTIRE doc with identical content. Mapping anchors
+              // through that replacement deletes every one of them (every fold
+              // popped open on ⌘F). `binding` is set on exactly that rerender —
+              // positions are unchanged there, so keep them; foldInfoAt still
+              // re-validates each in case content did move.
+              if (ySync?.binding) {
+                const kept = value.folded.filter((pos) => foldInfoAt(newState.doc, pos));
+                return { folded: kept, decorations: build(newState.doc, kept) };
+              }
               const remapped = remap(tr, value.folded, newState.doc);
               // Remap for EVERY edit (local + remote) so anchors ride along, but
               // only auto-expand for LOCAL edits: the local caret is meaningless
               // for a collaborator's transaction, so acting on it there could pop
               // a peer's edit open on our screen. y-sync tags remote txns.
-              if (tr.getMeta(ySyncPluginKey)) {
+              if (ySync) {
                 return { folded: remapped, decorations: build(newState.doc, remapped) };
               }
               // An edit can grow a fold's hidden range around the selection

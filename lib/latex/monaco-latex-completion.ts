@@ -4,6 +4,12 @@ import {
   type LatexCompletionContext,
   type LatexCompletionKind,
 } from '@/lib/latex/latex-completions';
+import {
+  clampSuffix,
+  MAX_PREFIX_CHARS,
+  MAX_SUFFIX_CHARS,
+  MAX_SUFFIX_LINES,
+} from '@/lib/workspace/autocomplete/engine';
 
 /**
  * Monaco adapter for the pure completion engine (W3.acomplete). The engine in
@@ -17,9 +23,12 @@ import {
  * / file paths refresh as the project changes without rebuilding the provider.
  */
 
-export type LatexProjectContext = Omit<LatexCompletionContext, 'linePrefix'>;
+export type LatexProjectContext = Omit<
+  LatexCompletionContext,
+  'linePrefix' | 'suffix' | 'suffixTruncated'
+>;
 
-/** Trigger after the chars that open a completable context, plus letters. */
+/** Trigger after characters that open or continue a completable context. */
 const TRIGGER_CHARACTERS = ['\\', '{', ',', '/'];
 
 function monacoKind(
@@ -51,30 +60,64 @@ export function createLatexCompletionProvider(
       model: editor.ITextModel,
       position: Position,
     ): languages.ProviderResult<languages.CompletionList> {
+      const prefixStartColumn = Math.max(1, position.column - MAX_PREFIX_CHARS);
       const linePrefix = model.getValueInRange({
         startLineNumber: position.lineNumber,
-        startColumn: 1,
+        startColumn: prefixStartColumn,
         endLineNumber: position.lineNumber,
         endColumn: position.column,
       });
+      // Syntax completion runs on each trigger character, so never read the
+      // whole document. The bounded suffix is enough to spot an adjacent `}`
+      // or an already-balanced \end without regressing large-paper typing.
+      const lineCount = model.getLineCount();
+      const lastLine = Math.min(lineCount, position.lineNumber + MAX_SUFFIX_LINES - 1);
+      const startOffset = model.getOffsetAt(position);
+      const lineBoundOffset = model.getOffsetAt({
+        lineNumber: lastLine,
+        column: model.getLineMaxColumn(lastLine),
+      });
+      const suffixEndOffset = Math.min(lineBoundOffset, startOffset + MAX_SUFFIX_CHARS);
+      const suffixEnd = model.getPositionAt(suffixEndOffset);
+      const rawSuffix = model.getValueInRange({
+        startLineNumber: position.lineNumber,
+        startColumn: position.column,
+        endLineNumber: suffixEnd.lineNumber,
+        endColumn: suffixEnd.column,
+      });
+      const suffix = clampSuffix(rawSuffix);
+      const documentEndOffset = model.getOffsetAt({
+        lineNumber: lineCount,
+        column: model.getLineMaxColumn(lineCount),
+      });
 
-      const result = getLatexCompletions({ linePrefix, ...getProjectContext() });
+      const result = getLatexCompletions({
+        linePrefix,
+        suffix,
+        suffixTruncated: suffixEndOffset < documentEndOffset || suffix.length < rawSuffix.length,
+        ...getProjectContext(),
+      });
       if (!result || result.items.length === 0) return { suggestions: [] };
 
       // Engine `from` is a 0-based column; Monaco columns are 1-based.
-      const range: IRange = {
-        startLineNumber: position.lineNumber,
-        startColumn: result.from + 1,
-        endLineNumber: position.lineNumber,
-        endColumn: position.column,
-      };
-
       const suggestions: languages.CompletionItem[] = result.items.map((item) => ({
         label: item.label,
         kind: monacoKind(monaco, item.kind),
         insertText: item.insertText,
+        insertTextRules: item.insertMode === 'snippet'
+          ? monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet
+            | monaco.languages.CompletionItemInsertTextRule.KeepWhitespace
+          : undefined,
+        command: item.retrigger
+          ? { id: 'editor.action.triggerSuggest', title: 'Trigger suggestions' }
+          : undefined,
         detail: item.detail,
-        range,
+        range: {
+          startLineNumber: position.lineNumber,
+          startColumn: prefixStartColumn + result.from,
+          endLineNumber: position.lineNumber,
+          endColumn: position.column + (item.replaceSuffixChars ?? 0),
+        } satisfies IRange,
       }));
       return { suggestions };
     },

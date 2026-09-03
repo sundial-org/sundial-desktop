@@ -24,7 +24,7 @@ import { snapshotResolutions, diffResolutions } from '../lib/crdt-js/suggestion_
 import fsp from 'node:fs/promises';
 
 import { contentHash } from './store.mjs';
-import { fileKind, isIgnoredPath, normalizeRelPath, resolveInRoot } from './paths.mjs';
+import { fileKindForFile, isIgnoredPath, normalizeRelPath, resolveInRoot } from './paths.mjs';
 import { readTextFile, writeTextFileAtomic } from './disk.mjs';
 import { locateProjectPath } from './roots.mjs';
 
@@ -118,7 +118,7 @@ export class DocHost {
         if (!auth || !meta) throw new Error('Unauthorized');
         if (auth.projectId && auth.projectId !== meta.projectId) throw new Error('Unauthorized');
         if (!store.getProject(meta.projectId)) throw new Error('Unauthorized');
-        if (isIgnoredPath(meta.path) || fileKind(meta.path) !== 'text') throw new Error('Unauthorized');
+        if (isIgnoredPath(meta.path) || fileKindForFile(meta.path) !== 'text') throw new Error('Unauthorized');
         connectionConfig.readOnly = auth.readOnly === true;
         return auth;
       },
@@ -284,6 +284,14 @@ export class DocHost {
     );
   }
 
+  hasPendingPersist(documentName) {
+    return this.pendingPersist.has(documentName) || this.persistChains.has(documentName);
+  }
+
+  hasObservedDiskText(documentName, text) {
+    return this.lastDiskText.has(documentName) && this.lastDiskText.get(documentName) === text;
+  }
+
   /** Serialize persists per doc: the debounce timer and Hocuspocus's own
    *  onStoreDocument debounce can otherwise run persist() concurrently, both
    *  passing the state-changed check against the same prior vector and
@@ -414,7 +422,9 @@ export class DocHost {
     // auto-recompile). Any remote in the window counts (a local keystroke
     // sharing the debounce must not swallow it); local-only windows stay
     // silent: the editor already has those bytes.
-    if (window?.remote && textChanged) this.onRemotePersist?.(meta.projectId, meta.path);
+    if (window?.remote && textChanged) {
+      this.onRemotePersist?.(meta.projectId, meta.path, { remoteOnly });
+    }
     // Forensics for the launch-window wipe bug (turbosundial, unreproduced):
     // a doc collapsing to a fraction of its size in one persist window is
     // never normal typing — capture who could have written it.
@@ -531,7 +541,7 @@ export class DocHost {
       await this.detachMissingUnder(projectId, relPath, { record, actor, chatId, messageId, turnResolved, authorId });
       return;
     }
-    if (!stat.isFile() || fileKind(relPath) !== 'text') return;
+    if (!stat.isFile() || fileKindForFile(relPath) !== 'text') return;
     const disk = await readTextFile(loc.root, loc.rel).catch(() => null);
     if (!disk) return; // unreadable/oversized — never treat as a delete
 
@@ -1175,7 +1185,7 @@ export class DocHost {
     // a later recreation reads as a creation, and remember the content hash
     // so a rename destination is never misread as a creation.
     this.watchers.get(projectId)?.markGone(rel);
-    if (fileKind(rel) === 'text') this.noteDeletedContent(projectId, rel);
+    if (fileKindForFile(rel) === 'text') this.noteDeletedContent(projectId, rel);
     // BEFORE the teardown below drops the live doc and the stored state: a
     // tombstone needs a previous row to anchor on (recordDeleteTombstone is a
     // no-op without one), so an agent deleting a file it never touched would
@@ -1185,7 +1195,7 @@ export class DocHost {
     // file_id (opened or listed, never edited) is exactly the case that has no
     // baseline, and deleteDocState below is about to drop its last trace.
     const childPaths =
-      fileKind(rel) === 'text'
+      fileKindForFile(rel) === 'text'
         ? [rel]
         : [
             ...new Set([
@@ -1196,7 +1206,7 @@ export class DocHost {
     const deletedPaths =
       record && actor === 'agent'
         ? childPaths.filter(
-            (candidate) => fileKind(candidate) === 'text' && !this.store.hasEdits(projectId, candidate),
+            (candidate) => fileKindForFile(candidate) === 'text' && !this.store.hasEdits(projectId, candidate),
           )
         : [];
     const baselines = new Map(deletedPaths.map((candidate) => [candidate, this.knownText(projectId, candidate)]));
@@ -1214,8 +1224,8 @@ export class DocHost {
     // a rename destination (the create half of a raw `mv`) can adopt it and
     // keep the CRDT history continuous across the move (see the field's
     // comment in the constructor).
-    for (const candidate of fileKind(rel) === 'text' ? [rel] : childPaths) {
-      if (fileKind(candidate) === 'text') this.#stashDeletedState(projectId, candidate);
+    for (const candidate of fileKindForFile(rel) === 'text' ? [rel] : childPaths) {
+      if (fileKindForFile(candidate) === 'text') this.#stashDeletedState(projectId, candidate);
     }
     await this.detachUnder(projectId, rel);
     this.store.deleteDocState(projectId, rel);
@@ -1234,7 +1244,7 @@ export class DocHost {
         existedBefore.get(candidate) ?? false,
       );
     };
-    if (fileKind(rel) === 'text') {
+    if (fileKindForFile(rel) === 'text') {
       tombstone(rel);
       return;
     }
@@ -1243,7 +1253,7 @@ export class DocHost {
     // union as the baseline sweep: a child the agent deleted without ever
     // editing has no ledger row to find it by.
     for (const child of childPaths) {
-      if (fileKind(child) === 'text') {
+      if (fileKindForFile(child) === 'text') {
         this.noteDeletedContent(projectId, child);
         tombstone(child);
       }

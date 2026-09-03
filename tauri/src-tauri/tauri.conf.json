@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Sundial",
-  "version": "0.1.12",
+  "version": "0.1.14",
   "identifier": "md.sundial.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -34,7 +34,7 @@
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": true,
-    "resources": ["resources/sidecar/*"],
+    "resources": ["resources/sidecar/**/*"],
     "externalBin": ["binaries/node", "binaries/tectonic"],
     "macOS": {
       "minimumSystemVersion": "13.5",
@@ -49,6 +49,6 @@
     ],
     "category": "Productivity",
     "shortDescription": "Sundial collaborative editor",
-    "longDescription": "AI-native collaborative editor for STEM — LaTeX, markdown, and notebooks with an embedded agent."
+    "longDescription": "Local-first collaborative editor where agents are collaborators: Claude Code and Codex propose reviewable edits in live multiplayer docs."
   }
 }

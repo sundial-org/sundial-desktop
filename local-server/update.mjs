@@ -3,23 +3,76 @@
 // deploy ships a matching /serve.mjs — without this, a unit-run daemon
 // drifts behind the cloud forever (the exact skew SIDECAR_API_VERSION
 // exists to catch). The daemon periodically fetches the origin's bundle,
-// and when the bytes differ: syntax-verify with the same Node that will run
-// it, swap atomically (old copy kept at .prev), and report update-applied —
-// the caller exits cleanly and the supervisor relaunches onto the new code.
+// and when the bytes differ: check the release signature (update-key.mjs),
+// syntax-verify with the same Node that will run it, swap atomically (old
+// copy kept at .prev), and report update-applied — the caller exits cleanly
+// and the supervisor relaunches onto the new code.
+//
+// The signature is the load-bearing half: this is an arbitrary-code channel,
+// so `node --check` (which only proves the bytes PARSE) can never be the only
+// gate. See update-key.mjs for the key and how it is provisioned.
 //
 // Unsupervised (foreground) runs must NOT restart themselves — exiting would
 // stop sync with nobody to relaunch it — so they only surface the news; the
 // next serve.sh run refetches anyway.
 
-import { createHash } from 'node:crypto';
+import { createHash, createPublicKey, verify as verifySignature } from 'node:crypto';
 import fsp from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+
+import { UPDATE_PUBLIC_KEY } from './update-key.mjs';
 
 const execFileAsync = promisify(execFile);
 
 export function sha256Hex(buffer) {
   return createHash('sha256').update(buffer).digest('hex');
+}
+
+// A raw ed25519 public key carries no algorithm identifier, so wrap the 32
+// key bytes in the one fixed SPKI header createPublicKey() understands. This
+// is what lets update-key.mjs hold a plain 44-char base64 string a human can
+// eyeball against the release key instead of a PEM block.
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+
+/** The embedded trust anchor as a KeyObject, or null when signing is not
+ *  provisioned (empty constant) or the value is malformed. */
+export function updateSigningKey(raw = UPDATE_PUBLIC_KEY) {
+  const bytes = Buffer.from(String(raw || '').trim(), 'base64');
+  if (bytes.length !== 32) return null;
+  try {
+    return createPublicKey({ key: Buffer.concat([ED25519_SPKI_PREFIX, bytes]), format: 'der', type: 'spki' });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Integrity gate for the served bundle: 'ok' when a detached ed25519
+ * signature at `${app}/serve.mjs.sig` covers exactly these bytes, 'bad' when
+ * the signature is missing, unfetchable or wrong, and 'unsigned' when no key
+ * is embedded yet (pre-provisioning behaviour — see update-key.mjs).
+ *
+ * 'bad' must always refuse the swap: the running daemon keeps executing the
+ * code it already verified, which is strictly safer than TLS-only trust.
+ */
+async function verifyServedBundle({ app, bundle, publicKey = UPDATE_PUBLIC_KEY, log = () => {} }) {
+  const key = updateSigningKey(publicKey);
+  if (!key) return 'unsigned';
+  const res = await fetch(`${app}/serve.mjs.sig`).catch((error) => {
+    log(`[sundial-local] update check: ${app}/serve.mjs.sig unreachable (${error?.message})`);
+    return null;
+  });
+  if (!res?.ok) {
+    if (res) log(`[sundial-local] update check: ${app}/serve.mjs.sig -> ${res.status}`);
+    return 'bad';
+  }
+  const signature = Buffer.from((await res.text().catch(() => '')).trim(), 'base64');
+  if (signature.length !== 64 || !verifySignature(null, bundle, key, signature)) {
+    log('[sundial-local] update check: bundle signature does not verify, keeping current');
+    return 'bad';
+  }
+  return 'ok';
 }
 
 /**
@@ -34,8 +87,12 @@ export function sha256Hex(buffer) {
  * executes the old code — forever. With loadedHash, a disk file that already
  * matches the deployment but not the running code returns 'applied' (no
  * rewrite needed) so a supervised daemon relaunches onto it.
+ *
+ * `publicKey` defaults to the embedded release key and exists so tests can
+ * drive both the armed and the not-yet-provisioned channel; nothing in
+ * production passes it.
  */
-export async function checkAndApplyUpdate({ app, bundlePath, nodeBin = process.execPath, log = () => {}, loadedHash = /** @type {string | null} */ (null) }) {
+export async function checkAndApplyUpdate({ app, bundlePath, nodeBin = process.execPath, log = () => {}, loadedHash = /** @type {string | null} */ (null), publicKey = UPDATE_PUBLIC_KEY }) {
   try {
     const res = await fetch(`${app}/serve.mjs`);
     if (!res.ok) {
@@ -44,6 +101,9 @@ export async function checkAndApplyUpdate({ app, bundlePath, nodeBin = process.e
     }
     const fresh = Buffer.from(await res.arrayBuffer());
     if (fresh.length === 0) return 'failed';
+    // Before any decision, including the relaunch-onto-disk branch below: an
+    // unverifiable bundle is not a candidate for anything.
+    if ((await verifyServedBundle({ app, bundle: fresh, publicKey, log })) === 'bad') return 'failed';
     const current = await fsp.readFile(bundlePath).catch(() => null);
     if (current && current.equals(fresh)) {
       if (!loadedHash || loadedHash === sha256Hex(fresh)) return 'current';

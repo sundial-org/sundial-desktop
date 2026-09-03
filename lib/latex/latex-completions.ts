@@ -22,11 +22,21 @@ export type LatexCompletion = {
   kind: LatexCompletionKind;
   /** Right-aligned hint: env for refs, "Author · Title" for cites, etc. */
   detail?: string;
+  /** Monaco-independent insertion behavior; plain text is the default. */
+  insertMode?: 'snippet';
+  /** Re-open the suggest widget after accepting this item (staged syntax). */
+  retrigger?: boolean;
+  /** Characters immediately after the cursor that this item replaces. */
+  replaceSuffixChars?: number;
 };
 
 export type LatexCompletionContext = {
-  /** Text from the start of the current line up to the cursor. */
+  /** Bounded text from the current line immediately before the cursor. */
   linePrefix: string;
+  /** Bounded text after the cursor, used only to avoid duplicate closers. */
+  suffix?: string;
+  /** Whether the bounded suffix stops before the end of the document. */
+  suffixTruncated?: boolean;
   /** `\label{...}` keys across the project (for `\ref` family). */
   labels?: string[];
   /** Parsed `.bib` entries (for the `\cite` family). */
@@ -42,7 +52,7 @@ export type LatexCompletionContext = {
 };
 
 export type LatexCompletionResult = {
-  /** Column (0-based, within the line) where the replaced token starts. */
+  /** Offset (0-based, within `linePrefix`) where replacement starts. */
   from: number;
   items: LatexCompletion[];
 };
@@ -52,12 +62,26 @@ export type LatexCompletionResult = {
 const COMMANDS = [
   'section', 'subsection', 'subsubsection', 'paragraph', 'chapter',
   'textbf', 'textit', 'emph', 'texttt', 'underline', 'textsc',
-  'begin', 'end', 'item', 'label', 'ref', 'eqref', 'pageref', 'autoref', 'cref',
+  'begin', 'end', 'item', 'label', 'ref', 'eqref', 'pageref', 'autoref', 'nameref', 'cref', 'Cref',
   'cite', 'citep', 'citet', 'footnote', 'caption', 'centering',
-  'includegraphics', 'input', 'include', 'usepackage', 'documentclass',
+  'includegraphics', 'input', 'include', 'subfile', 'import', 'usepackage', 'documentclass',
   'frac', 'sqrt', 'sum', 'int', 'prod', 'lim', 'left', 'right',
-  'newcommand', 'renewcommand', 'newenvironment', 'bibliography', 'bibliographystyle',
+  'href', 'url', 'newcommand', 'renewcommand', 'newenvironment', 'bibliography', 'bibliographystyle',
 ];
+
+/** Commands whose next stage is a project-derived value or environment. */
+const ARGUMENT_COMPLETION_COMMANDS = new Set([
+  'begin', 'end', 'ref', 'eqref', 'pageref', 'autoref', 'nameref', 'cref', 'Cref',
+  'cite', 'citep', 'citet', 'includegraphics', 'input', 'include', 'subfile',
+]);
+
+/** One-required-argument commands that can finish as a native snippet. */
+const UNARY_COMMANDS = new Set([
+  'section', 'subsection', 'subsubsection', 'paragraph', 'chapter',
+  'textbf', 'textit', 'emph', 'texttt', 'underline', 'textsc',
+  'label', 'footnote', 'caption', 'sqrt', 'url', 'usepackage', 'documentclass',
+  'bibliography', 'bibliographystyle',
+]);
 
 /** Environments offered after `\begin{`. `\end{` completes from the same set. */
 const ENVIRONMENTS = [
@@ -86,6 +110,7 @@ function fileCompletions(
   paths: string[],
   partial: string,
   stripTexExt: boolean,
+  ctx: LatexCompletionContext,
 ): LatexCompletion[] {
   const trimmed = partial.trim().toLowerCase();
   return paths
@@ -93,8 +118,116 @@ function fileCompletions(
     .map((p) => {
       // \input/\include conventionally omit the .tex extension.
       const insert = stripTexExt ? p.replace(/\.tex$/i, '') : p;
-      return { label: insert, insertText: insert, kind: 'file' as const };
+      return { label: insert, ...argumentInsertion(insert, ctx), kind: 'file' as const };
     });
+}
+
+type CompletionInsertion = Pick<
+  LatexCompletion,
+  'insertText' | 'insertMode' | 'replaceSuffixChars'
+>;
+
+/** Finish a value argument when the cursor is at its end, replacing Monaco's
+ * auto-closed `}` when present. Cite keeps the caret inside for another key. */
+function argumentInsertion(
+  value: string,
+  ctx: LatexCompletionContext,
+  keepCaretInside = false,
+): CompletionInsertion {
+  const lineSuffix = (ctx.suffix ?? '').split('\n', 1)[0] ?? '';
+  const tokenTail = lineSuffix.match(/^[^,}\s]*/)?.[0] ?? '';
+  const afterToken = lineSuffix.slice(tokenTail.length);
+  const hasAdjacentBrace = afterToken.startsWith('}');
+  const atArgumentEnd = hasAdjacentBrace || afterToken.trim() === '';
+  const replaceSuffixChars = tokenTail.length + (hasAdjacentBrace ? 1 : 0);
+  if (!atArgumentEnd) {
+    return { insertText: value, replaceSuffixChars: tokenTail.length || undefined };
+  }
+  return {
+    insertText: keepCaretInside ? `${value}$1}$0` : `${value}}`,
+    insertMode: keepCaretInside ? 'snippet' : undefined,
+    replaceSuffixChars: replaceSuffixChars || undefined,
+  };
+}
+
+function commandInsertion(name: string): Pick<LatexCompletion, 'insertText' | 'insertMode' | 'retrigger'> {
+  if (ARGUMENT_COMPLETION_COMMANDS.has(name)) {
+    return { insertText: `\\${name}{`, retrigger: true };
+  }
+  if (UNARY_COMMANDS.has(name)) {
+    return { insertText: `\\${name}{$1}$0`, insertMode: 'snippet' };
+  }
+  if (name === 'frac') return { insertText: '\\frac{$1}{$2}$0', insertMode: 'snippet' };
+  if (name === 'href') return { insertText: '\\href{$1}{$2}$0', insertMode: 'snippet' };
+  if (name === 'import') return { insertText: '\\import{$1}{$2}$0', insertMode: 'snippet' };
+  return { insertText: `\\${name}` };
+}
+
+function regexLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function snippetLiteral(value: string): string {
+  return value.replace(/[$}\\]/g, '\\$&');
+}
+
+function environmentBody(name: string): string {
+  if (name === 'itemize' || name === 'enumerate') return '\\item $1';
+  if (name === 'description') return '\\item[$1] $2';
+  if (name === 'tabular' || name === 'array' || name === 'minipage' || name === 'subfigure') return '$2';
+  return '$1';
+}
+
+function environmentExtraArgument(name: string): string {
+  if (name === 'tabular' || name === 'array') return '{${1:cc}}';
+  if (name === 'minipage') return '{${1:\\textwidth}}';
+  if (name === 'subfigure') return '{${1:0.48\\textwidth}}';
+  return '';
+}
+
+function environmentInsertion(
+  name: string,
+  mode: 'begin' | 'end',
+  ctx: LatexCompletionContext,
+): CompletionInsertion {
+  const suffix = ctx.suffix ?? '';
+  const lineSuffix = suffix.split('\n', 1)[0] ?? '';
+  const nameTail = lineSuffix.match(/^[^}\s]*/)?.[0] ?? '';
+  const afterName = lineSuffix.slice(nameTail.length);
+  const hasAdjacentBrace = afterName.startsWith('}');
+  const endsAtCursor = hasAdjacentBrace || afterName.trim() === '';
+  if (!endsAtCursor) {
+    return { insertText: name, replaceSuffixChars: nameTail.length || undefined };
+  }
+
+  const replaceCount = nameTail.length + (hasAdjacentBrace ? 1 : 0);
+  const replaceSuffixChars = replaceCount || undefined;
+  if (mode === 'end') return { insertText: `${name}}`, replaceSuffixChars };
+
+  // Ignore commented-out closers: they do not balance the active opener.
+  const activeSuffix = suffix
+    .slice(replaceCount)
+    .replace(/(^|[^\\])%.*$/gm, '$1');
+  const hasMatchingCloser = new RegExp(`\\\\end\\{${regexLiteral(name)}\\}`).test(activeSuffix);
+  if (hasMatchingCloser) return { insertText: `${name}}`, replaceSuffixChars };
+  // A new block immediately before \end{document} is safe to pair even though
+  // more document follows. A different adjacent closer may be the old half of
+  // an environment rename, so leave it untouched instead of adding a mismatch.
+  const beforeOuterCloser = /^\s*\\end\{document\}/.test(activeSuffix);
+  if (!beforeOuterCloser && (ctx.suffixTruncated || activeSuffix.trim())) {
+    return { insertText: `${name}}`, replaceSuffixChars };
+  }
+
+  const indent = ctx.linePrefix.match(/^\s*/)?.[0] ?? '';
+  const safeName = snippetLiteral(name);
+  return {
+    insertText:
+      `${safeName}}${environmentExtraArgument(name)}\n` +
+      `${indent}  ${environmentBody(name)}\n` +
+      `${indent}\\end{${safeName}}$0`,
+    insertMode: 'snippet',
+    replaceSuffixChars,
+  };
 }
 
 function citeDetail(entry: BibEntry): string {
@@ -120,7 +253,12 @@ export function getLatexCompletions(ctx: LatexCompletionContext): LatexCompletio
     // Reuse the picker's ranked, year-aware search so inline `\cite` completion
     // and the menu picker never disagree (§6.3).
     const items = searchBibEntries(ctx.bibEntries ?? [], partial)
-      .map((e) => ({ label: e.key, insertText: e.key, kind: 'cite' as const, detail: citeDetail(e) }));
+      .map((e) => ({
+        label: e.key,
+        ...argumentInsertion(e.key, ctx, true),
+        kind: 'cite' as const,
+        detail: citeDetail(e),
+      }));
     return { from, items };
   }
 
@@ -133,7 +271,7 @@ export function getLatexCompletions(ctx: LatexCompletionContext): LatexCompletio
     const q = partial.trim().toLowerCase();
     const items = labels
       .filter((l) => !q || l.toLowerCase().includes(q))
-      .map((l) => ({ label: l, insertText: l, kind: 'ref' as const }));
+      .map((l) => ({ label: l, ...argumentInsertion(l, ctx), kind: 'ref' as const }));
     return { from, items };
   }
 
@@ -141,24 +279,35 @@ export function getLatexCompletions(ctx: LatexCompletionContext): LatexCompletio
   const graphics = line.match(/\\includegraphics(?:\[[^\]]*\])?\{([^}]*)$/);
   if (graphics) {
     const partial = graphics[1] ?? '';
-    return { from: line.length - partial.length, items: fileCompletions(ctx.graphicsFiles ?? [], partial, false) };
+    return {
+      from: line.length - partial.length,
+      items: fileCompletions(ctx.graphicsFiles ?? [], partial, false, ctx),
+    };
   }
 
-  // \input{ / \include{ / \subfile{ / \import{ partial  → .tex paths
-  const include = line.match(/\\(?:input|include|subfile|import)\{([^}]*)$/);
+  // \input{ / \include{ / \subfile{ partial  → .tex paths
+  const include = line.match(/\\(?:input|include|subfile)\{([^}]*)$/);
   if (include) {
     const partial = include[1] ?? '';
-    return { from: line.length - partial.length, items: fileCompletions(ctx.texFiles ?? [], partial, true) };
+    return {
+      from: line.length - partial.length,
+      items: fileCompletions(ctx.texFiles ?? [], partial, true, ctx),
+    };
   }
 
-  // \begin{ / \end{ partial  → environments (auto-\end handled by the adapter)
-  const env = line.match(/\\(?:begin|end)\{([^}]*)$/);
+  // \begin{ / \end{ partial → close the argument; begin also pairs the block.
+  const env = line.match(/\\(begin|end)\{([^}]*)$/);
   if (env) {
-    const partial = env[1] ?? '';
+    const mode = env[1] as 'begin' | 'end';
+    const partial = env[2] ?? '';
     const from = line.length - partial.length;
     const items = ENVIRONMENTS
       .filter((e) => startsWithCaseInsensitive(e, partial))
-      .map((e) => ({ label: e, insertText: e, kind: 'environment' as const }));
+      .map((e) => ({
+        label: e,
+        ...environmentInsertion(e, mode, ctx),
+        kind: 'environment' as const,
+      }));
     return { from, items };
   }
 
@@ -175,7 +324,12 @@ export function getLatexCompletions(ctx: LatexCompletionContext): LatexCompletio
       ...COMMANDS.filter((c) => !userSet.has(c)).map((c) => [c, undefined] as const),
     ]
       .filter(([c]) => startsWithCaseInsensitive(c, partial))
-      .map(([c, detail]) => ({ label: `\\${c}`, insertText: `\\${c}`, kind: 'command' as const, detail }));
+      .map(([c, detail]) => ({
+        label: `\\${c}`,
+        ...(detail ? { insertText: `\\${c}` } : commandInsertion(c)),
+        kind: 'command' as const,
+        detail,
+      }));
     return items.length ? { from, items } : null;
   }
 

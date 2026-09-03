@@ -17,7 +17,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 
 import { modelMessagesToClaudePrompt } from '../../agent-ts/src/harness/history.ts';
-import { appendThinkingRow, rowsUnseenByEngine, rowsToModelMessages, systemPrompt, turnEditsMetadata, writeTurnEditsMetadata } from './runner.mjs';
+import { appendThinkingRow, rowsUnseenByEngine, rowsToModelMessages, systemPrompt, turnEditsMetadata, turnMetaMetadata, writeTurnEditsMetadata } from './runner.mjs';
 
 /** Where `codex` lives: env override, installer paths, nvm globals, PATH. */
 export function detectCodexEngine() {
@@ -157,6 +157,10 @@ export async function runCodexTurn({
   let turnErrored = null;
   let stderrTail = '';
   let continuedThreadId = null; // the id the NEXT turn resumes
+  // Turn-details footer (model · tokens · duration). Codex settles usage on
+  // `turn.completed`; the CLI reports no wall clock, so time it here.
+  const turnStartedAt = Date.now();
+  let turnUsage = null;
 
   const relPath = (p) => {
     const abs = String(p ?? '');
@@ -301,6 +305,7 @@ export async function runCodexTurn({
         // Top-level `error` events can be TRANSIENT (stream reconnects) — a
         // turn that completes afterwards ended successfully.
         turnErrored = null;
+        if (event.usage && typeof event.usage === 'object') turnUsage = event.usage;
         break;
       }
       default:
@@ -378,6 +383,14 @@ export async function runCodexTurn({
   // Codex edits the disk natively, so the turn's rows arrive through the
   // watcher — read the count once, here, after its debounce grace above.
   const editsMeta = turnEditsMetadata(store, project.id, assistantMessageId);
+  // `input_tokens` is OpenAI-shaped (cache reads INCLUDED), matching what the
+  // cloud openai lane persists.
+  const turnMeta = turnMetaMetadata({
+    model,
+    inputTokens: turnUsage?.input_tokens,
+    outputTokens: turnUsage?.output_tokens,
+    durationMs: Date.now() - turnStartedAt,
+  });
   if (abort.signal.aborted) {
     // User stop — persist whatever the turn produced so far. A thinking row
     // counts: without its anchor it flushes under a synthetic id, reads as
@@ -387,7 +400,9 @@ export async function runCodexTurn({
         id: assistantMessageId,
         role: 'assistant',
         content: pendingText,
-        metadata: pendingText.trim() || ranTools ? editsMeta : { ...editsMeta, run_status: 'aborted' },
+        metadata: pendingText.trim() || ranTools
+          ? { ...editsMeta, ...turnMeta }
+          : { ...editsMeta, ...turnMeta, run_status: 'aborted' },
       });
     }
     writeTurnEditsMetadata(stream, editsMeta);
@@ -425,8 +440,8 @@ export async function runCodexTurn({
       role: 'assistant',
       content: pendingText,
       metadata: failure
-        ? { ...editsMeta, run_status: 'error', run_error: `Codex stopped before finishing (${failure.slice(0, 200)}).` }
-        : { ...editsMeta, ...terminal },
+        ? { ...editsMeta, ...turnMeta, run_status: 'error', run_error: `Codex stopped before finishing (${failure.slice(0, 200)}).` }
+        : { ...editsMeta, ...turnMeta, ...terminal },
     });
   }
   writeTurnEditsMetadata(stream, editsMeta);

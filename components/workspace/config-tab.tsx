@@ -10,6 +10,7 @@ import {
   useWorkspaceCollabSocket,
 } from '@/lib/workspace/collab-socket-context';
 import { applyMarkdownDiff, serializeDoc } from '@/lib/crdt-js/markdown_yjs.mjs';
+import { useApiFetch } from '@/lib/workspace/api-fetch-context';
 import type { WorkspaceFileRow } from '@/lib/workspace/types';
 
 const SAVE_DEBOUNCE_MS = 600;
@@ -50,6 +51,7 @@ interface WorkspaceTabProps {
   templateSlug?: string | null;
   templateName?: string | null;
   templateDefaultAddendum?: string | null;
+  templateLatestAddendum?: string | null;
   templateAddendumOverride?: string | null;
   /** Archived chats — hidden from the rail, revivable only from here. */
   archivedChats?: { id: string; title: string | null }[];
@@ -270,16 +272,36 @@ export function WorkspaceTab({
   templateSlug,
   templateName,
   templateDefaultAddendum,
+  templateLatestAddendum,
   templateAddendumOverride,
   archivedChats,
   onUnarchiveChat,
 }: WorkspaceTabProps) {
   const [status, setStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  // The server's reason for a failed save. "Save failed" alone left the
+  // AGENTS.md move undiagnosable from the UI (team bug thread, Aug 23).
+  const [errorDetail, setErrorDetail] = useState<string | null>(null);
   const [movingToFile, setMovingToFile] = useState(false);
   const savedRef = useRef(spaceInstructions);
   const valueRef = useRef(spaceInstructions);
   valueRef.current = spaceInstructions;
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Local (sidecar) workspaces provide their emulated /api/workspace/* fetch
+  // through this context; bare fetch() sent their local project id to the
+  // CLOUD routes, which 404 — every save from a local project's Workspace tab
+  // failed, "Move to AGENTS.md" included. Cloud workspaces fall through to
+  // the real fetch unchanged.
+  const apiFetch = useApiFetch();
+
+  const failWith = useCallback(async (res: Response | null, fallback: string) => {
+    let detail = fallback;
+    if (res) {
+      const payload = (await res.json().catch(() => null)) as { error?: string } | null;
+      detail = payload?.error ? payload.error : `${fallback} (${res.status})`;
+    }
+    setErrorDetail(detail);
+    setStatus('error');
+  }, []);
 
   const flush = useCallback(async () => {
     if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
@@ -287,19 +309,23 @@ export function WorkspaceTab({
     if (!workspaceId || !canWrite || next === savedRef.current) return;
     setStatus('saving');
     try {
-      const res = await fetch('/api/workspace', {
+      const res = await apiFetch('/api/workspace', {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
         credentials: 'include',
         body: JSON.stringify({ projectId: workspaceId, space_instructions: next }),
       });
-      if (!res.ok) throw new Error(`Save failed (${res.status})`);
+      if (!res.ok) {
+        await failWith(res, 'Save failed');
+        return;
+      }
       savedRef.current = next;
+      setErrorDetail(null);
       setStatus('saved');
     } catch {
-      setStatus('error');
+      await failWith(null, 'Save failed');
     }
-  }, [workspaceId, canWrite]);
+  }, [apiFetch, failWith, workspaceId, canWrite]);
 
   // Debounced autosave. onBlur (below) covers fast close-before-debounce.
   // Skipped in AGENTS.md mode, where the file is the single source of truth.
@@ -318,7 +344,7 @@ export function WorkspaceTab({
     setMovingToFile(true);
     try {
       await flush(); // don't lose an unsaved column edit if the create fails
-      const res = await fetch('/api/workspace/files', {
+      const res = await apiFetch('/api/workspace/files', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -328,15 +354,19 @@ export function WorkspaceTab({
           content: valueRef.current,
         }),
       });
-      if (!res.ok) throw new Error(`Create failed (${res.status})`);
+      if (!res.ok) {
+        await failWith(res, 'Create failed');
+        return;
+      }
       const payload = (await res.json()) as { file: WorkspaceFileRow };
+      setErrorDetail(null);
       onAgentsFileCreated?.(payload.file);
     } catch {
-      setStatus('error');
+      await failWith(null, 'Create failed');
     } finally {
       setMovingToFile(false);
     }
-  }, [canWrite, flush, movingToFile, onAgentsFileCreated, workspaceId]);
+  }, [apiFetch, canWrite, failWith, flush, movingToFile, onAgentsFileCreated, workspaceId]);
 
   return (
     <div className="p-5 flex flex-col overflow-auto flex-1 gap-4">
@@ -347,6 +377,7 @@ export function WorkspaceTab({
           templateSlug={templateSlug}
           templateName={templateName}
           defaultAddendum={templateDefaultAddendum}
+          latestAddendum={templateLatestAddendum ?? null}
           initialOverride={templateAddendumOverride ?? null}
         />
       ) : null}
@@ -371,7 +402,7 @@ export function WorkspaceTab({
         <div className="mt-2 flex items-baseline justify-between gap-3 shrink-0">
           <span className="text-[11px] text-stone-400">
             {status === 'saving' ? 'Saving…'
-              : status === 'error' ? <span className="text-red-500">Save failed</span>
+              : status === 'error' ? <span className="text-red-500">{errorDetail ?? 'Save failed'}</span>
               : status === 'saved' ? 'Saved.'
               : 'Applied to every new message.'}
           </span>

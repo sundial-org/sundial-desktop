@@ -8,7 +8,7 @@
 // plugin, and accept/reject commands are wired into Tiptap here. Styling lives
 // in app/globals.css (`ins[data-suggestion]` / `del[data-suggestion]`), so the
 // look is fully ours.
-import { Mark, Node, Extension, type AnyExtension, type CommandProps } from '@tiptap/core';
+import { InputRule, Mark, Node, Extension, type AnyExtension, type CommandProps } from '@tiptap/core';
 import { EditorState, Plugin, PluginKey, Selection, TextSelection, type Transaction } from '@tiptap/pm/state';
 import { Decoration, DecorationSet, type EditorView } from '@tiptap/pm/view';
 import { Fragment, type Node as PMNode } from '@tiptap/pm/model';
@@ -115,16 +115,47 @@ const REMOVABLE_REQUIRED_CONTAINERS = new Set(['listItem', 'bulletList', 'ordere
 // as a whole) but never deleted on their own — a lone emptied cell keeps the grid.
 const TABLE_INTERNALS = new Set(['tableRow', 'tableCell', 'tableHeader']);
 
+// The library anchors insertion runs with U+200B spacer characters, so in
+// suggest mode a fresh line's text is "​# " — and every `^`-anchored
+// input rule silently stops matching. Let block-TYPE rules (setBlockType:
+// heading, code fence — tracked as a clean nodeType modification) skip leading
+// spacers; the match then covers the spacer, so the rule's own delete-range
+// removes it along with the markdown prefix. WRAPPING rules (lists, quotes)
+// stay untouched: the library mistracks their ReplaceAroundStep into an empty
+// wrapper, so for them not-firing is strictly better than firing.
+const SPACER_TOLERANT_RULE_NODES = new Set(['heading', 'codeBlock']);
+const spacerTolerantFind = (find: RegExp): RegExp =>
+  find.source.startsWith('^') && !find.source.startsWith('^(?:\\u200B')
+    ? new RegExp(`^(?:\\u200B)*${find.source.slice(1)}`, find.flags)
+    : find;
+
 // The suggestion library can temporarily put marks on block children at every
 // nesting depth, before our dispatch wrapper converts them to durable attrs +
 // inline marks. Patch node kits recursively so those transactions are schema-
-// valid inside lists, quotes, and tables as well as at the document root.
+// valid inside lists, quotes, and tables as well as at the document root —
+// and make their `^`-anchored input rules tolerate the insertion spacers.
 export function allowSuggestionBlockMarks<T extends AnyExtension>(extension: T): T {
   const fields: Record<string, unknown> = {};
   if (BLOCK_CONTAINERS.has(extension.name)) fields.marks = SUGGESTION_NODE_MARKS;
+  // codeBlock ships `marks: ""`, which is right for formatting (no bold inside
+  // fences) but also silently swallowed suggestion marks: in suggest mode a
+  // delete or type inside a code block staged NOTHING (the addMark was a
+  // schema no-op), so the edit appeared to do nothing and reviews had nothing
+  // to show. Allow exactly the three suggestion marks there — formatting marks
+  // stay banned.
+  if (extension.name === 'codeBlock') fields.marks = SUGGESTION_NODE_MARKS;
   if (extension.config.addExtensions) {
     fields.addExtensions = function (this: { parent?: () => AnyExtension[] }) {
       return (this.parent?.() ?? []).map(allowSuggestionBlockMarks);
+    };
+  }
+  if (SPACER_TOLERANT_RULE_NODES.has(extension.name) && extension.config.addInputRules) {
+    fields.addInputRules = function (this: { parent?: () => InputRule[] }) {
+      return (this.parent?.() ?? []).map((rule) =>
+        rule.find instanceof RegExp
+          ? new InputRule({ find: spacerTolerantFind(rule.find), handler: rule.handler, undoable: rule.undoable })
+          : rule,
+      );
     };
   }
   return Object.keys(fields).length ? extension.extend(fields) as T : extension;
@@ -890,6 +921,33 @@ function suggestionLiveInDoc(doc: PMNode, id: SuggestionId): boolean {
   return live;
 }
 
+// U+200B spacers anchor pending insertion runs (the library inserts them at
+// run boundaries). Once a resolution strips the marks, an orphaned spacer is
+// plain invisible text that persists into the markdown forever — it survived
+// accept, landed in `files.content_text`, and came back on every reload.
+// Sweep every suggestion-unmarked spacer char in the SAME transaction; spacers
+// still carrying a mark belong to a different pending suggestion and stay.
+function sweepOrphanSpacers(tr: Transaction) {
+  const positions: number[] = [];
+  tr.doc.descendants((node, pos) => {
+    if (!node.isText || !node.text?.includes('\u200B')) return true;
+    if (node.marks.some((m) => SUGGESTION_MARK_NAMES.has(m.type.name))) return true;
+    for (let i = 0; i < node.text.length; i += 1) {
+      if (node.text[i] === '\u200B') positions.push(pos + i);
+    }
+    return true;
+  });
+  for (let i = positions.length - 1; i >= 0; i -= 1) tr.delete(positions[i], positions[i] + 1);
+}
+
+/** The library's own resolve transaction, with the spacer sweep appended. */
+const sweepingDispatch = (dispatch?: EditorView['dispatch']): EditorView['dispatch'] | undefined =>
+  dispatch &&
+  ((tr: Transaction) => {
+    sweepOrphanSpacers(tr);
+    dispatch(tr);
+  });
+
 function resolveSuggestionId(id: SuggestionId, accept: boolean, onCascade?: (outcome: CascadeOutcome) => void) {
   return (state: EditorState, dispatch?: EditorView['dispatch']): boolean => {
     const structural: Array<{
@@ -926,7 +984,7 @@ function resolveSuggestionId(id: SuggestionId, accept: boolean, onCascade?: (out
     const blockDeletes = suggestionEmptiedBlocks(state.doc, accept, id, cascade?.drops ?? [])
       .filter((r) => !structural.some((s) => (s.remove || s.replace) && s.from <= r.from && s.to >= r.to));
     if (structural.length === 0 && !cascade?.depIds.size && blockDeletes.length === 0) {
-      return resolveInline(state, dispatch);
+      return resolveInline(state, sweepingDispatch(dispatch));
     }
     if (!dispatch) return true;
 
@@ -968,6 +1026,7 @@ function resolveSuggestionId(id: SuggestionId, accept: boolean, onCascade?: (out
         if (out.doc.nodeAt(pos)) out.setNodeAttribute(pos, NODE_DELETION_ID, null);
       }
     }
+    sweepOrphanSpacers(out);
     out.setMeta(suggestChangesKey, { skip: true });
     dispatch(out);
     if (onCascade && cascade?.depIds.size) {
@@ -1014,7 +1073,7 @@ function resolveAllSuggestions(accept: boolean) {
     const resolveInline = accept ? applySuggestions : revertSuggestions;
     if (!dispatch) return structural.length > 0 || blockDeletes.length > 0 || resolveInline(state);
 
-    if (structural.length === 0 && blockDeletes.length === 0) return resolveInline(state, dispatch);
+    if (structural.length === 0 && blockDeletes.length === 0) return resolveInline(state, sweepingDispatch(dispatch));
 
     // Block work FIRST, on positions computed against `state.doc`. The library's
     // inline pass can merge an emptied block into its neighbour (deleteRange
@@ -1042,6 +1101,7 @@ function resolveAllSuggestions(accept: boolean) {
       deleteOrKeepRequiredDocumentBlock(out, out.mapping.map(r.from, 1), out.mapping.map(r.to, -1));
     }
     resolveInline(EditorState.create({ doc: out.doc }), (inline) => { for (const step of inline.steps) out.step(step); });
+    sweepOrphanSpacers(out);
     out.setMeta(suggestChangesKey, { skip: true });
     dispatch(out);
     return true;
