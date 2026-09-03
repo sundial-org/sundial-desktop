@@ -45,14 +45,25 @@ export function isEnvSecretPath(rel) {
  *  it can. Used to SKIP such downloads loudly instead of erroring on every
  *  poll (reserved device names, forbidden characters, trailing dot/space). */
 const WINDOWS_RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+/** A path as a LOG FIELD value: JSON-quoted, so the field has an unambiguous
+ *  end. Without it a legal filename carrying a space and an equals sign
+ *  ("Client status=Merger.md") looks like the start of the next field, and the
+ *  diagnostics redactor would strip only the first half. */
+export function logPath(value) {
+  return JSON.stringify(String(value ?? ''));
+}
+
 export function windowsUnwritableReason(rel) {
   const normalized = normalizeRelPath(rel);
   if (!normalized) return 'unsafe path';
   for (const segment of normalized.split('/')) {
+    // The offending segment is NOT quoted back: callers log the path under a
+    // key the diagnostics sink redacts, and a name repeated in free prose
+    // would ride along unredacted.
     // eslint-disable-next-line no-control-regex
-    if (/[<>:"|?*\u0000-\u001f]/.test(segment)) return `"${segment}" contains characters Windows forbids`;
-    if (WINDOWS_RESERVED_NAMES.test(segment.split('.')[0] ?? '')) return `"${segment}" is a reserved Windows device name`;
-    if (/[. ]$/.test(segment)) return `"${segment}" ends with a dot or space`;
+    if (/[<>:"|?*\u0000-\u001f]/.test(segment)) return 'contains characters Windows forbids';
+    if (WINDOWS_RESERVED_NAMES.test(segment.split('.')[0] ?? '')) return 'is a reserved Windows device name';
+    if (/[. ]$/.test(segment)) return 'ends with a dot or space';
   }
   return null;
 }

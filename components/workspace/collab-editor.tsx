@@ -95,6 +95,7 @@ import { HtmlPreview, type HtmlPreviewOptions } from '@/lib/tiptap/html-preview'
 import { PointerSelection } from '@/lib/tiptap/pointer-selection';
 import { ScopedSelectAll } from '@/lib/tiptap/scoped-select-all';
 import { CaretEdgeScroll } from '@/lib/tiptap/caret-edge-scroll';
+import { TableShiftSelection } from '@/lib/tiptap/table-shift-selection';
 import { applyIncremental, changedBlockSpan } from '@/lib/tiptap/incremental-decorations';
 import { EditorTabGuard, UndoBoundaries } from '@/lib/tiptap/structural-keys';
 // Keeps the text selection visibly highlighted while DOM focus is elsewhere
@@ -1796,6 +1797,9 @@ export function markdownFormattingExtensions(
     allowSuggestionBlockMarks(TableRow),
     allowSuggestionBlockMarks(TableHeader),
     allowSuggestionBlockMarks(TableCell),
+    // Shift-Arrow out of a block next to a table selects the whole table rather
+    // than dying against prosemirror-tables' selection normalization.
+    TableShiftSelection,
     MarkdownCheckbox,
     Mathematics.configure({
       regex: MATH_TEXT_REGEX,

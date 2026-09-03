@@ -13,7 +13,7 @@ import {
   safeResolveInRoot, walkProject, writeBlobAtomic, writeBlobStreamAtomic, writeTextFileAtomic,
 } from './disk.mjs';
 import { RootWatchers, locateRel, pickRootPrefix, projectRoots, walkAllRoots } from './roots.mjs';
-import { MIME, fileKind, fileKindForFile, isIgnoredPath, normalizeRelPath, resolveInRoot } from './paths.mjs';
+import { MIME, fileKind, fileKindForFile, isIgnoredPath, logPath, normalizeRelPath, resolveInRoot } from './paths.mjs';
 import { buildLocalChangeEntries, collectLocalSessions } from './history.mjs';
 import { SyncBridgeManager } from './bridge.mjs';
 import { compileLatexLocally } from './compile.mjs';
@@ -752,7 +752,7 @@ export async function startLocalServer({
   docHost.onFileRemoved = (projectId, rel) => {
     void bridges
       .handleLocalFileEvent(projectId, rel)
-      .catch((error) => log(`bridge delete failed path=${rel} error=${error?.message}`));
+      .catch((error) => log(`bridge delete failed path=${logPath(rel)} error=${error?.message}`));
     emit(projectId, { type: 'files-changed', path: rel });
   };
 
@@ -803,15 +803,15 @@ export async function startLocalServer({
             if (suppressed) emit(project.id, { type: 'files-changed', path: rel });
             return bridges.handleLocalFileEvent(project.id, rel);
           })
-          .catch((error) => log(`disk change failed path=${rel} error=${error?.message}`));
+          .catch((error) => log(`disk change failed path=${logPath(rel)} error=${error?.message}`));
         await applied.catch(() => {});
       } else if (!suppressed) {
         void bridges
           .handleLocalFileEvent(project.id, rel)
-          .catch((error) => log(`blob change failed path=${rel} error=${error?.message}`));
+          .catch((error) => log(`blob change failed path=${logPath(rel)} error=${error?.message}`));
       }
       if (!suppressed) emit(project.id, { type: 'files-changed', path: rel });
-      })().catch((error) => log(`disk change failed path=${rel} error=${error?.message}`));
+      })().catch((error) => log(`disk change failed path=${logPath(rel)} error=${error?.message}`));
   };
 
   const ensureWatcher = (project) => {
@@ -824,7 +824,7 @@ export async function startLocalServer({
       } catch (error) {
         // A vanished EXTRA root must not take the primary watcher down with it.
         if (!entry.prefix) throw error;
-        log(`watcher failed root=${entry.root} error=${error?.message}`);
+        log(`watcher failed root=${logPath(entry.root)} error=${error?.message}`);
       }
     }
     watchers.set(project.id, set);
@@ -840,7 +840,7 @@ export async function startLocalServer({
     try {
       ensureWatcher(project);
     } catch (error) {
-      log(`watcher failed project=${project.root} error=${error?.message}`);
+      log(`watcher failed project root=${logPath(project.root)} error=${error?.message}`);
     }
   }
   // Bridge resumption re-auths every cloud-shared doc over the network —
@@ -1489,7 +1489,7 @@ export async function startLocalServer({
           try {
             watchers.get(project.id)?.attach(prefix, rootPath, onWatcherChange(project));
           } catch (error) {
-            log(`watcher failed root=${rootPath} error=${error?.message}`);
+            log(`watcher failed root=${logPath(rootPath)} error=${error?.message}`);
           }
           emit(project.id, { type: 'files-changed', path: prefix });
           json(res, 200, { ok: true, root: { prefix, root: rootPath, name: path.basename(rootPath) || rootPath } });
@@ -2027,7 +2027,7 @@ export async function startLocalServer({
           // rejected creation's DELETE arrives separately via onFileRemoved).
           void bridges
             .handleLocalFileEvent(project.id, rel)
-            .catch((error) => log(`bridge resolve failed path=${rel} error=${error?.message}`));
+            .catch((error) => log(`bridge resolve failed path=${logPath(rel)} error=${error?.message}`));
           emit(project.id, { type: 'files-changed', path: rel });
         }
         // `after` = the file's text once the dust settles — with PARTIALLY

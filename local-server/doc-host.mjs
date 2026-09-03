@@ -24,7 +24,7 @@ import { snapshotResolutions, diffResolutions } from '../lib/crdt-js/suggestion_
 import fsp from 'node:fs/promises';
 
 import { contentHash } from './store.mjs';
-import { fileKindForFile, isIgnoredPath, normalizeRelPath, resolveInRoot } from './paths.mjs';
+import { fileKindForFile, isIgnoredPath, logPath, normalizeRelPath, resolveInRoot } from './paths.mjs';
 import { readTextFile, writeTextFileAtomic } from './disk.mjs';
 import { locateProjectPath } from './roots.mjs';
 
@@ -128,10 +128,10 @@ export class DocHost {
       connected: ({ documentName }) => {
         const meta = parseDocumentName(documentName);
         if (meta) this.onEditorConnected?.(meta.projectId, meta.path);
-        this.log(`editor connected doc=${documentName} connections=${this.connectionCount(documentName)}`);
+        this.log(`editor connected doc=${logPath(documentName)} connections=${this.connectionCount(documentName)}`);
       },
       onDisconnect: async ({ documentName }) => {
-        this.log(`editor disconnected doc=${documentName} connections=${this.connectionCount(documentName)}`);
+        this.log(`editor disconnected doc=${logPath(documentName)} connections=${this.connectionCount(documentName)}`);
       },
       onChange: ({ documentName, document, context }) => {
         if (!this.loadedDocs.has(documentName)) return;
@@ -268,7 +268,7 @@ export class DocHost {
       pending.push(...changes.map((change) => ({ ...change, context: originContext ?? null })));
       this.pendingDecisions.set(documentName, pending);
     });
-    this.log(`load doc=${documentName} source=${stored ? 'state' : disk ? 'disk' : 'empty'}`);
+    this.log(`load doc=${logPath(documentName)} source=${stored ? 'state' : disk ? 'disk' : 'empty'}`);
     return document;
   }
 
@@ -302,7 +302,7 @@ export class DocHost {
     const prev = this.persistChains.get(documentName) ?? Promise.resolve();
     const attempt = prev.then(() => this.persist(documentName, document, context));
     const next = attempt.catch((error) => {
-      this.log(`persist failed doc=${documentName} error=${error?.message}`);
+      this.log(`persist failed doc=${logPath(documentName)} error=${error?.message}`);
     });
     this.persistChains.set(documentName, next);
     void next.finally(() => {
@@ -368,7 +368,7 @@ export class DocHost {
             // UI tree and the cloud bridge must hear it like other deletes.
             this.onFileRemoved?.(meta.projectId, meta.path);
           } catch (error) {
-            this.log(`rejected-creation delete failed doc=${documentName} error=${error?.message}`);
+            this.log(`rejected-creation delete failed doc=${logPath(documentName)} error=${error?.message}`);
           }
         });
         return;
@@ -430,7 +430,7 @@ export class DocHost {
     // never normal typing — capture who could have written it.
     if (previousLength > 50 && text.length < previousLength / 2) {
       this.log(
-        `doc-shrink doc=${documentName} len=${previousLength}->${text.length} window=${JSON.stringify(window ?? null)} connections=${this.connectionCount(documentName)} actor=${context?.actor ?? 'none'}`,
+        `doc-shrink doc=${logPath(documentName)} len=${previousLength}->${text.length} window=${JSON.stringify(window ?? null)} connections=${this.connectionCount(documentName)} actor=${context?.actor ?? 'none'}`,
       );
     }
     this.store.recordEdit({
@@ -653,7 +653,7 @@ export class DocHost {
       this.pendingPersist.delete(documentName);
       this.#recordAgentBaseline(projectId, relPath, actor, priorText);
       await this.persist(documentName, document, { actor, chatId, messageId, turnResolved, userId: authorId }).catch((error) => {
-        this.log(`external persist failed doc=${documentName} error=${error?.message}`);
+        this.log(`external persist failed doc=${logPath(documentName)} error=${error?.message}`);
       });
     }
     return changed ? 'mutated' : undefined;

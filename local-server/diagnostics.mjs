@@ -21,21 +21,44 @@ const ENTRY_OVERHEAD_BYTES = 32;
 // (`path=Clients/Acme/merger.md`) names the user's work as plainly as an
 // absolute one, and a folder name can contain spaces.
 // Where a path is certain — under a registered root, home-shaped, or after a
-// path key — the value runs to the path's end: a space is taken only while
-// another separator lies ahead and the next word is not a `key=` pair, so
-// "My Secret Project/x.md" goes whole and trailing prose ("failed") stays.
-const PATH_VALUE = String.raw`(?:[^\s'"]|\s(?![\w.-]+=)(?=[^'"]*[/\\]))*`;
+// path key — the value runs to the end of the path: it takes spaces, stopping
+// only at a quote or the next `key=` pair. So a spaced folder OR a spaced
+// bare filename ("Client Merger.md") goes whole, and no later field is eaten.
+// The cost is a trailing bare word ("... failed") going with an unkeyed path;
+// over-redaction is the right way to be wrong here.
+const PATH_VALUE = String.raw`(?:[^\s'"]|\s(?![\w.-]+=))*`;
 // The keys the sidecar logs paths under, including those whose value is often
 // a bare basename with no separator for the token pass below to catch: doc=
 // (doc-host), from= (rename), file=. `project=` is deliberately absent: it is
 // a UUID as often as a path, and the path form always has separators.
 const PATH_KEYS = 'path|root|file|dir|folder|cwd|cloud|doc|from|to';
-const PATH_KEY_RX = new RegExp(String.raw`\b(${PATH_KEYS})(\s*=\s*)("[^"]*"|'[^']*'|${PATH_VALUE})`, 'gi');
+// A JSON-quoted value (what logPath() emits) is the unambiguous form: it ends
+// at its closing quote, so a filename carrying spaces AND `key=` text cannot
+// fake a field boundary. The bare forms stay as a fallback for any line that
+// interpolates a path without the helper.
+const JSON_QUOTED = String.raw`"(?:[^"\\]|\\.)*"`;
+// Node writes its own quotes, and it escapes nothing: `open '/x/O'Brien.md'`
+// has three apostrophes for one path. A single-quoted span is therefore taken
+// GREEDILY, to the last quote on the line — merging two spans over-redacts,
+// stopping at the first leaks a filename.
+// A newline is legal in a POSIX filename and Node prints it raw, so the span
+// crosses lines too.
+const SINGLE_QUOTED = String.raw`'[\s\S]*'`;
+// observe() slices a line at maxLineChars, which can cut a closing quote off.
+// An unterminated quote runs to the end of the line rather than falling back
+// to the bare rules, which cannot consume the opening quote and would strand
+// the words inside it.
+// `\\?$` because the slice can land between the two characters of an escape
+// and leave a dangling backslash, which `\\.` alone would reject.
+const JSON_UNCLOSED = String.raw`"(?:[^"\\]|\\.)*\\?$`;
+const SINGLE_UNCLOSED = String.raw`'[\s\S]*$`;
+const QUOTED_FORMS = `${JSON_QUOTED}|${SINGLE_QUOTED}|${JSON_UNCLOSED}|${SINGLE_UNCLOSED}`;
+const PATH_KEY_RX = new RegExp(String.raw`\b(${PATH_KEYS})(\s*=\s*)(${QUOTED_FORMS}|${PATH_VALUE})`, 'gi');
 const escapeRx = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // Home-shaped and quoted spans, so a spaced path is covered even with no roots
 // to enumerate (store closed mid-shutdown, or a path outside every project).
 const HOME_PATH_RX = new RegExp(String.raw`(?:\/Users\/|\/home\/|[A-Za-z]:\\Users\\)` + PATH_VALUE, 'g');
-const QUOTED_RX = /'[^']*'|"[^"]*"/g;
+const QUOTED_RX = new RegExp(QUOTED_FORMS, 'g');
 // Then any remaining token carrying a separator, matched segment-wise so it
 // stays linear. A URL keeps scheme + host, so a failing endpoint is still
 // identifiable. The FIRST segment excludes "=" so `key=a/b` keeps its key;
@@ -66,12 +89,20 @@ export function buildRedactionRules(paths = []) {
 }
 
 export function applyRedaction(message, rules = []) {
-  // Roots first: only they can tell where a spaced path under a known folder
-  // begins, and taking the whole value leaves the token pass nothing to split.
-  let out = String(message);
+  // Quoted spans FIRST: the quotes are the only unambiguous delimiter, so a
+  // path whose filename contains `key=` text (or spaces) stays atomic. Running
+  // the root rules first would cut such a path short and strand its tail.
+  let out = String(message).replace(QUOTED_RX, (match) => {
+    if (!/[/\\]/.test(match)) return match; // an apostrophe in prose, not a path
+    const quote = match[0];
+    // A span the slice truncated has no closing quote to put back.
+    const closed = match.length > 1 && match.endsWith(quote);
+    return closed ? `${quote}<path>${quote}` : `${quote}<path>`;
+  });
+  // Then the known roots and home, which alone can tell where an UNquoted
+  // spaced path begins, and take it whole.
   for (const rule of rules) out = out.replace(rule, '<path>');
   out = out.replace(HOME_PATH_RX, '<path>');
-  out = out.replace(QUOTED_RX, (match) => (/[/\\]/.test(match) ? `${match[0]}<path>${match[0]}` : match));
   out = out.replace(PATH_KEY_RX, (_match, key, equals) => `${key}${equals}<path>`);
   out = out.replace(PATHY_RX, (match) => {
     const url = URL_RX.exec(match);

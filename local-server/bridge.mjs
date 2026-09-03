@@ -7,7 +7,7 @@ import { applyContentTextIfChanged, readDocumentText } from '../lib/crdt-js/docu
 import fsp from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 
-import { fileKindForFile, isEnvSecretPath, isIgnoredPath, mimeFor, resolveInRoot, scopeCoversPath, windowsUnwritableReason } from './paths.mjs';
+import { fileKindForFile, isEnvSecretPath, isIgnoredPath, logPath, mimeFor, resolveInRoot, scopeCoversPath, windowsUnwritableReason } from './paths.mjs';
 import { inExtraRoot } from './roots.mjs';
 import { syncShareLedger } from './ledger-sync.mjs';
 import { Readable } from 'node:stream';
@@ -46,6 +46,9 @@ const BLOB_UPLOAD_CHUNK_BYTES = Number(process.env.SUNDIAL_BRIDGE_BLOB_CHUNK_BYT
 // the tree size: idle bridges close once their cloud row is confirmed, and
 // reopen on local edits, a local editor connecting, or a cloud updated_at
 // change seen by the poll.
+// noteError() subjects that name a whole-share phase rather than a file — the
+// only `where` values that are NOT a path, and so the only ones logged bare.
+const ERROR_PHASES = new Set(['cloud-list', 'cloud-poll', 'ledger-sync', 'token-refresh']);
 const BRIDGE_IDLE_MS = Number(process.env.SUNDIAL_BRIDGE_IDLE_MS || 60_000);
 const SYNC_PROGRESS_TIMEOUT_MS = Number(process.env.SUNDIAL_SYNC_PROGRESS_TIMEOUT_MS || 4_000);
 const SYNC_PROGRESS_UPDATE_MS = Number(process.env.SUNDIAL_SYNC_PROGRESS_UPDATE_MS || 500);
@@ -253,7 +256,7 @@ class FileBridge {
         docHost.loadedWithoutDisk.delete(this.localDocName);
         docHost.schedulePersist(this.localDocName, localDoc, { actor: 'remote', userId: 'cloud-bridge' });
         this.engine.manager.emitFilesChanged(this.engine.project.id, this.localRel);
-        log(`bridge stale empty materialization awaiting confirmation file=${this.localRel}`);
+        log(`bridge stale empty materialization awaiting confirmation file=${logPath(this.localRel)}`);
         return;
       }
       docHost.loadedWithoutDisk.delete(this.localDocName);
@@ -304,18 +307,27 @@ class FileBridge {
       try {
         await createCloudTwin();
       } catch {
-        this.engine.queueCloudOp(`create ${this.cloudPath}`, createCloudTwin);
+        this.engine.queueCloudOp('create', this.cloudPath, createCloudTwin);
       }
-      log(`bridge up file=${this.localRel} cloud=${this.cloudDocName}`);
+      log(`bridge up file=${logPath(this.localRel)} cloud=${logPath(this.cloudDocName)}`);
       docHost.schedulePersist(this.localDocName, localDoc, { actor: 'remote', userId: 'cloud-bridge' });
       return;
     }
     requireCurrentListing();
-    store.markBridgeFile(share.id, this.localRel);
-
-    // Flush the merged state to disk + let the cloud persist its side.
-    docHost.schedulePersist(this.localDocName, localDoc, { actor: 'remote', userId: 'cloud-bridge' });
-    log(`bridge up file=${this.localRel} cloud=${this.cloudDocName}`);
+    if (localExists) {
+      store.markBridgeFile(share.id, this.localRel);
+      // Flush the merged state to disk + let the cloud persist its side.
+      docHost.schedulePersist(this.localDocName, localDoc, { actor: 'remote', userId: 'cloud-bridge' });
+    } else {
+      // Cloud pull with no disk twin: the bridge_files row means "first sync
+      // done" and every gone-from-disk rail trusts it, so the disk write must
+      // land BEFORE the mark — marking first leaves a window where a watcher
+      // event reads the not-yet-written file as a local delete and deletes
+      // the cloud original (the 2026-09-02 mass-delete on fresh attach).
+      await docHost.queuePersist(this.localDocName, localDoc, { actor: 'remote', userId: 'cloud-bridge' }, { rethrow: true });
+      store.markBridgeFile(share.id, this.localRel);
+    }
+    log(`bridge up file=${logPath(this.localRel)} cloud=${logPath(this.cloudDocName)}`);
   }
 
   waitForSync() {
@@ -494,7 +506,7 @@ export class ShareEngine {
     // listing these ops haven't caught up with.
     if (this.isUnion) {
       for (const move of this.store.listPendingScopeMoves(share.id)) {
-        this.queueCloudOp(`move ${move.from} -> ${move.to}`, this.scopeMoveOp(move));
+        this.queueCloudOp('move', `${move.from} -> ${move.to}`, this.scopeMoveOp(move));
       }
     }
   }
@@ -761,13 +773,13 @@ export class ShareEngine {
       this.pendingOversizedUnbridges.delete(localRel);
     };
     if (this.opsParked) {
-      this.queueCloudOp(`delete oversized ${cloudPath}`, run);
+      this.queueCloudOp('delete oversized', cloudPath, run);
       return;
     }
     try {
       await run();
     } catch {
-      this.queueCloudOp(`delete oversized ${cloudPath}`, run);
+      this.queueCloudOp('delete oversized', cloudPath, run);
     }
   }
 
@@ -1065,9 +1077,9 @@ export class ShareEngine {
             };
             try {
               await run();
-              this.log(`bridge offline local-delete file=${rel}`);
+              this.log(`bridge offline local-delete file=${logPath(rel)}`);
             } catch {
-              this.queueCloudOp(`delete ${cloudPath}`, run);
+              this.queueCloudOp('delete', cloudPath, run);
             }
           } else {
             this.store.forgetBridgeFile(this.share.id, rel); // gone on both sides
@@ -1231,7 +1243,7 @@ export class ShareEngine {
         // existed had no event to re-bridge it and silently went unshared.
         this.pendingResumeOpens.add(file.path);
         this.log(
-          `bridge offline cloud-delete skipped (local file ${openInEditor ? 'open in editor' : 'edited since startup'}, re-sharing) file=${file.path}`,
+          `bridge offline cloud-delete skipped (local file ${openInEditor ? 'open in editor' : 'edited since startup'}, re-sharing) file=${logPath(file.path)}`,
         );
         continue;
       }
@@ -1244,7 +1256,7 @@ export class ShareEngine {
       this.store.recordEdit({ projectId: this.project.id, path: file.path, actor: 'remote', contentText: null });
       await this.docHost.handleDiskChange(this.project.id, file.path).catch(() => {});
       this.manager.emitFilesChanged(this.project.id, file.path);
-      this.log(`bridge offline cloud-delete file=${file.path}`);
+      this.log(`bridge offline cloud-delete file=${logPath(file.path)}`);
     }
     return kept;
   }
@@ -1260,7 +1272,11 @@ export class ShareEngine {
       typeof where === 'string' &&
       (this.progressLocalFiles?.has(where) || this.progressCloudFiles?.has(where) || this.bridges.has(where))
     ) this.progressFailedPaths.add(where);
-    this.log(`share ${this.share.id} ${this.error}`);
+    // `where` is a file path unless it names a whole-share phase. Paths go
+    // out under file=, the key the diagnostics sink redacts — a bare name in
+    // prose has no separator and nothing to key off, so it would ship as-is.
+    const subject = ERROR_PHASES.has(where) ? `phase=${where}` : `file=${logPath(where)}`;
+    this.log(`share ${this.share.id} ${subject} error=${error?.message || error}`);
     if (/auth|401|403/i.test(String(error?.message))) {
       this.status = 'error';
       this.authError = true;
@@ -1486,7 +1502,7 @@ export class ShareEngine {
     try {
       await this.docHost.handleDiskChange(this.project.id, localRel);
     } catch (error) {
-      this.noteError(`disk-reconcile ${localRel}`, error);
+      this.noteError(localRel, new Error(`disk-reconcile: ${error?.message || error}`));
       return null;
     }
     const confirmedBefore = this.localFileVersion(localRel);
@@ -1993,7 +2009,7 @@ export class ShareEngine {
       if (local.tooLarge) {
         if (!this.loggedBlobSkips.has(localRel)) {
           this.loggedBlobSkips.add(localRel);
-          this.log(`blob skip (over ${BLOB_SYNC_MAX_BYTES} bytes) file=${localRel}`);
+          this.log(`blob skip (over ${BLOB_SYNC_MAX_BYTES} bytes) file=${logPath(localRel)}`);
         }
         // A previously synced blob rewritten past the cap becomes local-only:
         // remove the (now stale) cloud twin, then drop bridge state. Leaving
@@ -2003,7 +2019,7 @@ export class ShareEngine {
         // leaving this queued for the next poll.
         if (this.store.hasBridgeFile(this.share.id, localRel)) {
           await this.unbridgeOversized(localRel);
-          this.log(`blob unbridged (grew over cap, now local-only) file=${localRel}`);
+          this.log(`blob unbridged (grew over cap, now local-only) file=${logPath(localRel)}`);
         }
         this.pendingBlobSyncs.delete(localRel);
         return;
@@ -2147,13 +2163,13 @@ export class ShareEngine {
     // delete / requeue the newer bytes instead of recording a stale sync.
     const current = await this.localBlobState(localRel, { rehash: true });
     if (!current.exists) {
-      this.log(`blob upload superseded by local delete file=${localRel}`);
+      this.log(`blob upload superseded by local delete file=${logPath(localRel)}`);
       await this.handleLocalFileEvent(localRel);
       return;
     }
     if (current.sha !== sha) {
       this.pendingBlobSyncs.add(localRel);
-      this.log(`blob rewritten mid-upload, requeued file=${localRel}`);
+      this.log(`blob rewritten mid-upload, requeued file=${logPath(localRel)}`);
       return;
     }
     this.store.recordBlobSync(this.share.id, localRel, {
@@ -2161,7 +2177,7 @@ export class ShareEngine {
       mtimeMs: Math.trunc(current.stat.mtimeMs),
       size: current.stat.size,
     });
-    this.log(`blob up file=${localRel} sha=${sha.slice(0, 8)}`);
+    this.log(`blob up file=${logPath(localRel)} sha=${sha.slice(0, 8)}`);
   }
 
   /** `basedOnLocalSha` is the local content the download decision was judged
@@ -2178,7 +2194,9 @@ export class ShareEngine {
     if (!this.unwritableLogged) this.unwritableLogged = new Set();
     if (!this.unwritableLogged.has(localRel)) {
       this.unwritableLogged.add(localRel);
-      this.log(`share ${this.share.id} skip download ${localRel}: ${reason}. Rename it in the workspace to sync it here.`);
+      // Keyed (file=), like every other path this logs: the diagnostics sink
+      // redacts path VALUES, and a bare name in prose would ship as-is.
+      this.log(`share ${this.share.id} skip download file=${logPath(localRel)} reason=${reason} (rename it in the workspace to sync it here)`);
     }
     return true;
   }
@@ -2190,7 +2208,7 @@ export class ShareEngine {
       this.skippedBlobDownloads.set(localRel, expectedSha ?? '');
       if (!this.loggedBlobSkips.has(localRel)) {
         this.loggedBlobSkips.add(localRel);
-        this.log(`blob skip download (over ${BLOB_SYNC_MAX_BYTES} bytes) file=${localRel}`);
+        this.log(`blob skip download (over ${BLOB_SYNC_MAX_BYTES} bytes) file=${logPath(localRel)}`);
       }
     };
     const cloudPath = this.localToCloud(localRel);
@@ -2223,7 +2241,7 @@ export class ShareEngine {
     const current = await this.localBlobState(localRel, { rehash: true });
     if ((current.exists ? current.sha ?? '' : null) !== basedOnLocalSha && current.sha !== sha) {
       this.pendingBlobSyncs.add(localRel);
-      this.log(`blob download aborted (local changed mid-transfer) file=${localRel}`);
+      this.log(`blob download aborted (local changed mid-transfer) file=${logPath(localRel)}`);
       return;
     }
     // Stream variant: writeBlobAtomic's 10 MB cap predates the 50 MB sync
@@ -2240,15 +2258,20 @@ export class ShareEngine {
     await this.refreshProgressLocalPath(localRel);
     this.scheduleProgressPublish();
     this.manager.emitFilesChanged(this.project.id, localRel);
-    this.log(`blob down file=${localRel} sha=${sha.slice(0, 8)}${expectedSha && sha !== expectedSha ? ' (listing was stale)' : ''}`);
+    this.log(`blob down file=${logPath(localRel)} sha=${sha.slice(0, 8)}${expectedSha && sha !== expectedSha ? ' (listing was stale)' : ''}`);
   }
 
-  queueCloudOp(label, run) {
+  /** `kind` is the verb (create/delete/move…), `path` the cloud path it acts
+   *  on — split so the log can key the path under a name the diagnostics sink
+   *  redacts, while the verb still ships. The share's error string, which the
+   *  UI shows, keeps the old "<kind> <path>" wording. */
+  queueCloudOp(kind, path, run) {
+    const label = `${kind} ${path}`;
     this.pendingCloudOps.push({ label, run });
     this.opsParked = true;
     this.status = 'error';
     this.error = `cloud sync operation failed: ${label} (retrying)`;
-    this.log(`share ${this.share.id} queued retry: ${label}`);
+    this.log(`share ${this.share.id} queued retry op=${kind} path=${logPath(path)}`);
     this.publishProgress({ force: true });
   }
 
@@ -2548,7 +2571,7 @@ export class ShareEngine {
         // and park the share with a visible error instead.
         this.status = 'error';
         this.error = `cloud file "${bridge.cloudPath}" was removed or renamed. Sharing stopped, local file kept.`;
-        this.log(`file-share cloud path gone file=${localRel}; share parked`);
+        this.log(`file-share cloud path gone file=${logPath(localRel)}; share parked`);
         continue;
       }
       await deleteFile(this.project.root, localRel).catch(() => {});
@@ -2557,7 +2580,7 @@ export class ShareEngine {
       this.store.recordEdit({ projectId: this.project.id, path: localRel, actor: 'remote', contentText: null });
       await this.docHost.handleDiskChange(this.project.id, localRel).catch(() => {});
       this.manager.emitFilesChanged(this.project.id, localRel);
-      this.log(`bridge cloud-delete file=${localRel}`);
+      this.log(`bridge cloud-delete file=${logPath(localRel)}`);
     }
 
     // Synced files whose idle bridges CLOSED see collaborator deletes here:
@@ -2572,7 +2595,7 @@ export class ShareEngine {
       if (this.share.scope_kind === 'file') {
         this.status = 'error';
         this.error = `cloud file "${this.localToCloud(localRel)}" was removed or renamed. Sharing stopped, local file kept.`;
-        this.log(`file-share cloud path gone file=${localRel}; share parked`);
+        this.log(`file-share cloud path gone file=${logPath(localRel)}; share parked`);
         continue;
       }
       // A local edit/open that could not get a live slot is queued to
@@ -2580,7 +2603,7 @@ export class ShareEngine {
       // startup reconciliation rescue path above; deleting here would erase
       // the edit before the queue can drain.
       if (this.pendingResumeOpens.has(localRel)) {
-        this.log(`bridge cloud-delete skipped (local file queued to re-share) file=${localRel}`);
+        this.log(`bridge cloud-delete skipped (local file queued to re-share) file=${logPath(localRel)}`);
         continue;
       }
       const closedVersion = this.syncedLocalVersions.get(localRel);
@@ -2589,7 +2612,7 @@ export class ShareEngine {
       if (closedVersion !== undefined && currentVersion !== null && currentVersion !== closedVersion) {
         this.pendingResumeOpens.add(localRel);
         if (this.status === 'active') this.status = 'starting';
-        this.log(`bridge cloud-delete skipped (idle local file changed, re-sharing) file=${localRel}`);
+        this.log(`bridge cloud-delete skipped (idle local file changed, re-sharing) file=${logPath(localRel)}`);
         continue;
       }
       await deleteFile(this.project.root, localRel).catch(() => {});
@@ -2600,7 +2623,7 @@ export class ShareEngine {
       this.store.recordEdit({ projectId: this.project.id, path: localRel, actor: 'remote', contentText: null });
       await this.docHost.handleDiskChange(this.project.id, localRel).catch(() => {});
       this.manager.emitFilesChanged(this.project.id, localRel);
-      this.log(`bridge cloud-delete file=${localRel} (idle)`);
+      this.log(`bridge cloud-delete file=${logPath(localRel)} (idle)`);
     }
 
     // Rescued files whose re-share failed transiently requeued themselves —
@@ -2700,6 +2723,17 @@ export class ShareEngine {
     }
   }
 
+  /** Disk absence proves nothing for a path whose first materialization is
+   *  still in flight (bridge starting, or its persist scheduled but not yet
+   *  written) — condemning it as a local delete would delete the cloud
+   *  original. A skipped real delete converges: the persist rewrites the
+   *  file and the next delete event finds no pending work. */
+  materializationPending(rel) {
+    const bridge = this.bridges.get(rel);
+    if (bridge && !bridge.started) return true;
+    return this.docHost.hasPendingPersist(`${this.project.id}/${rel}`);
+  }
+
   /** This path plus every SYNCED descendant — open bridges and idle-closed
    *  ones alike (a deleted/renamed FOLDER arrives as one event for the folder
    *  path, and closed bridges still have cloud twins to move/delete). */
@@ -2722,7 +2756,7 @@ export class ShareEngine {
       if (!this.envSkipLogged) this.envSkipLogged = new Set();
       if (!this.envSkipLogged.has(localRel)) {
         this.envSkipLogged.add(localRel);
-        this.log(`share ${this.share.id} secrets stay local: ${localRel} is never synced; use workspace secrets to share configuration`);
+        this.log(`share ${this.share.id} secrets stay local file=${logPath(localRel)} (never synced; use workspace secrets to share configuration)`);
       }
       return;
     }
@@ -2743,7 +2777,7 @@ export class ShareEngine {
           if (!this.loggedProgressSkips) this.loggedProgressSkips = new Set();
           if (!this.loggedProgressSkips.has(localRel)) {
             this.loggedProgressSkips.add(localRel);
-            this.log(`share ${this.share.id} sync skipped by size policy file=${localRel}`);
+            this.log(`share ${this.share.id} sync skipped by size policy file=${logPath(localRel)}`);
           }
           return;
         }
@@ -2768,6 +2802,7 @@ export class ShareEngine {
         // sweep bridged descendants whose own files are gone.
         for (const rel of this.bridgedUnder(localRel)) {
           if (rel === localRel) continue;
+          if (this.materializationPending(rel)) continue;
           const relAbs = resolveInRoot(this.project.root, rel);
           const relStat = relAbs ? await fsp.stat(relAbs).catch(() => null) : null;
           if (relStat) continue;
@@ -2781,7 +2816,7 @@ export class ShareEngine {
           try {
             await run();
           } catch {
-            this.queueCloudOp(`delete ${cloudPath}`, run);
+            this.queueCloudOp('delete', cloudPath, run);
           }
         }
         return;
@@ -2792,6 +2827,7 @@ export class ShareEngine {
       // A failed cloud delete keeps the bridge_files row (and the share error)
       // so the orphan is visible instead of silently forgotten.
       for (const rel of this.bridgedUnder(localRel)) {
+        if (this.materializationPending(rel)) continue;
         await this.dropBridge(rel);
         const cloudPath = this.localToCloud(rel);
         const run = async () => {
@@ -2801,7 +2837,7 @@ export class ShareEngine {
         try {
           await run();
         } catch {
-          this.queueCloudOp(`delete ${cloudPath}`, run);
+          this.queueCloudOp('delete', cloudPath, run);
         }
       }
     } finally {
@@ -2851,7 +2887,7 @@ export class ShareEngine {
         } catch {
           // Park until the move lands — re-bridging now would first-sync
           // local-wins over whatever sits at the target cloud path.
-          this.queueCloudOp(`move ${this.localToCloud(fromRel)} -> ${this.localToCloud(toRel)}`, move);
+          this.queueCloudOp('move', `${this.localToCloud(fromRel)} -> ${this.localToCloud(toRel)}`, move);
         }
       } else {
         // Moved out of scope. Delete the affected CHILD paths individually —
@@ -2865,7 +2901,7 @@ export class ShareEngine {
           try {
             await run();
           } catch {
-            this.queueCloudOp(`delete ${cloudPath}`, run);
+            this.queueCloudOp('delete', cloudPath, run);
           }
         }
       }
@@ -3623,7 +3659,7 @@ export class SyncBridgeManager {
     for (const engine of this.engines.values()) {
       if (engine.project.id === projectId && !engine.stopped) {
         await engine.handleLocalFileEvent(relPath).catch((error) => {
-          this.log(`bridge local-event failed path=${relPath} error=${error?.message}`);
+          this.log(`bridge local-event failed path=${logPath(relPath)} error=${error?.message}`);
         });
       }
     }
@@ -3662,7 +3698,7 @@ export class SyncBridgeManager {
         continue;
       }
       void engine.ensureBridge(relPath).catch((error) => {
-        this.log(`bridge editor-open failed path=${relPath} error=${error?.message}`);
+        this.log(`bridge editor-open failed path=${logPath(relPath)} error=${error?.message}`);
       });
     }
   }
@@ -3675,7 +3711,7 @@ export class SyncBridgeManager {
       if (engine.share.scope_kind === 'chat') continue;
       if (engine.isUnion) {
         await this.handleUnionRename(shareId, engine, fromRel, toRel).catch((error) => {
-          this.log(`union rename failed from=${fromRel} error=${error?.message}`);
+          this.log(`union rename failed from=${logPath(fromRel)} error=${error?.message}`);
         });
         continue;
       }
@@ -3730,7 +3766,7 @@ export class SyncBridgeManager {
           this.engines.set(shareId, next);
           if (staleCloudPath) {
             const cloudPath = staleCloudPath;
-            next.queueCloudOp(`delete ${cloudPath}`, () => next.cloudDelete(cloudPath));
+            next.queueCloudOp('delete', cloudPath, () => next.cloudDelete(cloudPath));
           }
           await next.start().catch((error) => {
             this.log(`share scope-follow restart failed id=${shareId} error=${error?.message}`);
@@ -3739,7 +3775,7 @@ export class SyncBridgeManager {
         continue;
       }
       await engine.handleLocalRename(fromRel, toRel).catch((error) => {
-        this.log(`bridge rename failed from=${fromRel} error=${error?.message}`);
+        this.log(`bridge rename failed from=${logPath(fromRel)} error=${error?.message}`);
       });
     }
   }

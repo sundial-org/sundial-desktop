@@ -28,8 +28,6 @@ import { starterPacksForFlavor, type StarterPack } from '@/lib/local/starter-pac
  * The listing is flavor-gated: a general build (desktop/OSS) drops the
  * scientific packs rather than opening on LaTeX and papers.
  */
-const PACKS = starterPacksForFlavor(productFlavor());
-
 const PACK_ICONS: Record<string, ComponentType<IconProps>> = {
   'research-paper': GraduationCapIcon,
   'lit-review': BooksIcon,
@@ -99,9 +97,14 @@ export function StarterPackGrid({
   disabled?: boolean;
   onSelect: (pack: StarterPack) => void;
 }) {
+  // Resolved per render, not at module load: the env is fixed at runtime, but a
+  // module-level constant froze the listing to whatever the flavor was the
+  // first time this module was imported, which in a shared test worker is
+  // whatever an unrelated file left in the environment.
+  const packs = starterPacksForFlavor(productFlavor());
   return (
     <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-      {PACKS.map((pack) => {
+      {packs.map((pack) => {
         const Icon = PACK_ICONS[pack.id] ?? FolderSimpleIcon;
         return (
           <button
