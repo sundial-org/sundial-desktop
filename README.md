@@ -14,7 +14,24 @@ Open source. Local-first. Runs on your own Claude Code and Codex.
 
 *Select text, comment `@Agent tighten this`. The agent answers in the thread and its edit lands as a suggestion you accept or reject, while your teammate keeps typing.*
 
-## What you get
+## Install and try it
+
+**macOS.** [Download the app](https://www.sundial.md/download), drag it to Applications, open it. Free, no account needed.
+
+**Windows / Linux.** Not built yet, tracked in [issues](https://github.com/sundial-org/sundial-desktop/issues); a star helps us prioritize.
+
+**From source.** See [Build](#build).
+
+**In the browser.** The same editor runs at [sundial.md](https://www.sundial.md/new) with a hosted agent, nothing to install. Documents you share from the app open there too.
+
+Once it is open:
+
+1. Open Sundial and point it at any folder of markdown, or start empty.
+2. Select a sentence and comment `@Agent make this tighter`.
+3. The agent replies in the thread and its edit shows up inline as a suggestion. Accept or reject it.
+4. Share the doc with a teammate: their cursor, and their agent's edits, appear live.
+
+## Features
 
 - **Multiplayer for agents.** Your teammates' cursors and their agents' edits appear in the doc as they happen, attributed to whoever made them, human or agent.
 - **Your subscription works here.** Claude Code and Codex run on your machine, inside the editor. No API key, no per-token markup, no account until you share. Existing terminal sessions import and resume in place.
@@ -42,23 +59,6 @@ Claude Code · Codex · Claude, GPT, Gemini and open models through Sundial's ho
 | Per-edit review of agent work          | ✓       | commit-level         | ✗                    | ✗        |
 | Plain Markdown on your disk            | ✓       | ✓                    | ✗                    | ✓        |
 | Local-first, open source               | ✓       | ✗                    | ✗                    | files only |
-
-## Install
-
-**macOS.** [Download the app](https://www.sundial.md/download), drag it to Applications, open it. Free, no account needed.
-
-**Windows / Linux.** Not built yet, tracked in [issues](https://github.com/sundial-org/sundial-desktop/issues); a star helps us prioritize.
-
-**From source.** See [Build](#build).
-
-**In the browser.** The same editor runs at [sundial.md](https://www.sundial.md/new) with a hosted agent, nothing to install. Documents you share from the app open there too.
-
-## Try it in 60 seconds
-
-1. Open Sundial and point it at any folder of markdown, or start empty.
-2. Select a sentence and comment `@Agent make this tighter`.
-3. The agent replies in the thread and its edit shows up inline as a suggestion. Accept or reject it.
-4. Share the doc with a teammate: their cursor, and their agent's edits, appear live.
 
 ## FAQ
 
