@@ -278,6 +278,39 @@ function isCompileStatusPart(
   );
 }
 
+type PromptSkillsData = { ids?: unknown; count?: unknown };
+
+function isPromptSkillsPart(
+  part: unknown,
+): part is { type: 'data-prompt-skills'; id?: string; data?: PromptSkillsData } {
+  return (
+    typeof part === 'object' &&
+    part !== null &&
+    (part as { type?: unknown }).type === 'data-prompt-skills'
+  );
+}
+
+/** Which skill labels from files in this folder went into the turn's prompt.
+ *  Those labels are repo content (a shared folder or a cloned repo writes
+ *  them), so what steered the agent stays visible instead of implicit. Same
+ *  grey h-6 meta line as compile status and tool groups. */
+function PromptSkills({ data }: { data: PromptSkillsData }) {
+  const ids = Array.isArray(data.ids) ? data.ids.filter((id): id is string => typeof id === 'string') : [];
+  if (ids.length === 0) return null;
+  const count = typeof data.count === 'number' && data.count > ids.length ? data.count : ids.length;
+  const rest = count - ids.length;
+  return (
+    <div
+      className="my-0.5 flex h-6 items-center text-[14px] text-stone-400"
+      title="Names and descriptions read from skills/*/SKILL.md in this folder. The agent is told to treat them as data, not instructions."
+    >
+      <span className="min-w-0 truncate">
+        {`Skill labels from this folder in context: ${ids.join(', ')}${rest > 0 ? ` +${rest} more` : ''}`}
+      </span>
+    </div>
+  );
+}
+
 function isVisibleTextPart(part: unknown): boolean {
   return isTextPart(part) && part.text.trim().length > 0;
 }
@@ -872,6 +905,10 @@ function renderPart(
 
   if (isCompileStatusPart(part)) {
     return <CompileStatus key={key} data={part.data ?? {}} />;
+  }
+
+  if (isPromptSkillsPart(part)) {
+    return <PromptSkills key={key} data={part.data ?? {}} />;
   }
 
   return null;

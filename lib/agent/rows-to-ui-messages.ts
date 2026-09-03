@@ -48,6 +48,21 @@ function metaBool(meta: RowMeta, key: string): boolean {
   return meta[key] === true;
 }
 
+/** The local runner stamps which skill labels (untrusted text read from
+ *  `skills/<id>/SKILL.md` on disk) went into the turn's system prompt onto the
+ *  turn's assistant row, so the transcript can show what influenced the agent.
+ *  Carried by the anchor row rather than a row of its own: a standalone system
+ *  row would flush under a synthetic assistant id on any reload that beats the
+ *  anchor, leaving a ghost bubble beside the real reply. */
+function promptSkillsPart(row: ChatMessage): AnyPart | null {
+  const note = getMeta(row).prompt_skills as { ids?: unknown; count?: unknown } | undefined;
+  if (!note || typeof note !== 'object') return null;
+  const ids = Array.isArray(note.ids) ? note.ids.filter((id): id is string => typeof id === 'string') : [];
+  if (ids.length === 0) return null;
+  const count = typeof note.count === 'number' ? note.count : ids.length;
+  return { type: 'data-prompt-skills', id: `prompt-skills-${row.id}`, data: { ids, count } } as AnyPart;
+}
+
 function classifyRow(row: ChatMessage):
   | { kind: 'user' }
   | { kind: 'assistant_text' }
@@ -311,6 +326,9 @@ export function rowsToUIMessages(rows: ChatMessage[]): UIMessage[] {
       if (row.content && row.content.length > 0) {
         parts.push({ type: 'text', text: row.content } as AnyPart);
       }
+      // Ahead of the turn's own work: it describes the prompt the turn ran on.
+      const skillsPart = promptSkillsPart(row);
+      if (skillsPart) parts.unshift(skillsPart);
       out.push({
         id: row.id,
         role: 'assistant',

@@ -21,7 +21,7 @@ import path from 'node:path';
 import { z } from 'zod';
 
 import { modelMessagesToClaudePrompt } from '../../agent-ts/src/harness/history.ts';
-import { appendThinkingRow, rowsUnseenByEngine, rowsToModelMessages, systemPrompt, topUpTurnEdits, turnEditsMetadata, turnMetaMetadata, writeTurnEditsMetadata } from './runner.mjs';
+import { announcePromptSkills, appendThinkingRow, rowsToModelMessages, rowsUnseenByEngine, systemPrompt, topUpTurnEdits, turnEditsMetadata, turnMetaMetadata, writeTurnEditsMetadata } from './runner.mjs';
 
 const MCP_PREFIX = 'mcp__sundial__';
 
@@ -321,6 +321,8 @@ export async function runClaudeTurn({
   };
 
   stream.write({ type: 'start', messageId: assistantMessageId });
+  // Guest turns carry no skills section, so they get no note either.
+  const skillsMeta = untrustedCommentTurn ? {} : announcePromptSkills({ project, chatId, stream });
 
   let seq = 0;
   let openText = null;
@@ -563,7 +565,7 @@ export async function runClaudeTurn({
   // the work is real and persists, but the turn must not read as a clean
   // completion — run_status:'error' makes reload's latestTurnOutcome call it
   // 'failed', and the live stream gets an error instead of 'finish'.
-  const editsMeta = turnEditsMetadata(store, project.id, assistantMessageId);
+  const editsMeta = { ...skillsMeta, ...turnEditsMetadata(store, project.id, assistantMessageId) };
   // `persistedReasoning` counts: this engine now writes thinking rows, and a
   // Stop during thinking would otherwise leave them with NO anchor — flushed
   // under a synthetic id, read as outcome 'none', and retried by the client

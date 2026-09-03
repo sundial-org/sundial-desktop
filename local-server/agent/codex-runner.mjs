@@ -17,7 +17,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 
 import { modelMessagesToClaudePrompt } from '../../agent-ts/src/harness/history.ts';
-import { appendThinkingRow, rowsUnseenByEngine, rowsToModelMessages, systemPrompt, turnEditsMetadata, turnMetaMetadata, writeTurnEditsMetadata } from './runner.mjs';
+import { announcePromptSkills, appendThinkingRow, rowsToModelMessages, rowsUnseenByEngine, systemPrompt, turnEditsMetadata, turnMetaMetadata, writeTurnEditsMetadata } from './runner.mjs';
 
 /** Where `codex` lives: env override, installer paths, nvm globals, PATH. */
 export function detectCodexEngine() {
@@ -148,6 +148,9 @@ export async function runCodexTurn({
   ];
 
   stream.write({ type: 'start', messageId: assistantMessageId });
+  // Only the first (non-resumed) turn carries the Sundial system prompt, and
+  // with it the skill labels. A resumed thread keeps Codex's own context.
+  const skillsMeta = resume ? {} : announcePromptSkills({ project, chatId, stream });
 
   let seq = 0;
   let pendingText = ''; // latest agent_message, not yet persisted
@@ -382,7 +385,7 @@ export async function runCodexTurn({
 
   // Codex edits the disk natively, so the turn's rows arrive through the
   // watcher — read the count once, here, after its debounce grace above.
-  const editsMeta = turnEditsMetadata(store, project.id, assistantMessageId);
+  const editsMeta = { ...skillsMeta, ...turnEditsMetadata(store, project.id, assistantMessageId) };
   // `input_tokens` is OpenAI-shaped (cache reads INCLUDED), matching what the
   // cloud openai lane persists.
   const turnMeta = turnMetaMetadata({
