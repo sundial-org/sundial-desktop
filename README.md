@@ -129,4 +129,4 @@ If Sundial is useful to you, a star helps other people find it.
 
 ## License
 
-[Apache-2.0](LICENSE).
+[Apache-2.0](LICENSE)
