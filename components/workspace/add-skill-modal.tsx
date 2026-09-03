@@ -5,11 +5,13 @@ import { SparkleIcon, UploadSimpleIcon, XIcon } from '@phosphor-icons/react';
 import { ModalShell } from '@/components/modal-shell';
 import { FEATURED_SKILLS, type FeaturedSkill } from '@/lib/skills/featured';
 import { RESEARCH_FEATURED_SKILLS } from '@/lib/skills/featured-research';
-import { productFlavor } from '@/lib/flags/product-flavor';
+import { clientFlavor } from '@/lib/flags/product-flavor';
 
 // The scientific beta keeps its comp-bio one-click installs; the general
-// flavor (desktop/OSS) features the writing workflows.
-const featuredSkills = productFlavor() === 'general' ? FEATURED_SKILLS : RESEARCH_FEATURED_SKILLS;
+// flavor (desktop/OSS) features the writing workflows. Read per render, not at
+// module load: the visitor's flavor cookie is only readable in the browser.
+const featuredSkillsFor = () =>
+  clientFlavor() === 'general' ? FEATURED_SKILLS : RESEARCH_FEATURED_SKILLS;
 
 /**
  * Install a skill into `skills/<id>/SKILL.md` — from a GitHub/GitLab source or
@@ -36,6 +38,10 @@ export function AddSkillModal({
    */
   canSaveSecrets?: boolean;
 }) {
+  // Resolved per render (never at module load) so it can read the visitor's
+  // flavor cookie. The list only reaches the DOM once the modal is open, which
+  // is always after hydration — no server/client mismatch.
+  const featuredSkills = featuredSkillsFor();
   const [source, setSource] = useState('');
   // The raw File is kept (not its text): a `.skill`/`.zip` bundle is binary, and
   // reading it as text would corrupt it before it ever reaches the server.

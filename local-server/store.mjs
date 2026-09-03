@@ -757,6 +757,15 @@ export class LocalStore {
       .run(JSON.stringify(credentials));
   }
 
+  /** Error reports: on unless the user turned them off in the app. */
+  diagnosticsEnabled() {
+    return this.getSetting('diagnostics_enabled') !== '0';
+  }
+
+  setDiagnosticsEnabled(enabled) {
+    this.setSetting('diagnostics_enabled', enabled ? '1' : '0');
+  }
+
   getAgentCredentials() {
     const row = this.db.prepare("SELECT value FROM settings WHERE key = 'agent_credentials'").get();
     if (!row?.value) return null;
@@ -1909,19 +1918,6 @@ export class LocalStore {
   getShare(shareId) {
     return this.db.prepare('SELECT * FROM shares WHERE id = ?').get(shareId) ?? null;
   }
-
-  /** Newest enabled share for one deployment — the diagnostics sink ships
-   *  with its bridge token, the same credential the sync heartbeat uses. */
-  latestShareForOrigin(apiOrigin) {
-    return this.db
-      .prepare(
-        `SELECT id, workspace_id, api_origin, token FROM shares
-         WHERE enabled = 1 AND api_origin = ? AND token IS NOT NULL
-         ORDER BY created_at DESC LIMIT 1`,
-      )
-      .get(apiOrigin) ?? null;
-  }
-
 
   removeShare(shareId) {
     this.db.prepare('DELETE FROM shares WHERE id = ?').run(shareId);

@@ -30,7 +30,7 @@ import { createDiagnosticsSink } from './diagnostics.mjs';
  *  sidecars lack. A leftover instance from before an update reports a lower
  *  number (absent = 1) and gets REPLACED at boot instead of deferred to —
  *  deferring to old code is how "unknown project" reached the create dialog. */
-export const SIDECAR_API_VERSION = 26; // 26: shares expose per-scope sync progress and the bridge reports cloud heartbeats; 25: hosted MCP folder attach + in-sidecar credential refresh; 24: `signedIn` on /health (agent-credentials present) — a headless `serve.sh --share` run reads it to decline injecting an anon share into a signed-in desktop instance (and points the user at the app's Share); an older instance omits it, so the headless defer requires apiVersion ≥ 24 and refuses rather than guessing; …9: grants-model shares (grants:true, scope:* ids) — an older sidecar would silently create a LEGACY share against the hidden backing workspace; 10: /turn-edits (chat diff chip), chat-message paging (beforeSequence), /local/<id> served off the shell; 11: extra_roots on GET /projects (launcher rows label multi-folder workspaces); 12: POST /shares/confirm (mint-confirm — the client treats a 404 as live for older sidecars); 13: scope generations (confirm returns `generation`, scopes carry it, stops revoke ≤ it); 14: afterSequence on GET /chat-messages selects the EARLIEST rows after the cursor (same response shape, different page) — an older sidecar returns the newest window instead, so the web app's long-turn backfill would silently re-read the tail and leave the middle of the turn missing; 15: /comments reads and writes the CLOUD backing store for share-covered paths — an older sidecar keeps every comment in its local twin, so link guests' comments stay invisible to the owner (and the owner's to them) until the service is restarted by hand; 16: comments trigger agent runs (thread.chatId on GET /comments, comment_watch_path on /chats) — an older sidecar just stores the comment and nothing reacts; 17: `running` on GET /chats rows (live runner state) — the comment panel's "Agent is working" clears from it; absent means unknown and the panel falls back to reply-derived state; 18: POST /chat-messages persists a UUID clientId as the row id (optimistic↔persisted identity) — an older sidecar mints a fresh id, so every history reconcile re-adds the user row beside the optimistic bubble (duplicate message at the transcript bottom); 19: /file, /folder and /rename answer 409 on a case-variant collision — an older sidecar silently truncates the differently-cased original (`recent.md` empties `Recent.md`); 20: /local-engines resolves `defaultHarness` from detection when nobody picked one (and new chats are stamped with it) — an older sidecar answers null, so every new chat silently runs as cloud Sunny while the composer chip says so, ignoring the Claude Code / Codex the machine already has; 21: `answering` on GET /chats rows (a started run still owes this chat's comment thread an answer, spanning the retry gaps where it is not live) — the comment panel holds its "Agent is working" badge on it, so the badge no longer clears seconds before the reply lands; an older sidecar omits it and the badge clears on the first settle, as before; 22: the shares surface is scoped to the deployment this sidecar proxies (one ledger per machine, one row set per cloud) — an older sidecar mixes another deployment's rows into this app's list, where they retry that cloud forever, veto new shares on the same path, hand back their unreachable workspace as this project's backing one, and answer every Stop with "Project not found"; 23: `eventsPort` on /health (a dedicated events-plane listener, so the long-lived /events stream never occupies a data-plane connection slot) — an older sidecar omits it and the app keeps the stream on the primary origin
+export const SIDECAR_API_VERSION = 27; // 27: GET/POST /diagnostics — the app's user-visible error-report toggle (an older sidecar 404s and the app hides the switch); 26: shares expose per-scope sync progress and the bridge reports cloud heartbeats; 25: hosted MCP folder attach + in-sidecar credential refresh; 24: `signedIn` on /health (agent-credentials present) — a headless `serve.sh --share` run reads it to decline injecting an anon share into a signed-in desktop instance (and points the user at the app's Share); an older instance omits it, so the headless defer requires apiVersion ≥ 24 and refuses rather than guessing; …9: grants-model shares (grants:true, scope:* ids) — an older sidecar would silently create a LEGACY share against the hidden backing workspace; 10: /turn-edits (chat diff chip), chat-message paging (beforeSequence), /local/<id> served off the shell; 11: extra_roots on GET /projects (launcher rows label multi-folder workspaces); 12: POST /shares/confirm (mint-confirm — the client treats a 404 as live for older sidecars); 13: scope generations (confirm returns `generation`, scopes carry it, stops revoke ≤ it); 14: afterSequence on GET /chat-messages selects the EARLIEST rows after the cursor (same response shape, different page) — an older sidecar returns the newest window instead, so the web app's long-turn backfill would silently re-read the tail and leave the middle of the turn missing; 15: /comments reads and writes the CLOUD backing store for share-covered paths — an older sidecar keeps every comment in its local twin, so link guests' comments stay invisible to the owner (and the owner's to them) until the service is restarted by hand; 16: comments trigger agent runs (thread.chatId on GET /comments, comment_watch_path on /chats) — an older sidecar just stores the comment and nothing reacts; 17: `running` on GET /chats rows (live runner state) — the comment panel's "Agent is working" clears from it; absent means unknown and the panel falls back to reply-derived state; 18: POST /chat-messages persists a UUID clientId as the row id (optimistic↔persisted identity) — an older sidecar mints a fresh id, so every history reconcile re-adds the user row beside the optimistic bubble (duplicate message at the transcript bottom); 19: /file, /folder and /rename answer 409 on a case-variant collision — an older sidecar silently truncates the differently-cased original (`recent.md` empties `Recent.md`); 20: /local-engines resolves `defaultHarness` from detection when nobody picked one (and new chats are stamped with it) — an older sidecar answers null, so every new chat silently runs as cloud Sunny while the composer chip says so, ignoring the Claude Code / Codex the machine already has; 21: `answering` on GET /chats rows (a started run still owes this chat's comment thread an answer, spanning the retry gaps where it is not live) — the comment panel holds its "Agent is working" badge on it, so the badge no longer clears seconds before the reply lands; an older sidecar omits it and the badge clears on the first settle, as before; 22: the shares surface is scoped to the deployment this sidecar proxies (one ledger per machine, one row set per cloud) — an older sidecar mixes another deployment's rows into this app's list, where they retry that cloud forever, veto new shares on the same path, hand back their unreachable workspace as this project's backing one, and answer every Stop with "Project not found"; 23: `eventsPort` on /health (a dedicated events-plane listener, so the long-lived /events stream never occupies a data-plane connection slot) — an older sidecar omits it and the app keeps the stream on the primary origin
 
 /**
  * DNS-rebinding gate. Binding to 127.0.0.1 keeps other machines out, but it is
@@ -102,8 +102,9 @@ export async function startLocalServer({
       logStream.write(`${line}\n`);
     };
   }
-  // Error-level diagnostics ship to the deployment this sidecar proxies (see
-  // diagnostics.mjs; SUNDIAL_NO_DIAGNOSTICS=1 opts out, disclosed in /start).
+  // Error-level diagnostics ship to the cloud this install is signed in to
+  // (see diagnostics.mjs). Off switches: the app's own toggle (GET/POST
+  // /diagnostics, live) and SUNDIAL_NO_DIAGNOSTICS=1 (disclosed in /start).
   // Wrapped around whatever logger is in effect so the desktop shell's own
   // logger feeds it too; the sink swallows every failure.
   const diagnosticsOrigin = (process.env.SUNDIAL_REMOTE_ORIGIN || '').trim().replace(/\/$/, '');
@@ -111,17 +112,34 @@ export async function startLocalServer({
   const installId = (() => {
     try {
       const identity = fs.readFileSync(path.join(home, 'headless-identity'), 'utf8').trim();
-      return identity ? createHash('sha256').update(identity).digest('hex').slice(0, 16) : null;
+      if (identity) return createHash('sha256').update(identity).digest('hex').slice(0, 16);
+    } catch {
+      /* not a headless install */
+    }
+    // Random per install, and the route's rate key when no workspace is named.
+    try {
+      return store.installId();
     } catch {
       return null;
     }
   })();
   const diagnostics = createDiagnosticsSink({
+    // The user's OWN parked credentials — an install with nobody signed in
+    // reports nothing rather than borrowing an unrelated share's token.
     resolveTarget: () => {
-      if (!diagnosticsOrigin) return null;
-      const share = store.latestShareForOrigin(diagnosticsOrigin);
-      return share ? { origin: diagnosticsOrigin, token: share.token, workspaceId: share.workspace_id } : null;
+      const credentials = store.getAgentCredentials();
+      if (!credentials?.token) return null;
+      const origin = String(credentials.apiOrigin || diagnosticsOrigin || '').trim().replace(/\/$/, '');
+      return origin ? { origin, token: credentials.token } : null;
     },
+    isEnabled: () => store.diagnosticsEnabled(),
+    redactionPaths: () => [
+      os.homedir(),
+      ...store.listProjects().flatMap((project) => [
+        project.root,
+        ...store.listExtraRoots(project.id).map((row) => row.root),
+      ]),
+    ],
     envelope: () => ({
       installId,
       bundleHash: loadedBundleHash,
@@ -1103,6 +1121,7 @@ export async function startLocalServer({
   // The sidecar's own API namespace; everything else belongs to the web app.
   const isSidecarPath = (pathname) =>
     pathname === '/health' || pathname === '/boot' || pathname === '/session-config' || pathname === '/agent-credentials' ||
+    pathname === '/diagnostics' ||
     // '/claude-engine' is a retired sidecar path: kept in the namespace so a
     // stale client's bearer-carrying probe 404s HERE instead of being
     // proxied (with the sidecar token) to the remote origin.
@@ -1330,6 +1349,19 @@ export async function startLocalServer({
           store.setSetting('default_harness', harness);
           store.adoptDefaultHarness();
           json(res, 200, { ok: true, defaultHarness: harness });
+          return;
+        }
+      }
+      // Error reports: the app's user-visible switch. Takes effect on the
+      // next line observed — no restart. The env var can only force it off.
+      if (url.pathname === '/diagnostics') {
+        const envDisabled = !diagnostics.enabled;
+        if (req.method === 'POST') {
+          const body = await readBody(req);
+          store.setDiagnosticsEnabled(body.enabled !== false);
+        }
+        if (req.method === 'GET' || req.method === 'POST') {
+          json(res, 200, { ok: true, enabled: !envDisabled && store.diagnosticsEnabled(), envDisabled });
           return;
         }
       }

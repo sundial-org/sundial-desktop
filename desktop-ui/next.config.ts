@@ -9,8 +9,11 @@ const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const nextConfig: NextConfig = {
   output: "export",
   // The local desktop surface is always the general (markdown-first) product;
-  // the scientific/LaTeX flavor lives on the cloud deployments only.
-  env: { NEXT_PUBLIC_SUNDIAL_FLAVOR: "general" },
+  // the scientific/LaTeX flavor lives on the cloud deployments only. PINNED
+  // makes it outrank any sundial_flavor cookie the webview carries (a web
+  // deployment sets the flavor alone, so its visitors keep per-visitor
+  // overrides).
+  env: { NEXT_PUBLIC_SUNDIAL_FLAVOR: "general", NEXT_PUBLIC_SUNDIAL_FLAVOR_PINNED: "1" },
   agentRules: false,
   devIndicators: false,
   images: { unoptimized: true },

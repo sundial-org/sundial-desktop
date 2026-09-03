@@ -394,6 +394,15 @@ export const sidecar = {
     }),
   agentCredentialsConfigured: (c: SidecarConfig) =>
     request<{ configured: boolean }>(c, '/agent-credentials'),
+  /** Error-report toggle (sidecar API v27+; older sidecars 404). `envDisabled`
+   *  means SUNDIAL_NO_DIAGNOSTICS=1 forced it off, so the switch is read-only. */
+  diagnosticsSetting: (c: SidecarConfig) =>
+    request<{ enabled: boolean; envDisabled: boolean }>(c, '/diagnostics'),
+  setDiagnosticsEnabled: (c: SidecarConfig, enabled: boolean) =>
+    request<{ enabled: boolean; envDisabled: boolean }>(c, '/diagnostics', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    }),
   /** Local chat engines (the user's own Claude Code / Codex installs) plus
    *  the install's default engine for new chats. */
   localEngines: (c: SidecarConfig) =>

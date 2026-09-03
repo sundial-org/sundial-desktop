@@ -1,4 +1,4 @@
-import { productFlavor } from '@/lib/flags/product-flavor';
+import { clientFlavor, type ProductFlavor } from '@/lib/flags/product-flavor';
 import { WELCOME_PATH, WELCOME_TEX_PATH } from '@/lib/workspace/welcome-doc';
 import { isIgnoredWorkspacePath } from '@/lib/workspace/ignored-paths';
 import { isWorkspaceMetaPath } from '@/lib/workspace/spaces';
@@ -29,7 +29,13 @@ const README_RE = /^readme(\.[a-z0-9]+)?$/i;
 
 const hasDotSegment = (path: string) => path.split('/').some((segment) => segment.startsWith('.'));
 
-export function pickDefaultDocument<T extends DefaultDocumentCandidate>(files: T[]): T | null {
+export function pickDefaultDocument<T extends DefaultDocumentCandidate>(
+  files: T[],
+  // The visitor's flavor. Defaults to the browser resolution (build pin, then
+  // their cookie, then the env default); server callers holding the request
+  // pass the flavor they resolved from it.
+  flavor: ProductFlavor = clientFlavor(),
+): T | null {
   // The seeded onboarding doc never wins the landing while any other document
   // exists: eligible new users force it open themselves, and an
   // experienced user creating a template must land in the template, not the
@@ -38,10 +44,10 @@ export function pickDefaultDocument<T extends DefaultDocumentCandidate>(files: T
   // tutorial. A root welcome.md is only ours on the general flavor (which
   // seeds it); on the scientific flavor it is a user's own document.
   const isOnboardingDoc = (path: string) =>
-    path === WELCOME_TEX_PATH || (path === WELCOME_PATH && productFlavor() === 'general');
+    path === WELCOME_TEX_PATH || (path === WELCOME_PATH && flavor === 'general');
   const withoutOnboarding = files.filter((file) => !isOnboardingDoc(file.path));
   if (withoutOnboarding.length !== files.length) {
-    const fallback = pickDefaultDocument(withoutOnboarding);
+    const fallback = pickDefaultDocument(withoutOnboarding, flavor);
     if (fallback) return fallback;
   }
   const openable = files.filter(

@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useClerk, useUser } from '@/lib/auth/optional-auth';
 import { DESKTOP_CREDENTIALS_EVENT, isDesktopApp } from '@/lib/desktop';
+import { resolveSidecarConfig, sidecar } from '@/lib/local/sidecar';
 
 type FetchedIdentity = { name: string | null; email: string | null; imageUrl: string | null };
 
@@ -52,6 +53,32 @@ export function ProfileMenu() {
     };
   }, [user, credentialsEpoch]);
 
+  // Error reports are shipped by the sidecar, so the switch belongs to the
+  // desktop app only — the web menu must not even probe for one. Read when the
+  // menu opens; a sidecar too old to know the endpoint leaves the row out.
+  const [diagnostics, setDiagnostics] = useState<{ enabled: boolean; envDisabled: boolean } | null>(null);
+  useEffect(() => {
+    if (!open || !desktop || diagnostics) return;
+    let cancelled = false;
+    void (async () => {
+      const config = await resolveSidecarConfig();
+      if (!config || cancelled) return;
+      const setting = await sidecar.diagnosticsSetting(config).catch(() => null);
+      if (setting && !cancelled) setDiagnostics({ enabled: setting.enabled, envDisabled: setting.envDisabled });
+    })().catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [open, desktop, diagnostics]);
+  // Never rejects: a menu row is not worth an unhandled rejection.
+  const toggleDiagnostics = async (enabled: boolean) => {
+    setDiagnostics((prev) => (prev ? { ...prev, enabled } : prev));
+    const config = await resolveSidecarConfig();
+    const setting = config ? await sidecar.setDiagnosticsEnabled(config, enabled).catch(() => null) : null;
+    // A failed write must not leave the box claiming the setting changed.
+    setDiagnostics((prev) => (prev ? { ...prev, enabled: setting ? setting.enabled : !enabled } : prev));
+  };
+
   const name = user?.fullName || user?.username || fetched?.name || '';
   const email =
     user?.primaryEmailAddress?.emailAddress ??
@@ -96,7 +123,7 @@ export function ProfileMenu() {
               identity text or panel padding would drag the window. */}
           <div
             data-tauri-drag-region="false"
-            className="absolute right-0 z-50 mt-2 w-48 rounded-xl border border-stone-200 bg-white py-1 shadow-lg"
+            className="absolute right-0 z-50 mt-2 w-56 rounded-xl border border-stone-200 bg-white py-1 shadow-lg"
           >
             {name || handleLine ? (
               <div className="border-b border-stone-100 px-4 py-2">
@@ -120,6 +147,22 @@ export function ProfileMenu() {
               <Link href="/profile" onClick={() => setOpen(false)} className={item}>
                 Profile
               </Link>
+            ) : null}
+            {diagnostics ? (
+              <label className="flex cursor-pointer items-start gap-2 border-t border-stone-100 px-4 py-2 text-sm text-stone-700 hover:bg-stone-50">
+                <input
+                  type="checkbox"
+                  data-testid="diagnostics-toggle"
+                  checked={diagnostics.enabled}
+                  disabled={diagnostics.envDisabled}
+                  onChange={(event) => void toggleDiagnostics(event.target.checked).catch(() => {})}
+                  className="mt-1 h-3.5 w-3.5 accent-stone-700"
+                />
+                <span>
+                  Send anonymous error reports
+                  <span className="mt-0.5 block text-xs text-stone-500">Helps us fix crashes. Paths are removed.</span>
+                </span>
+              </label>
             ) : null}
             {clerk.signOut ? (
               <div className="mt-1 border-t border-stone-100 pt-1">

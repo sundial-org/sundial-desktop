@@ -21,7 +21,11 @@
   },
   "plugins": {
     "deep-link": {
-      "desktop": { "schemes": ["sundial"] }
+      "desktop": {
+        "schemes": [
+          "sundial"
+        ]
+      }
     },
     "updater": {
       "endpoints": [
@@ -33,9 +37,13 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "createUpdaterArtifacts": true,
-    "resources": ["resources/sidecar/**/*"],
-    "externalBin": ["binaries/node", "binaries/tectonic"],
+    "resources": [
+      "resources/sidecar/**/*"
+    ],
+    "externalBin": [
+      "binaries/node",
+      "binaries/tectonic"
+    ],
     "macOS": {
       "minimumSystemVersion": "13.5",
       "entitlements": "./Entitlements.plist"
